@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generative Surface | No-App OS</title>
+    <style>
+        :root {
+            --bg: #050505;
+            --surface: rgba(255, 255, 255, 0.05);
+            --border: rgba(255, 255, 255, 0.1);
+            --accent: #007AFF;
+            --text: #ffffff;
+            --text-dim: rgba(255, 255, 255, 0.5);
+            --blur: blur(20px);
+        }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        #latent-surface {
+            flex: 1;
+            padding: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            background: radial-gradient(circle at 50% 50%, #111 0%, #050505 100%);
+        }
+
+        /* The container for the 'hallucinated' UI */
+        #ui-shard {
+            width: 100%;
+            max-width: 800px;
+            min-height: 200px;
+            background: var(--surface);
+            backdrop-filter: var(--blur);
+            -webkit-backdrop-filter: var(--blur);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 32px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            transition: all 0.5s cubic-bezier(0.19, 1, 0.22, 1);
+            opacity: 0;
+            transform: translateY(20px);
+        }
+
+        #ui-shard.active {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        #intent-bar {
+            padding: 24px;
+            background: rgba(10, 10, 10, 0.8);
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: center;
+        }
+
+        .input-wrapper {
+            width: 100%;
+            max-width: 600px;
+            position: relative;
+        }
+
+        input {
+            width: 100%;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 100px;
+            padding: 16px 24px;
+            color: white;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        input:focus {
+            border-color: var(--accent);
+        }
+
+        .status {
+            font-size: 12px;
+            color: var(--text-dim);
+            margin-top: 8px;
+            text-align: center;
+        }
+
+        /* Mock UI Elements for the Generator to use */
+        .gen-h1 { font-size: 32px; font-weight: 700; margin-bottom: 16px; letter-spacing: -0.5px; }
+        .gen-p { color: var(--text-dim); line-height: 1.6; margin-bottom: 24px; }
+        .gen-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
+        .gen-card { 
+            background: rgba(255,255,255,0.03); 
+            padding: 16px; border-radius: 12px; 
+            border: 1px solid var(--border); 
+            transition: 0.3s;
+        }
+        .gen-card:hover { background: rgba(255,255,255,0.08); transform: translateY(-2px); }
+        .gen-button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: filter 0.2s;
+        }
+        .gen-button:hover { filter: brightness(1.2); }
+
+    </style>
+</head>
+<body>
+
+    <div id="latent-surface">
+        <div id="ui-shard">
+            <!-- Dynamically generated UI will appear here -->
+            <h1 class="gen-h1">Awaiting Intent...</h1>
+            <p class="gen-p">Describe what you want to do below. The OS will synthesize a UI for you.</p>
+        </div>
+    </div>
+
+    <div id="intent-bar">
+        <div class="input-wrapper">
+            <input type="text" id="intent-input" placeholder="e.g. 'Compare my travel expenses' or 'Visualize my NCA training logs'..." autocomplete="off">
+            <div class="status" id="status-text">Latent Surface ready. Waiting for observer.</div>
+        </div>
+    </div>
+
+    <script>
+        const input = document.getElementById('intent-input');
+        const shard = document.getElementById('ui-shard');
+        const status = document.getElementById('status-text');
+
+        // Initial entry animation
+        setTimeout(() => shard.classList.add('active'), 300);
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                handleIntent(input.value);
+                input.value = '';
+            }
+        });
+
+        async function handleIntent(text) {
+            status.innerText = "Analyzing intent and synthesizing UI...";
+            shard.classList.remove('active');
+            
+            // Simulation of UI synthesis
+            setTimeout(() => {
+                const html = generateMockUI(text);
+                shard.innerHTML = html;
+                shard.classList.add('active');
+                status.innerText = "UI Generated for: " + text;
+            }, 800);
+        }
+
+        // This is the simplified version of what an LLM would do.
+        // It provides a "Projection" of intent onto UI elements.
+        function generateMockUI(text) {
+            const low = text.toLowerCase();
+            if (low.includes('log') || low.includes('nca') || low.includes('train')) {
+                return `
+                    <h1 class="gen-h1">NCA Training Observer</h1>
+                    <p class="gen-p">Monitoring real-time stability for 'GenomeProject'.</p>
+                    <div class="gen-grid">
+                        <div class="gen-card"><h3>Stability</h3><div style="font-size: 24px; color: #4ade80;">98.2%</div></div>
+                        <div class="gen-card"><h3>Loss</h3><div style="font-size: 24px; color: var(--accent);">0.0042</div></div>
+                        <div class="gen-card"><h3>Fire Rate</h3><div style="font-size: 24px;">0.50 hz</div></div>
+                    </div>
+                    <div style="margin-top:24px;">
+                        <button class="gen-button" onclick="alert('Adjusting Fire Rate...')">Optimize Rate</button>
+                    </div>
+                `;
+            }
+
+            if (low.includes('expense') || low.includes('japan') || low.includes('money')) {
+                return `
+                    <h1 class="gen-h1">Financial Intent Projection</h1>
+                    <p class="gen-p">Comparing bank balance against Japan Travel goals.</p>
+                    <div style="height: 10px; width: 100%; background: #222; border-radius: 5px; margin-bottom: 24px;">
+                        <div style="height: 100%; width: 65%; background: var(--accent); border-radius: 5px;"></div>
+                    </div>
+                    <div class="gen-grid">
+                        <div class="gen-card"><h3>Total Budget</h3><div>$4,500</div></div>
+                        <div class="gen-card"><h3>Current Goal</h3><div style="color: #fca5a5;">-$1,200 short</div></div>
+                    </div>
+                    <div style="margin-top:24px;">
+                        <button class="gen-button">View Savings Recommendations</button>
+                    </div>
+                `;
+            }
+
+            return `
+                <h1 class="gen-h1">General Task Surface</h1>
+                <p class="gen-p">The system generated this generic workspace to handle: "${text}"</p>
+                <div class="gen-card">
+                    <h3>Observation Complete</h3>
+                    <p>Ready to execute logic on high-dimensional intent.</p>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>

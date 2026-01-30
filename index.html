@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Latent Surface | No-App OS</title>
+    <link rel="stylesheet" href="index.css">
+    <link rel="icon" href="https://fav.farm/✨">
+</head>
+
+<body>
+    <div id="latent-field"></div>
+    <div id="history-reel"></div>
+    <div id="reasoning-overlay"></div>
+
+    <main>
+        <div id="surface">
+            <!-- The UIEngine will inject shards here -->
+            <div id="ui-container" class="ui-shard">
+                <div class="h1">Latent Surface</div>
+                <div class="desc">The interface will holographically manifest upon your intent.</div>
+                <div class="card shimmer"
+                    style="height: 200px; display: flex; align-items: center; justify-content: center; opacity: 0.3;">
+                    <span style="font-family: var(--font-mono); color: var(--text-muted);">AWAITING OBSERVER...</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="command-bar">
+            <div class="input-container">
+                <div class="input-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8" />
+                        <path d="m21 21-4.3-4.3" />
+                    </svg>
+                </div>
+                <input type="text" id="intent-input" placeholder="What capability do you need?" autocomplete="off"
+                    autofocus>
+            </div>
+            <div class="status" id="status">PERSISTENCE: STABLE | ENTROPY: 0.02</div>
+        </div>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
