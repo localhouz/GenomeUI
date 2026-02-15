@@ -2,12 +2,28 @@
   "name": "generative-ui-os",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:os": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1",
+    "dev:os:watch": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -WatchBackend",
+    "dev:os:bootstrap": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -Bootstrap",
+    "os:test": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -SmokeTest -TestOnly",
+    "os:test:replay": ".\\.venv\\Scripts\\python.exe scripts\\replay_smoke.py",
+    "os:test:slo": ".\\.venv\\Scripts\\python.exe scripts\\slo_stress.py",
+    "os:test:handoff": ".\\.venv\\Scripts\\python.exe scripts\\handoff_stress.py",
+    "ui:test": "playwright test",
+    "ui:test:headed": "playwright test --headed",
+    "verify:all": "npm run os:test:replay && npm run os:test:slo && npm run ui:test && npm run build",
+    "dev:client": "vite",
+    "dev:server": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787",
+    "dev:server:watch": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787 --reload",
     "build": "vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "concurrently": "^9.2.1",
     "vite": "^5.0.0"
   }
 }

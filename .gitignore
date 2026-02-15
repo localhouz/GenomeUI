@@ -1,0 +1,8 @@
+node_modules/
+dist/
+test-results/
+.venv/
+.env
+backend/data/
+*.pyc
+__pycache__/
