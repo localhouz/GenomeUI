@@ -6037,7 +6037,7 @@ Notes:
 ---
 
 ## T290 - Electron Packaging + Distribution Build
-Status: in_progress
+Status: done
 Track: G (desktop shell packaging)
 Priority: P1
 Dependencies: T289
@@ -6053,7 +6053,10 @@ Acceptance:
 
 Notes:
 - packaging config/scripts implemented in `package.json`
-- blocker in current host: `electron-builder` fails extracting `winCodeSign` due Windows symlink privilege (`A required privilege is not held by the client`)
+- local build workaround validated:
+  - `npm run electron:pack:local`
+  - `npm run electron:build:local`
+- output artifact validated in this environment: `dist-electron/Genome Surface OS Setup 0.1.0.exe`
 
 ---
 
