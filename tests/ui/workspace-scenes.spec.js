@@ -16,11 +16,14 @@ test('renders immersive task and file scenes', async ({ page, request }) => {
   await input.press('Enter');
   await expect(page.locator('.scene-tasks')).toBeVisible();
   await expect(page.locator('.tasks-shell')).toBeVisible();
+  await expect(page.locator('.tasks-row-action').first()).toBeVisible();
 
   await input.fill('list files .');
   await input.press('Enter');
   await expect(page.locator('.scene-files')).toBeVisible();
   await expect(page.locator('.files-body')).toBeVisible();
   await expect(page.locator('.files-tree')).toBeVisible();
+  const commandNodes = await page.locator('.files-node[data-command]').count();
+  const emptyNodes = await page.getByText('No entries').count();
+  expect(commandNodes + emptyNodes).toBeGreaterThan(0);
 });
-

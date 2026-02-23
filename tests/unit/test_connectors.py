@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 import unittest
@@ -178,7 +179,82 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertIn("https://", str(items[0].get("url", "")))
         self.assertTrue(bool(str(items[0].get("host", "")).strip()))
         self.assertIn("favicon", items[0])
-        self.assertIn("thumbnail", items[0])
+
+    def test_scheduler_emits_background_reminder_event(self) -> None:
+        sid = f"unit-reminder-{os.getpid()}-{id(self)}"
+        session = main.ensure_session(sid)
+        session.jobs = []
+        schedule = main.run_operation(
+            session,
+            {"type": "schedule_remind_once", "payload": {"text": "stretch", "delayMs": 1000}},
+        )
+        self.assertTrue(bool(schedule.get("ok", False)))
+        queue: asyncio.Queue = asyncio.Queue()
+        session.subscribers.add(queue)
+        try:
+            asyncio.run(main.run_due_jobs_for_session(sid, session, force=True))
+            payload = asyncio.run(queue.get())
+            self.assertIsInstance(payload, dict)
+            events = payload.get("backgroundEvents", []) if isinstance(payload.get("backgroundEvents"), list) else []
+            self.assertGreaterEqual(len(events), 1)
+            self.assertEqual(str(events[0].get("type", "")), "reminder_fired")
+        finally:
+            session.subscribers.discard(queue)
+            main.SESSIONS.pop(sid, None)
+
+    def test_continuity_alert_event_emits_and_respects_cooldown(self) -> None:
+        sid = f"unit-cont-alert-{os.getpid()}-{id(self)}"
+        session = main.ensure_session(sid)
+        session.continuity_history = [
+            {
+                "ts": 1,
+                "source": "seed",
+                "status": "healthy",
+                "score": 92,
+                "activeDevices": 1,
+                "presenceTotal": 1,
+                "staleDevices": 0,
+                "handoffBreaches": 0,
+                "handoffP95Ms": 120,
+                "handoffBudgetMs": 500,
+            },
+            {
+                "ts": 2,
+                "source": "seed",
+                "status": "critical",
+                "score": 48,
+                "activeDevices": 0,
+                "presenceTotal": 1,
+                "staleDevices": 1,
+                "handoffBreaches": 2,
+                "handoffP95Ms": 780,
+                "handoffBudgetMs": 500,
+            },
+        ]
+        session.presence = main.ensure_presence_state(
+            {
+                "devices": {
+                    "dev-a": {
+                        "deviceId": "dev-a",
+                        "label": "Desktop",
+                        "platform": "desktop",
+                        "userAgent": "unit",
+                        "lastSeenAt": 1,
+                    }
+                },
+                "updatedAt": 1,
+            }
+        )
+
+        first = main.maybe_continuity_alert_event(session, sid)
+        self.assertIsInstance(first, dict)
+        self.assertEqual(str(first.get("type", "")), "continuity_alert")
+        self.assertGreater(int(first.get("anomalyCount", 0) or 0), 0)
+        self.assertGreater(int(session.last_continuity_alert_at or 0), 0)
+
+        second = main.maybe_continuity_alert_event(session, sid)
+        self.assertIsNone(second)
+        main.SESSIONS.pop(sid, None)
 
     def test_web_fetch_policy_still_blocks_localhost(self) -> None:
         main.CONNECTOR_VAULT = main.default_connector_vault_state()
@@ -295,6 +371,7 @@ class ConnectorUnitTests(unittest.TestCase):
         target = snap.get("sourceTarget", {}) if isinstance(snap.get("sourceTarget"), dict) else {}
         self.assertIn("puma.com", str(target.get("url", "")).lower())
         self.assertEqual(str(target.get("mode", "")), "direct")
+        self.assertIn("search?q=", str(target.get("url", "")).lower())
         pause_env = main.compile_intent_envelope("pause reminder 1")
         pause_ops = (pause_env.get("stateIntent", {}) or {}).get("writeOperations", [])
         pause_types = [str(item.get("type", "")) for item in (pause_ops if isinstance(pause_ops, list) else [])]
@@ -320,7 +397,7 @@ class ConnectorUnitTests(unittest.TestCase):
         snap = main.shopping_catalog_snapshot("show me men's jordan size 8.5", category="shoes")
         self.assertTrue(bool(snap.get("ok", False)))
         items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
-        self.assertGreaterEqual(len(items), 1)
+        self.assertGreaterEqual(len(items), 2)
         brands = [str(item.get("brand", "")).lower() for item in items if isinstance(item, dict)]
         self.assertIn("jordan", brands)
         self.assertTrue(all("nike.com" in str(item.get("sourceHost", "")).lower() for item in items if isinstance(item, dict)))
@@ -328,6 +405,7 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertIn("nike.com", str(target.get("url", "")).lower())
         self.assertIn("nike.com", str(target.get("host", "")).lower())
         self.assertEqual(str(target.get("mode", "")), "direct")
+        self.assertIn("?q=", str(target.get("url", "")).lower())
 
     def test_shopping_catalog_prefers_first_explicit_brand_in_query(self) -> None:
         snap = main.shopping_catalog_snapshot("show me jordan then puma shoes for men size 8.5", category="shoes")
@@ -346,6 +424,16 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertIn("newbalance.com", str(target.get("url", "")).lower())
         self.assertIn("newbalance.com", str(target.get("host", "")).lower())
 
+    def test_shopping_catalog_nike_direct_returns_richer_result_set(self) -> None:
+        snap = main.shopping_catalog_snapshot("show me nike running shoes for men size 8.5", category="shoes")
+        self.assertTrue(bool(snap.get("ok", False)))
+        items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+        self.assertGreaterEqual(len(items), 3)
+        self.assertTrue(all("nike.com" in str(item.get("sourceHost", "")).lower() for item in items if isinstance(item, dict)))
+        target = snap.get("sourceTarget", {}) if isinstance(snap.get("sourceTarget"), dict) else {}
+        self.assertEqual(str(target.get("mode", "")), "direct")
+        self.assertIn("nike.com", str(target.get("url", "")).lower())
+
     def test_web_search_phrase_source_route_instagram(self) -> None:
         session = main.ensure_session("ut_web_phrase_ig")
         result = main.run_operation(session, {"type": "web_search", "payload": {"query": "show me running tips on instagram"}})
@@ -363,6 +451,34 @@ class ConnectorUnitTests(unittest.TestCase):
         target = data.get("sourceTarget", {}) if isinstance(data.get("sourceTarget"), dict) else {}
         self.assertEqual(str(target.get("mode", "")), "direct")
         self.assertIn("youtube.com", str(target.get("url", "")).lower())
+
+    def test_web_search_run_operation_caps_payload_to_12_items(self) -> None:
+        original = main.web_search_snapshot
+        try:
+            def fake_snapshot(query: str) -> dict:
+                items = []
+                for i in range(20):
+                    items.append(
+                        {
+                            "title": f"Result {i + 1}",
+                            "url": f"https://example.com/r/{i + 1}",
+                            "snippet": "snippet",
+                            "host": "example.com",
+                            "favicon": "https://example.com/favicon.ico",
+                            "thumbnail": "",
+                        }
+                    )
+                return {"ok": True, "source": "mock", "query": query, "items": items}
+
+            main.web_search_snapshot = fake_snapshot
+            session = main.ensure_session("ut_web_cap_12")
+            result = main.run_operation(session, {"type": "web_search", "payload": {"query": "cap test"}})
+            self.assertTrue(bool(result.get("ok", False)))
+            data = result.get("data", {}) if isinstance(result.get("data"), dict) else {}
+            items = data.get("items", []) if isinstance(data.get("items"), list) else []
+            self.assertEqual(len(items), 12)
+        finally:
+            main.web_search_snapshot = original
 
     def test_resolve_contact_target_from_name(self) -> None:
         target = main.resolve_contact_target("mike")

@@ -251,6 +251,7 @@ CONTINUITY_AUTOPILOT_MAX_APPLIES_PER_HOUR = int(os.getenv("CONTINUITY_AUTOPILOT_
 CONTINUITY_AUTOPILOT_POSTURE_HISTORY_MAX = int(os.getenv("CONTINUITY_AUTOPILOT_POSTURE_HISTORY_MAX", "200"))
 CONTINUITY_AUTOPILOT_POSTURE_ACTION_HISTORY_MAX = int(os.getenv("CONTINUITY_AUTOPILOT_POSTURE_ACTION_HISTORY_MAX", "300"))
 CONTINUITY_AUTOPILOT_POSTURE_ACTION_POLICY_HISTORY_MAX = int(os.getenv("CONTINUITY_AUTOPILOT_POSTURE_ACTION_POLICY_HISTORY_MAX", "300"))
+CONTINUITY_ALERT_COOLDOWN_MS = int(os.getenv("CONTINUITY_ALERT_COOLDOWN_MS", "300000"))
 
 
 class SessionInitBody(BaseModel):
@@ -351,6 +352,7 @@ class SessionState:
     continuity_autopilot_posture_history: list[dict[str, Any]] = field(default_factory=list)
     continuity_autopilot_posture_action_history: list[dict[str, Any]] = field(default_factory=list)
     continuity_autopilot_posture_action_policy_history: list[dict[str, Any]] = field(default_factory=list)
+    last_continuity_alert_at: int = 0
     dead_letters: list[dict[str, Any]] = field(default_factory=list)
     journal: list[dict[str, Any]] = field(default_factory=list)
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
@@ -584,6 +586,86 @@ MOCK_SHOP_ITEMS: list[dict[str, Any]] = [
         "imageUrl": "https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?auto=format&fit=crop&w=900&q=80",
         "url": "https://www.nike.com/w/jordan-shoes-37eefzy7ok",
         "tags": ["jordan", "basketball", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-017",
+        "title": "Jordan One Take 5",
+        "category": "shoes",
+        "brand": "Jordan",
+        "priceUsd": 100.0,
+        "imageUrl": "https://images.unsplash.com/photo-1511556532299-8f662fc26c06?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/w/jordan-shoes-37eefzy7ok",
+        "tags": ["jordan", "basketball", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-018",
+        "title": "Nike Vomero 17",
+        "category": "shoes",
+        "brand": "Nike",
+        "priceUsd": 160.0,
+        "imageUrl": "https://images.unsplash.com/photo-1556048219-bb6978360b84?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/w/mens-shoes-nik1zy7ok",
+        "tags": ["nike", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-019",
+        "title": "Nike Revolution 7",
+        "category": "shoes",
+        "brand": "Nike",
+        "priceUsd": 70.0,
+        "imageUrl": "https://images.unsplash.com/photo-1491553895911-0055eca6402d?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/w/mens-shoes-nik1zy7ok",
+        "tags": ["nike", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-020",
+        "title": "Adidas Adizero SL2",
+        "category": "shoes",
+        "brand": "Adidas",
+        "priceUsd": 130.0,
+        "imageUrl": "https://images.unsplash.com/photo-1465453869711-7e174808ace9?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.adidas.com/us/men-shoes",
+        "tags": ["adidas", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-021",
+        "title": "Adidas Forum Low",
+        "category": "shoes",
+        "brand": "Adidas",
+        "priceUsd": 100.0,
+        "imageUrl": "https://images.unsplash.com/photo-1600185365483-26d7a4cc7519?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.adidas.com/us/men-shoes",
+        "tags": ["adidas", "lifestyle", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-022",
+        "title": "New Balance FuelCell Rebel v4",
+        "category": "shoes",
+        "brand": "New Balance",
+        "priceUsd": 140.0,
+        "imageUrl": "https://images.unsplash.com/photo-1543163521-1bf539c55dd2?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.newbalance.com/men/shoes/",
+        "tags": ["newbalance", "new-balance", "nb", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-023",
+        "title": "New Balance 9060",
+        "category": "shoes",
+        "brand": "New Balance",
+        "priceUsd": 150.0,
+        "imageUrl": "https://images.unsplash.com/photo-1551107696-a4b0c5a0d9a2?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.newbalance.com/men/shoes/",
+        "tags": ["newbalance", "new-balance", "nb", "streetwear", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-024",
+        "title": "Nike Air Max Alpha Trainer 6",
+        "category": "shoes",
+        "brand": "Nike",
+        "priceUsd": 95.0,
+        "imageUrl": "https://images.unsplash.com/photo-1539185441755-769473a23570?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/w/mens-shoes-nik1zy7ok",
+        "tags": ["nike", "training", "men", "size-8-5"],
     },
     {
         "id": "outfit-001",
@@ -1850,6 +1932,26 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
         "jordan":     ("Jordan",    "https://www.nike.com/w/jordan-shoes-37eefzy7ok",                   "jordan",    "#111111", "#c7482a"),
     }
 
+    def resolve_brand_search_url(brand_key: str, fallback_url: str, raw_query: str) -> str:
+        brand = str(brand_key or "").strip().lower()
+        base_url = str(fallback_url or "").strip()
+        query_text = str(raw_query or "").strip()
+        if not query_text:
+            return base_url
+        encoded = quote_plus(query_text)
+        by_brand = {
+            "puma": f"https://us.puma.com/us/en/search?q={encoded}",
+            "nike": f"https://www.nike.com/w?q={encoded}",
+            "jordan": f"https://www.nike.com/w?q={encoded}",
+            "adidas": f"https://www.adidas.com/us/search?q={encoded}",
+            "reebok": f"https://www.reebok.com/search?q={encoded}",
+            "newbalance": f"https://www.newbalance.com/search?text={encoded}",
+            "asics": f"https://www.asics.com/us/en-us/search?q={encoded}",
+            "converse": f"https://www.converse.com/shop/search?lang=en_US&q={encoded}",
+            "vans": f"https://www.vans.com/en-us/search?text={encoded}",
+        }
+        return by_brand.get(brand, base_url)
+
     def select_direct_brand_from_query(text_query: str, candidates: set[str]) -> str:
         raw = str(text_query or "").lower()
         if not raw:
@@ -2066,10 +2168,11 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
     if direct_brand:
         brand_label, brand_url, brand_theme, brand_primary, brand_accent = brand_site_map[direct_brand]
         mode = "direct" if specificity >= 3 else "assist"
+        target_url = resolve_brand_search_url(direct_brand, brand_url, q if mode == "direct" else "")
         host = url_host(brand_url)
         source_target = {
             "label": f"Open {brand_label} site",
-            "url": brand_url,
+            "url": target_url,
             "mode": mode,
             "host": host,
             "brandName": brand_label,
@@ -2080,14 +2183,50 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
             direct_filtered = [item for item in out if isinstance(item, dict) and host and host in str(item.get("sourceHost", ""))]
             if direct_filtered:
                 out = direct_filtered
+            if len(out) < 8:
+                existing = {
+                    re.sub(r"[?#].*$", "", str(item.get("url", "")).strip())
+                    for item in out
+                    if isinstance(item, dict)
+                }
+                for item in MOCK_SHOP_ITEMS:
+                    if not isinstance(item, dict):
+                        continue
+                    item_brand = normalize_token(str(item.get("brand", "")))
+                    item_url = str(item.get("url", "")).strip()
+                    item_host = url_host(item_url)
+                    if item_brand != direct_brand and (not host or host not in item_host):
+                        continue
+                    key = re.sub(r"[?#].*$", "", item_url)
+                    if key in existing:
+                        continue
+                    item_cat = str(item.get("category", "")).strip().lower()
+                    if c and item_cat and item_cat != c:
+                        continue
+                    out.append(
+                        {
+                            "id": str(item.get("id", "")),
+                            "title": str(item.get("title", "")).strip(),
+                            "category": item_cat or "shoes",
+                            "brand": str(item.get("brand", "")).strip(),
+                            "priceUsd": float(item.get("priceUsd", 0.0) or 0.0),
+                            "imageUrl": str(item.get("imageUrl", "")).strip(),
+                            "url": item_url,
+                            "sourceHost": item_host,
+                        }
+                    )
+                    existing.add(key)
+                    if len(out) >= 12:
+                        break
     elif out:
         top_brand = normalize_token(str((out[0] if isinstance(out[0], dict) else {}).get("brand", "")))
         if top_brand in brand_site_map:
             brand_label, brand_url, brand_theme, brand_primary, brand_accent = brand_site_map[top_brand]
             host = url_host(brand_url)
+            target_url = resolve_brand_search_url(top_brand, brand_url, q)
             source_target = {
                 "label": f"Open {brand_label} site",
-                "url": brand_url,
+                "url": target_url,
                 "mode": "assist",
                 "host": host,
                 "brandName": brand_label,
@@ -2481,6 +2620,7 @@ def serialize_session_state(session: SessionState) -> dict[str, Any]:
         "continuity_autopilot_posture_history": session.continuity_autopilot_posture_history,
         "continuity_autopilot_posture_action_history": session.continuity_autopilot_posture_action_history,
         "continuity_autopilot_posture_action_policy_history": session.continuity_autopilot_posture_action_policy_history,
+        "last_continuity_alert_at": int(session.last_continuity_alert_at or 0),
         "dead_letters": session.dead_letters,
         "journal": session.journal,
         "undo_stack": session.undo_stack,
@@ -2508,6 +2648,7 @@ def deserialize_session_state(payload: dict[str, Any]) -> SessionState:
         continuity_autopilot_posture_history=payload.get("continuity_autopilot_posture_history") or [],
         continuity_autopilot_posture_action_history=payload.get("continuity_autopilot_posture_action_history") or [],
         continuity_autopilot_posture_action_policy_history=payload.get("continuity_autopilot_posture_action_policy_history") or [],
+        last_continuity_alert_at=int(payload.get("last_continuity_alert_at", 0) or 0),
         dead_letters=payload.get("dead_letters") or [],
         journal=payload.get("journal") or [],
         undo_stack=payload.get("undo_stack") or [],
@@ -7511,6 +7652,7 @@ async def run_scheduler_loop() -> None:
 async def run_due_jobs_for_session(session_id: str, session: SessionState, force: bool = False) -> bool:
     now = now_ms()
     ran = False
+    background_events: list[dict[str, Any]] = []
     autopilot_report = run_continuity_autopilot_tick(session, session_id, force=force)
     if bool(autopilot_report.get("ran", False)):
         graph_add_event(
@@ -7540,7 +7682,9 @@ async def run_due_jobs_for_session(session_id: str, session: SessionState, force
         try:
             if force:
                 job["lastRunKey"] = None
-            execute_scheduled_job(session, session_id, job)
+            bg_event = execute_scheduled_job(session, session_id, job)
+            if isinstance(bg_event, dict) and bg_event:
+                background_events.append(bg_event)
             job["failureCount"] = 0
             job["lastError"] = ""
             interval_ms = int(job.get("intervalMs", 0) or 0)
@@ -7577,15 +7721,51 @@ async def run_due_jobs_for_session(session_id: str, session: SessionState, force
             )
         ran = True
 
+    continuity_alert = maybe_continuity_alert_event(session, session_id)
+    if continuity_alert:
+        background_events.append(continuity_alert)
+        ran = True
+
     if not ran:
         return False
 
     session.memory = graph_to_memory(session.graph)
     session.revision += 1
     payload = session_sync_payload(session_id, session)
+    if background_events:
+        payload["backgroundEvents"] = background_events[:8]
     await broadcast_session(session, payload)
     await persist_sessions_to_disk_safe("scheduler_tick")
     return True
+
+
+def maybe_continuity_alert_event(session: SessionState, session_id: str) -> dict[str, Any] | None:
+    history = session.continuity_history if isinstance(session.continuity_history, list) else []
+    if not history:
+        return None
+    anomaly_report = detect_continuity_anomalies(history, limit=200)
+    anomaly_summary = anomaly_report.get("summary", {}) if isinstance(anomaly_report.get("summary"), dict) else {}
+    anomaly_count = int(anomaly_summary.get("totalDetected", 0) or 0)
+    if anomaly_count <= 0:
+        return None
+    now = now_ms()
+    last_at = int(getattr(session, "last_continuity_alert_at", 0) or 0)
+    if last_at > 0 and (now - last_at) < int(CONTINUITY_ALERT_COOLDOWN_MS):
+        return None
+    continuity = build_continuity_payload(session, session_id)
+    health = continuity.get("health", {}) if isinstance(continuity.get("health"), dict) else {}
+    status = str(health.get("status", "healthy"))
+    if status not in {"degraded", "critical"}:
+        return None
+    severity = "critical" if status == "critical" else "warn"
+    session.last_continuity_alert_at = now
+    return {
+        "type": "continuity_alert",
+        "severity": severity,
+        "anomalyCount": anomaly_count,
+        "message": f"Continuity health {status}: {anomaly_count} anomalies detected",
+        "createdAt": now,
+    }
 
 
 def session_sync_payload(session_id: str, session: SessionState) -> dict[str, Any]:
@@ -8462,6 +8642,7 @@ def build_continuity_autopilot_dry_run(session: SessionState, session_id: str, f
         continuity_history=copy.deepcopy(session.continuity_history),
         continuity_autopilot=copy.deepcopy(session.continuity_autopilot),
         continuity_autopilot_history=copy.deepcopy(session.continuity_autopilot_history),
+        last_continuity_alert_at=int(session.last_continuity_alert_at or 0),
         dead_letters=copy.deepcopy(session.dead_letters),
         journal=copy.deepcopy(session.journal),
         undo_stack=copy.deepcopy(session.undo_stack),
@@ -12347,7 +12528,7 @@ def build_intent_preview_report(session: SessionState, session_id: str, intent: 
     }
 
 
-def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str, Any]) -> None:
+def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str, Any]) -> dict[str, Any] | None:
     kind = str(job.get("kind", "unknown"))
     run_key = compute_job_run_key(job)
     if run_key and str(job.get("lastRunKey", "")) == run_key:
@@ -12378,7 +12559,7 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
                 "diff": zero_diff(),
             },
         )
-        return
+        return None
 
     if kind == "remind_note":
         text = str(job.get("text", "")).strip()
@@ -12400,7 +12581,14 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
                 "diff": {"tasks": 0, "expenses": 0, "notes": 1},
             },
         )
-        return
+        return {
+            "type": "reminder_fired",
+            "jobId": str(job.get("id", "")),
+            "kind": kind,
+            "title": "Reminder fired",
+            "message": text[:120],
+            "createdAt": now_ms(),
+        }
 
     if kind == "remind_once":
         text = str(job.get("text", "")).strip()
@@ -12422,7 +12610,14 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
                 "diff": {"tasks": 0, "expenses": 0, "notes": 1},
             },
         )
-        return
+        return {
+            "type": "reminder_fired",
+            "jobId": str(job.get("id", "")),
+            "kind": kind,
+            "title": "One-shot reminder",
+            "message": text[:120],
+            "createdAt": now_ms(),
+        }
 
     if kind == "audit_open_tasks":
         projection = graph_projection(session.graph)
@@ -12443,7 +12638,7 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
                 "diff": {"tasks": 0, "expenses": 0, "notes": 1},
             },
         )
-        return
+        return None
 
     if kind == "summarize_expenses_daily":
         projection = graph_projection(session.graph)
@@ -12464,10 +12659,11 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
                 "diff": {"tasks": 0, "expenses": 0, "notes": 1},
             },
         )
-        return
+        return None
 
     if kind == "failing_probe":
         raise RuntimeError("simulated failing probe")
+    return None
 
 
 def compile_intent_envelope(text: str) -> dict[str, Any]:
@@ -28740,7 +28936,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             "op": "web_search",
             "message": f"Web search ready for '{query}'",
             "previewLines": lines[:10],
-            "data": {"query": query, "source": source, "items": items[:8], "sourceTarget": site_target},
+            "data": {"query": query, "source": source, "items": items[:12], "sourceTarget": site_target},
         }
 
     if kind == "list_audit":

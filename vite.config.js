@@ -1,6 +1,10 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  publicDir: 'public',
+  build: {
+    target: 'es2020'
+  },
   server: {
     host: true,
     port: 5173,

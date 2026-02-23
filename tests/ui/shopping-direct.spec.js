@@ -17,6 +17,9 @@ test('shopping direct intent renders brand stage with canonical source link', as
   const stageStripCount = await page.locator('.shop-source-strip').count();
   const galleryCount = await page.locator('.shop-gallery').count();
   expect(stageStripCount + galleryCount).toBeGreaterThan(0);
+  if (stageStripCount > 0) {
+    await expect(page.locator('.shop-stage-live-frame').first()).toBeVisible();
+  }
   const cta = page.locator('.shop-brand-cta').first();
   const fallbackCta = page.locator('.scene-shopping .scene-chip-link').first();
   const target = (await cta.count()) > 0 ? cta : fallbackCta;
@@ -28,5 +31,12 @@ test('shopping direct intent renders brand stage with canonical source link', as
     || hrefStr.includes('nike.com')
     || hrefStr.includes('adidas.com')
     || hrefStr.includes('newbalance.com')
+  ).toBeTruthy();
+  expect(
+    hrefStr.includes('?q=')
+    || hrefStr.includes('/search?')
+    || hrefStr.includes('/w?')
+    || hrefStr.includes('/men/shoes')
+    || hrefStr.includes('/mens-shoes')
   ).toBeTruthy();
 });
