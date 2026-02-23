@@ -39,7 +39,7 @@
   "build": {
     "appId": "com.genome.surface",
     "productName": "Genome Surface OS",
-    "copyright": "Copyright © 2026 Genome",
+    "copyright": "Copyright (c) 2026 Genome",
     "directories": {
       "output": "dist-electron",
       "buildResources": "public"
@@ -108,3 +108,4 @@
     "wait-on": "^9.0.4"
   }
 }
+

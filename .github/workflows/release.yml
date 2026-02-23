@@ -1,0 +1,40 @@
+name: GenomeUI Release Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to build
+        required: false
+        default: main
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build installer (local-safe mode)
+        run: npm run electron:build:local
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: genome-surface-release-windows
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.blockmap
+          if-no-files-found: error

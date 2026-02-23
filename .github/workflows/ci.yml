@@ -1,0 +1,92 @@
+name: GenomeUI CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Unit tests
+        run: |
+          . .venv/bin/activate
+          python -m unittest discover -s tests/unit -p "test_*.py"
+
+      - name: Electron module tests
+        run: npm run os:test:electron
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: UI smoke tests
+        run: npx playwright test tests/ui/webdeck-scene.spec.js tests/ui/welcome-boot.spec.js tests/ui/shopping-direct.spec.js
+
+  package-windows-local:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Local-safe Windows packaging
+        run: npm run electron:build:local
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: genome-surface-windows-installer
+          path: dist-electron/*.exe
+          if-no-files-found: error
+
+  tauri-compile:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tauri compile check
+        run: cargo check --manifest-path src-tauri/Cargo.toml

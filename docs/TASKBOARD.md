@@ -6098,6 +6098,46 @@ Acceptance:
 Notes:
 - checkpoint commits: `475dc68`, `7898b46`
 
+---
+
+## T293 - GitHub CI Pipeline (Build/Test/Package/Tauri Check)
+Status: done
+Track: H (CI/CD)
+Priority: P1
+Dependencies: T292
+
+Deliverables:
+- repository CI workflow with Linux validation and Windows packaging checks
+- Playwright smoke lane in CI
+- Tauri compile check in CI
+
+Acceptance:
+- push/PR triggers CI workflow
+- Windows packaging lane builds installer artifact in local-safe mode
+- Tauri wrapper compiles in CI via `cargo check`
+
+Notes:
+- implementation in `.github/workflows/ci.yml`
+
+---
+
+## T294 - Manual Release Artifact Workflow
+Status: done
+Track: H (CI/CD)
+Priority: P1
+Dependencies: T293
+
+Deliverables:
+- workflow_dispatch release build for Windows installer artifacts
+- ref-selectable release source
+
+Acceptance:
+- operator can trigger release workflow from GitHub Actions UI
+- workflow uploads installer and blockmap artifacts
+
+Notes:
+- implementation in `.github/workflows/release.yml`
+
 ## Suggested Execution Order
 1. T3
 2. T4

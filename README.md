@@ -76,6 +76,14 @@ Current sprint execution board: `docs/TASKBOARD.md`.
 
 6. **Open**: `http://localhost:5173`
 
+## CI / Release
+- CI workflow: `.github/workflows/ci.yml`
+  - Linux validate job: build + Python unit tests + Electron module tests + Playwright smoke
+  - Windows package job: `electron:build:local` + installer artifact upload
+  - Tauri compile job: `cargo check --manifest-path src-tauri/Cargo.toml`
+- Manual release workflow: `.github/workflows/release.yml`
+  - `workflow_dispatch` builds Windows installer artifact from selected ref
+
 ## 📱 Cross-Device Continuity
 Use the same session URL on desktop + phone:
 - Desktop: `http://localhost:5173/?session=mysharedsurface`
