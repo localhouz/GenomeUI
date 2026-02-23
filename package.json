@@ -19,6 +19,7 @@
     "ui:test": "playwright test",
     "ui:test:headed": "playwright test --headed",
     "verify:all": "npm run os:test:replay && npm run os:test:slo && npm run ui:test && npm run build",
+    "ci:local": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\ci-local.ps1",
     "dev:client": "vite",
     "dev:server": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787",
     "dev:server:watch": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787 --reload",

@@ -6138,6 +6138,24 @@ Acceptance:
 Notes:
 - implementation in `.github/workflows/release.yml`
 
+---
+
+## T295 - Local CI Parity Script
+Status: done
+Track: H (CI/CD)
+Priority: P1
+Dependencies: T293
+
+Deliverables:
+- one-command local CI parity execution for build/tests/ui-smoke/tauri-check
+- npm script entrypoint for repeatable operator usage
+
+Acceptance:
+- `npm run ci:local` runs and passes core CI lanes on dev machine
+
+Notes:
+- implementation in `scripts/ci-local.ps1`, `package.json`, `README.md`
+
 ## Suggested Execution Order
 1. T3
 2. T4

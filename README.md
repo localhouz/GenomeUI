@@ -83,6 +83,10 @@ Current sprint execution board: `docs/TASKBOARD.md`.
   - Tauri compile job: `cargo check --manifest-path src-tauri/Cargo.toml`
 - Manual release workflow: `.github/workflows/release.yml`
   - `workflow_dispatch` builds Windows installer artifact from selected ref
+- Local CI parity command:
+  ```bash
+  npm run ci:local
+  ```
 
 ## 📱 Cross-Device Continuity
 Use the same session URL on desktop + phone:
