@@ -6058,7 +6058,7 @@ Notes:
 ---
 
 ## T291 - Tauri Mobile Wrapper (iOS/Android)
-Status: in_progress
+Status: done
 Track: G (mobile shell)
 Priority: P1
 Dependencies: T290
@@ -6073,8 +6073,24 @@ Acceptance:
 - scripts are available in package manifest for simulator/device workflows
 
 Notes:
-- implementation in `src-tauri/tauri.conf.json`, `package.json`
-- local mobile compile not yet executed in this environment (requires Rust + platform SDKs)
+- implementation in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/build.rs`, `src-tauri/src/main.rs`, `src-tauri/icons/*`, `package.json`
+- validated with `cargo check --manifest-path src-tauri/Cargo.toml`
+
+---
+
+## T292 - Track 11 Integration Checkpoint Commit
+Status: in_progress
+Track: G (desktop/mobile shell release checkpoint)
+Priority: P1
+Dependencies: T291
+
+Deliverables:
+- committed checkpoint for Track 11 implementation and tests
+- remaining blockers captured (packaging privilege/signing environment)
+
+Acceptance:
+- git history contains an explicit Track 11 checkpoint commit
+- known packaging blocker documented for operator follow-up
 
 ## Suggested Execution Order
 1. T3

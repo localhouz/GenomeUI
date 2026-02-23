@@ -1,8 +1,11 @@
 node_modules/
 dist/
+dist-electron/
 test-results/
 .venv/
 .env
 backend/data/
 *.pyc
 __pycache__/
+src-tauri/target/
+src-tauri/gen/
