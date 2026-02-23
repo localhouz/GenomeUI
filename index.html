@@ -1,12 +1,18 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0d7c66">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Genome">
     <title>Latent Surface | No-App OS</title>
     <link rel="stylesheet" href="index.css">
-    <link rel="icon" href="https://fav.farm/✨">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+    <link rel="apple-touch-icon" sizes="192x192" href="/icon-192.png">
 </head>
 
 <body>
@@ -29,6 +35,11 @@
 
         <div id="command-bar">
             <div class="input-container">
+                <div id="window-controls" class="window-controls" aria-hidden="true">
+                    <button class="wc-btn wc-close" id="wc-close" title="Close" type="button"></button>
+                    <button class="wc-btn wc-minimize" id="wc-minimize" title="Minimize" type="button"></button>
+                    <button class="wc-btn wc-maximize" id="wc-maximize" title="Maximize" type="button"></button>
+                </div>
                 <div class="input-icon">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -47,3 +58,4 @@
 </body>
 
 </html>
+

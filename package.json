@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "electron/main.mjs",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:os": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1",
@@ -14,6 +15,7 @@
     "os:test:connectors": ".\\.venv\\Scripts\\python.exe scripts\\connector_replay.py",
     "os:test:slo": ".\\.venv\\Scripts\\python.exe scripts\\slo_stress.py",
     "os:test:handoff": ".\\.venv\\Scripts\\python.exe scripts\\handoff_stress.py",
+    "os:test:electron": "node tests/electron-privacy.test.mjs && node tests/electron-credentials.test.mjs",
     "ui:test": "playwright test",
     "ui:test:headed": "playwright test --headed",
     "verify:all": "npm run os:test:replay && npm run os:test:slo && npm run ui:test && npm run build",
@@ -21,11 +23,86 @@
     "dev:server": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787",
     "dev:server:watch": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8787 --reload",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "electron:pack": "npm run build && electron-builder --dir",
+    "electron:build": "npm run build && electron-builder",
+    "electron:build:mac": "npm run build && electron-builder --mac",
+    "electron:build:win": "npm run build && electron-builder --win",
+    "electron:build:linux": "npm run build && electron-builder --linux",
+    "tauri:dev": "tauri dev",
+    "tauri:build:ios": "tauri build --target ios",
+    "tauri:build:android": "tauri build --target android"
+  },
+  "build": {
+    "appId": "com.genome.surface",
+    "productName": "Genome Surface OS",
+    "copyright": "Copyright © 2026 Genome",
+    "directories": {
+      "output": "dist-electron",
+      "buildResources": "public"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "public/icon-512.png",
+        "to": "icon-512.png"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "public/icon-512.png",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "win": {
+      "icon": "public/icon-512.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "icon": "public/icon-512.png",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/cli": "^2.10.0",
     "concurrently": "^9.2.1",
-    "vite": "^5.0.0"
+    "electron": "^40.6.0",
+    "electron-builder": "^26.8.1",
+    "vite": "^5.0.0",
+    "wait-on": "^9.0.4"
   }
 }

@@ -5710,6 +5710,372 @@ Notes:
 - UI coverage in `tests/ui/trace.spec.js`
 - docs update in `README.md`
 
+---
+
+## T267 - Sync Transport Auto-Reconnect with Exponential Backoff
+Status: done
+Track: F (cross-device + resilience)
+Priority: P1
+Dependencies: T266
+
+Deliverables:
+- client reconnect scheduler with bounded exponential backoff for websocket recovery
+- transport failure funnel that degrades WS/SSE to polling while retrying WS in background
+- retry lifecycle reset on successful reconnect
+
+Acceptance:
+- disconnecting backend moves sync to degraded mode without freezing intent handling
+- reconnect attempts increase over time and reset to baseline on successful WS open
+- status bar reflects online/offline transport state during recovery
+
+Notes:
+- frontend implementation in `app.js`
+- UI coverage in `tests/ui/offline-overlay.spec.js`
+
+---
+
+## T268 - Offline Overlay + Manual Retry UX
+Status: done
+Track: F (cross-device + resilience)
+Priority: P1
+Dependencies: T267
+
+Deliverables:
+- full-screen offline overlay with explicit recovery messaging
+- manual retry action that attempts immediate transport restoration
+- offline visual state bound to browser online/offline events and fetch transport failures
+
+Acceptance:
+- offline event shows overlay and status indicates `NET: OFFLINE`
+- retry action hides overlay and returns status to `NET: ONLINE` when transport recovers
+- local intent fallback continues while backend transport is unavailable
+
+Notes:
+- frontend implementation in `app.js`, `index.css`
+- UI coverage in `tests/ui/offline-overlay.spec.js`
+
+---
+
+## T269 - Background Event Push (Reminder Fired -> Toast + Feed)
+Status: done
+Track: F (OS shell realtime events)
+Priority: P1
+Dependencies: T268
+
+Deliverables:
+- scheduler emits structured `backgroundEvents` for reminder jobs on session sync payloads
+- client consumes background events into runtime state and toasts
+- right-rail feed includes a `Live Events` block when runtime events are present
+
+Acceptance:
+- firing a scheduled reminder produces a `reminder_fired` event in scheduler broadcast payloads
+- frontend surfaces reminder pushes as toast notifications
+- frontend surfaces recent pushes in compact feed history
+
+Notes:
+- backend implementation in `backend/main.py`
+- frontend implementation in `app.js`
+- unit coverage in `tests/unit/test_connectors.py` (`test_scheduler_emits_background_reminder_event`)
+
+---
+
+## T270 - Background Event Push (Continuity Alert -> Status Badge)
+Status: done
+Track: F (OS shell realtime events)
+Priority: P1
+Dependencies: T269
+
+Deliverables:
+- backend continuity alert event emission with 5-minute cooldown guard
+- scheduler includes continuity alert events in sync payload background stream
+- frontend marks status bar with continuity warning badge and warning toast on alert events
+
+Acceptance:
+- degraded/critical continuity state with anomaly signal emits a `continuity_alert` event
+- repeated checks within cooldown do not flood alerts
+- clients show continuity warning toast and status badge when alert arrives
+
+Notes:
+- backend implementation in `backend/main.py` (`maybe_continuity_alert_event`, scheduler integration)
+- frontend implementation in `app.js`, `index.css`
+- unit coverage in `tests/unit/test_connectors.py` (`test_continuity_alert_event_emits_and_respects_cooldown`)
+- UI coverage in `tests/ui/continuity-alert.spec.js`
+
+---
+
+## T271 - Boot Empty-State Welcome Suggestions
+Status: done
+Track: F (OS shell UX)
+Priority: P1
+Dependencies: T270
+
+Deliverables:
+- boot sequence renders a dedicated welcome surface for new/empty sessions
+- four tappable starter intent tiles routed through the normal intent command path
+- welcome surface keeps immersive visual language and mobile-friendly tile layout
+
+Acceptance:
+- fresh session shows welcome title/subtitle and 4 suggestion tiles after boot
+- clicking a tile executes that intent immediately via existing `data-command` handling
+- returning users with prior state continue into normal surface restore path
+
+Notes:
+- frontend implementation in `app.js`, `index.css`
+- UI coverage in `tests/ui/welcome-boot.spec.js`
+
+---
+
+## T272 - Web App Manifest (Installable PWA Metadata)
+Status: done
+Track: F (PWA)
+Priority: P1
+Dependencies: T271
+
+Deliverables:
+- local manifest with standalone display + theme/start/scope metadata
+- local install icons (`192`, `512`) served from project static assets
+- manifest + Apple mobile meta tags wired in HTML shell
+
+Acceptance:
+- `/manifest.json` resolves and parses cleanly
+- manifest includes required name/short-name/icon fields
+- page head exposes manifest link and mobile-web-app metadata
+
+Notes:
+- implementation in `public/manifest.json`, `public/icon-192.png`, `public/icon-512.png`, `index.html`
+- UI coverage in `tests/ui/pwa.spec.js`
+
+---
+
+## T273 - Service Worker App Shell Cache
+Status: done
+Track: F (PWA)
+Priority: P1
+Dependencies: T272
+
+Deliverables:
+- cache-first app shell service worker with API/network bypass
+- service worker registration on app boot
+- retained Vite proxy settings with explicit `publicDir`/build target
+
+Acceptance:
+- service worker registration exists in runtime
+- app shell assets (`/`, `/app.js`, `/index.css`, `/manifest.json`) cached
+- API/WS traffic remains network-first and uncached
+
+Notes:
+- implementation in `public/sw.js`, `app.js`, `vite.config.js`
+- UI coverage in `tests/ui/pwa.spec.js`
+
+---
+
+## T274 - Mobile Swipe Intent History Navigation
+Status: done
+Track: F (touch UX)
+Priority: P1
+Dependencies: T273
+
+Deliverables:
+- mobile touch swipe handlers for history navigation (right=back, left=forward)
+- top-edge swipe preserves scene-domain cycling behavior
+- unified navigation path through history restore runtime
+
+Acceptance:
+- mobile horizontal swipe updates active history index and restores previous surface
+- short/vertical swipes do not trigger navigation
+
+Notes:
+- implementation in `app.js`
+- UI coverage in `tests/ui/mobile-swipe-history.spec.js`
+
+---
+
+## T275 - Mobile/Visibility Animation Throttle
+Status: done
+Track: F (performance)
+Priority: P1
+Dependencies: T274
+
+Deliverables:
+- scene animation loop switched to fps-throttled RAF (desktop/mobile/hidden targets)
+- hidden-tab behavior tears down graphics loop and resumes on visibility return
+- coarse-pointer/mobile detection utility for animation budget selection
+
+Acceptance:
+- active scenes render at lower FPS on mobile and ultra-low FPS budget when hidden
+- visibility transitions do not spawn duplicate render loops
+
+Notes:
+- implementation in `app.js`
+
+---
+
+## T284 - Electron Scaffolding
+Status: done
+Track: G (desktop shell)
+Priority: P1
+Dependencies: T273
+
+Deliverables:
+- Electron main/preload scaffolding with isolated renderer bridge
+- window chrome IPC handlers (minimize/maximize/close)
+- Electron dev/build/pack scripts and electron-builder packaging config
+
+Acceptance:
+- Electron entrypoint and preload compile under ESM
+- `electron:dev` script available for local desktop shell launch
+- package config includes distributable targets and output directory
+
+Notes:
+- implementation in `electron/main.mjs`, `electron/preload.mjs`, `package.json`
+
+---
+
+## T285 - Local Privacy Interceptor (Electron Web Requests)
+Status: done
+Track: G (desktop shell privacy)
+Priority: P1
+Dependencies: T284
+
+Deliverables:
+- on-device request interception for all web sessions (default + webview-created sessions)
+- tracking query-param stripping with redirect rewrite
+- request/response header sanitation (`X-Genome-Surface`, third-party cookie stripping)
+- privacy event emission channel to renderer (`privacy:event`)
+
+Acceptance:
+- tracking params are removed before outbound navigation
+- third-party resource responses do not keep `Set-Cookie` headers
+- first-party frame cookie headers remain intact
+- privacy helper logic is directly testable outside Electron runtime
+
+Notes:
+- implementation in `electron/main.mjs`, `electron/privacy.mjs`
+- test coverage in `tests/electron-privacy.test.mjs` via `npm run os:test:electron`
+
+---
+
+## T286 - Intent Token Credential Store
+Status: done
+Track: G (desktop shell privacy)
+Priority: P1
+Dependencies: T285
+
+Deliverables:
+- in-memory context+domain token issuer with TTL
+- renderer IPC for set/list/revoke intent contexts
+- request header wiring for `X-Genome-Intent-Token`
+
+Acceptance:
+- same context/domain reuses valid token
+- different context/domain issues isolated token
+- revoking a context clears its active tokens
+
+Notes:
+- implementation in `electron/credentials.mjs`, `electron/main.mjs`, `electron/preload.mjs`, `app.js`
+- test coverage in `tests/electron-credentials.test.mjs` via `npm run os:test:electron`
+
+---
+
+## T287 - Webdeck Full View in Electron (WebView)
+Status: done
+Track: G (desktop shell browser layer)
+Priority: P1
+Dependencies: T286
+
+Deliverables:
+- webdeck full/surface mode remains in intent UI flow
+- Electron full mode uses native `<webview>` instead of iframe
+- browser fallback remains iframe for non-Electron surfaces
+
+Acceptance:
+- full mode on Electron mounts real Chromium webview with site interactivity
+- surface mode restores extracted intent rendering without leaving current scene
+
+Notes:
+- implementation in `app.js`, `index.css`
+
+---
+
+## T288 - Electron Window Controls in Command Bar
+Status: done
+Track: G (desktop shell chrome)
+Priority: P1
+Dependencies: T287
+
+Deliverables:
+- command bar includes close/minimize/maximize controls in Electron
+- body enters `electron-mode` for drag/no-drag regions
+- controls hidden in web runtime
+
+Acceptance:
+- Electron shell shows control dots and invokes window IPC handlers
+- browser runtime does not render desktop controls
+
+Notes:
+- implementation in `index.html`, `app.js`, `index.css`
+
+---
+
+## T289 - Resolved Intent Context Routing for Web Navigation
+Status: done
+Track: G (desktop shell privacy routing)
+Priority: P1
+Dependencies: T286
+
+Deliverables:
+- post-resolution context mapping from latest op/core domain
+- auto context updates for shopping/research/browsing/weather routes
+
+Acceptance:
+- web/search/shopping routes update context before subsequent navigation requests
+- token header scope follows resolved runtime domain, not only raw text regex
+
+Notes:
+- implementation in `app.js`
+
+---
+
+## T290 - Electron Packaging + Distribution Build
+Status: in_progress
+Track: G (desktop shell packaging)
+Priority: P1
+Dependencies: T289
+
+Deliverables:
+- electron-builder targets and installer scripts for Win/Mac/Linux
+- icon/build-resource wiring for distribution artifacts
+- local packaging verification in this environment
+
+Acceptance:
+- `electron:build:*` scripts exist and resolve config
+- packaging produces distributable output when host permissions allow cache extraction/sign tooling
+
+Notes:
+- packaging config/scripts implemented in `package.json`
+- blocker in current host: `electron-builder` fails extracting `winCodeSign` due Windows symlink privilege (`A required privilege is not held by the client`)
+
+---
+
+## T291 - Tauri Mobile Wrapper (iOS/Android)
+Status: in_progress
+Track: G (mobile shell)
+Priority: P1
+Dependencies: T290
+
+Deliverables:
+- Tauri v2 config scaffold targeting existing Vite frontend
+- mobile build scripts (`tauri:dev`, `tauri:build:ios`, `tauri:build:android`)
+- dependency wiring for Tauri CLI/API
+
+Acceptance:
+- mobile wrapper config exists and references current frontend build/dev entrypoints
+- scripts are available in package manifest for simulator/device workflows
+
+Notes:
+- implementation in `src-tauri/tauri.conf.json`, `package.json`
+- local mobile compile not yet executed in this environment (requires Rust + platform SDKs)
+
 ## Suggested Execution Order
 1. T3
 2. T4

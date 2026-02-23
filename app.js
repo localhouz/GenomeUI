@@ -4,6 +4,15 @@ const DEVICE_STORAGE_KEY = 'genui_device_v1';
 const HISTORY_LIMIT = 40;
 const FALLBACK_POLL_MS = 2500;
 const PRESENCE_HEARTBEAT_MS = 30000;
+const WS_RECONNECT_MIN_MS = 1200;
+const WS_RECONNECT_MAX_MS = 20000;
+const WS_RECONNECT_FACTOR = 1.8;
+
+if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => { });
+    });
+}
 
 const DEFAULT_MEMORY = {
     tasks: [
@@ -136,7 +145,9 @@ const UIEngine = {
             graphSnapshotRevision: 0,
             graphFetchInFlight: false,
             isApplyingLocalTurn: false,
-            syncTransport: 'idle'
+            syncTransport: 'idle',
+            networkOnline: true,
+            reconnectAttempts: 0
         },
         history: [],
         intentHistory: [],
@@ -144,15 +155,45 @@ const UIEngine = {
         metrics: {
             latency: 0,
             entropy: 0.02
-        }
+        },
+        sceneDock: {
+            activeDomain: 'generic',
+            lastTransition: null
+        },
+        webdeck: {
+            mode: 'surface'
+        },
+        runtimeEvents: []
     },
 
     async init() {
         this.loadState();
+        this.setupElectronChrome();
         this.setupUXChrome();
+        this.setConnectivity(typeof navigator?.onLine === 'boolean' ? navigator.onLine : true);
         this.bindEvents();
+        this.updateShortcutHint();
         await this.runBootSequence();
         this.showToast('Surface ready. Press ? for command help.', 'info', 3000);
+    },
+
+    setupElectronChrome() {
+        const isElectron = Boolean(window.electronAPI?.isElectron);
+        if (isElectron) {
+            document.body.classList.add('electron-mode');
+        }
+        const controls = document.getElementById('window-controls');
+        if (controls) {
+            controls.style.display = isElectron ? 'inline-flex' : 'none';
+        }
+        const closeBtn = document.getElementById('wc-close');
+        const minBtn = document.getElementById('wc-minimize');
+        const maxBtn = document.getElementById('wc-maximize');
+        if (isElectron) {
+            closeBtn?.addEventListener('click', () => window.electronAPI?.closeWindow?.());
+            minBtn?.addEventListener('click', () => window.electronAPI?.minimizeWindow?.());
+            maxBtn?.addEventListener('click', () => window.electronAPI?.maximizeWindow?.());
+        }
     },
 
     setupUXChrome() {
@@ -169,9 +210,15 @@ const UIEngine = {
                 <div class="help-sub">Intent-first controls for this surface.</div>
                 <div class="help-section">Shortcuts</div>
                 <div class="help-line"><span>/</span><span>Focus command input</span></div>
+                <div class="help-line"><span>Ctrl/Cmd+K</span><span>Focus and select input</span></div>
                 <div class="help-line"><span>?</span><span>Open or close this guide</span></div>
                 <div class="help-line"><span>Esc</span><span>Close guide</span></div>
                 <div class="help-line"><span>Up or Down</span><span>Recall prior intents</span></div>
+                <div class="help-line"><span>Alt+&larr;/&rarr;</span><span>Restore prev or next scene</span></div>
+                <div class="help-line"><span>Alt+Shift+&larr;/&rarr;</span><span>Cycle semantic scene dock</span></div>
+                <div class="help-line"><span>Alt+1..9</span><span>Run numbered quick command</span></div>
+                <div class="help-line"><span>Alt+M</span><span>Toggle webdeck surface/full mode</span></div>
+                <div class="help-line"><span>Swipe &larr;/&rarr;</span><span>Mobile history navigation</span></div>
                 <div class="help-section">Intent Examples</div>
                 <div class="help-line"><span>add task ship mobile shell</span><span>Create task</span></div>
                 <div class="help-line"><span>complete task 1</span><span>Toggle task state</span></div>
@@ -201,6 +248,23 @@ const UIEngine = {
         this.bootProgress = document.getElementById('boot-progress-bar');
         this.bootStage = document.getElementById('boot-stage');
         this.bootMeta = document.getElementById('boot-meta');
+
+        const shortcutHint = document.createElement('div');
+        shortcutHint.id = 'shortcut-hint';
+        this.status.insertAdjacentElement('afterend', shortcutHint);
+        this.shortcutHint = shortcutHint;
+
+        const offline = document.createElement('div');
+        offline.id = 'offline-overlay';
+        offline.innerHTML = `
+            <div class="offline-shell">
+                <div class="offline-title">Offline Mode</div>
+                <div class="offline-copy">Realtime sync is unavailable. Local intent handling is still active.</div>
+                <button type="button" class="offline-retry-btn" data-offline-retry>Retry connection</button>
+            </div>
+        `;
+        document.body.appendChild(offline);
+        this.offlineOverlay = offline;
     },
 
     async runBootSequence() {
@@ -213,10 +277,13 @@ const UIEngine = {
         await sleep(90);
 
         this.setBootState('Compiling startup intent layers', 52);
-        const bootstrapText = 'Show me what I can do';
-        const envelope = IntentLayerCompiler.compile(bootstrapText, this.state.memory);
-        const uiPlan = UIPlanner.build(envelope, this.state.memory, { ok: true, message: 'Surface online.' });
-        this.render(UIPlanSchema.normalize(uiPlan), envelope);
+        const hasHistory = Array.isArray(this.state.history) && this.state.history.length > 0;
+        const hasIntent = Boolean(String(this.state.session.lastIntent || '').trim());
+        if (!hasHistory && !hasIntent) {
+            this.renderWelcome();
+        } else {
+            this.refreshSurface();
+        }
         await sleep(110);
 
         this.setBootState('Synchronizing surface runtime', 78);
@@ -231,6 +298,29 @@ const UIEngine = {
         this.input.focus();
         await sleep(170);
         this.bootOverlay.classList.add('done');
+    },
+
+    renderWelcome() {
+        const welcomeIntents = [
+            'show weather in my city',
+            'show me running shoes',
+            'show my tasks',
+            'search web local-first app design'
+        ];
+        this.container.innerHTML = `
+            <div class="welcome-surface">
+                <div class="welcome-title">Genome Surface OS</div>
+                <div class="welcome-sub">Intent-driven. No apps. Just surface.</div>
+                <div class="welcome-tiles">
+                    ${welcomeIntents.map((intent) => `
+                        <button type="button" class="welcome-tile" data-command="${escapeAttr(intent)}">
+                            <div class="welcome-tile-label">${escapeHtml(intent)}</div>
+                        </button>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+        this.decorateQuickCommandTargets();
     },
 
     setBootState(label, percent) {
@@ -361,13 +451,73 @@ const UIEngine = {
         window.history.replaceState({}, '', url);
     },
 
+    setConnectivity(online, reason = '') {
+        const next = Boolean(online);
+        const prev = Boolean(this.state.session.networkOnline);
+        this.state.session.networkOnline = next;
+        document.body.classList.toggle('network-offline', !next);
+        if (this.offlineOverlay) {
+            this.offlineOverlay.classList.toggle('visible', !next);
+        }
+        if (next) {
+            this.state.session.reconnectAttempts = 0;
+        }
+        if (prev !== next && !next && reason) {
+            this.showToast('Connection lost. Trying to reconnect.', 'warn', 1800);
+        }
+    },
+
+    resetReconnectBackoff() {
+        this._wsReconnectDelay = WS_RECONNECT_MIN_MS;
+        this.state.session.reconnectAttempts = 0;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+    },
+
+    scheduleWebSocketReconnect(source = 'ws') {
+        if (!this.state.session.sessionId) return;
+        if (this._wsReconnectTimer) return;
+        if (this.state.session.syncTransport === 'ws') return;
+        const currentDelay = Math.max(WS_RECONNECT_MIN_MS, Number(this._wsReconnectDelay || WS_RECONNECT_MIN_MS));
+        const jitter = Math.floor(Math.random() * Math.max(1, Math.round(currentDelay * 0.2)));
+        const delay = Math.min(WS_RECONNECT_MAX_MS, currentDelay + jitter);
+        this.state.session.reconnectAttempts = Number(this.state.session.reconnectAttempts || 0) + 1;
+        this._wsReconnectTimer = setTimeout(() => {
+            this._wsReconnectTimer = null;
+            if (!this.state.session.networkOnline && source !== 'online') {
+                this.scheduleWebSocketReconnect(source);
+                return;
+            }
+            this.openWebSocketSync();
+        }, delay);
+        this._wsReconnectDelay = Math.min(WS_RECONNECT_MAX_MS, Math.round(currentDelay * WS_RECONNECT_FACTOR));
+    },
+
+    handleTransportFailure(source, error) {
+        const isNetworkError = !error || error?.name === 'TypeError' || /network|failed to fetch|fetch failed/i.test(String(error?.message || ''));
+        if (isNetworkError) {
+            this.setConnectivity(false, String(source || 'transport'));
+        }
+        if (this.state.session.syncTransport === 'ws') {
+            this.state.session.syncTransport = 'sse';
+            this.openSessionStream();
+        } else if (this.state.session.syncTransport !== 'sse') {
+            this.state.session.syncTransport = 'poll';
+        }
+        this.scheduleWebSocketReconnect(String(source || 'transport'));
+        this.updateStatus(this.state.session.statusMode || 'DEGRADED');
+    },
+
     startRealtimeSync() {
+        this.resetReconnectBackoff();
         this.openWebSocketSync();
         this.startPresenceHeartbeat();
         if (this._syncTimer) clearInterval(this._syncTimer);
         this._syncTimer = setInterval(() => {
             if (this.state.session.syncTransport === 'ws' || this.state.session.syncTransport === 'sse') return;
-            this.pollSession().catch(() => { });
+            this.pollSession().catch((error) => this.handleTransportFailure('poll', error));
         }, FALLBACK_POLL_MS);
     },
 
@@ -389,28 +539,30 @@ const UIEngine = {
         this._ws = ws;
 
         ws.onopen = () => {
+            this.setConnectivity(true);
             this.state.session.syncTransport = 'ws';
+            this.resetReconnectBackoff();
+            this.updateStatus(this.state.session.statusMode || 'SYNCED');
         };
 
         ws.onmessage = (event) => {
             try {
                 const payload = JSON.parse(event.data);
                 this.applyRemoteSync(payload);
+                this.setConnectivity(true);
             } catch {
                 this.state.session.syncTransport = 'poll';
             }
         };
 
-        ws.onerror = () => {
-            this.state.session.syncTransport = 'sse';
-            this.openSessionStream();
+        ws.onerror = (error) => {
+            this.handleTransportFailure('ws', error);
         };
 
         ws.onclose = () => {
             if (this._ws === ws) this._ws = null;
             if (this.state.session.syncTransport !== 'ws') return;
-            this.state.session.syncTransport = 'sse';
-            this.openSessionStream();
+            this.handleTransportFailure('ws_close');
         };
     },
 
@@ -433,18 +585,21 @@ const UIEngine = {
             if (this.state.session.syncTransport !== 'ws') {
                 this.state.session.syncTransport = 'sse';
             }
+            this.setConnectivity(true);
+            this.updateStatus(this.state.session.statusMode || 'SYNCED');
         };
 
         es.onmessage = (event) => {
             try {
                 const payload = JSON.parse(event.data);
                 this.applyRemoteSync(payload);
+                this.setConnectivity(true);
             } catch {
                 this.state.session.syncTransport = 'poll';
             }
         };
 
-        es.onerror = () => {
+        es.onerror = (error) => {
             if (this.state.session.syncTransport !== 'ws') {
                 this.state.session.syncTransport = 'poll';
             }
@@ -452,6 +607,7 @@ const UIEngine = {
                 this._eventSource.close();
                 this._eventSource = null;
             }
+            this.handleTransportFailure('sse', error);
         };
     },
 
@@ -460,6 +616,7 @@ const UIEngine = {
         if (!sessionId || this.state.session.isApplyingLocalTurn) return;
 
         const snapshot = await RemoteTurnService.getSession(sessionId);
+        this.setConnectivity(true);
         const serverRevision = Number(snapshot.revision || 0);
         if (serverRevision <= this.state.session.revision) return;
 
@@ -477,8 +634,49 @@ const UIEngine = {
         this.saveState();
     },
 
+    applyBackgroundEvents(events) {
+        const incoming = Array.isArray(events) ? events : [];
+        if (!incoming.length) return;
+        const prior = Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+        const seen = new Set(prior.map((item) => `${item.id}:${item.ts}`));
+        const next = [...prior];
+        for (const item of incoming) {
+            if (!item || typeof item !== 'object') continue;
+            const jobId = String(item.jobId || '');
+            const createdAt = Number(item.createdAt || Date.now());
+            const key = `${jobId}:${createdAt}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const title = String(item.title || 'Background event').trim();
+            const message = String(item.message || '').trim();
+            next.push({
+                id: jobId || key,
+                type: String(item.type || 'event'),
+                ts: createdAt,
+                title,
+                message
+            });
+            const eventType = String(item.type || 'event');
+            if (eventType === 'continuity_alert') {
+                this.showToast(`${message || title}`, 'warn', 5000);
+                if (this.status) {
+                    this.status.dataset.alert = 'continuity';
+                }
+            } else {
+                this.showToast(`${title}: ${message || 'updated'}`, 'info', 2600);
+            }
+        }
+        this.state.runtimeEvents = next.slice(-8);
+    },
+
     applyRemoteSync(payload) {
         if (!payload || this.state.session.isApplyingLocalTurn) return;
+        if (payload.type === 'continuity_alert') {
+            const msg = String(payload.message || 'Continuity alert').slice(0, 120);
+            this.showToast(msg, 'warn', 5000);
+            if (this.status) this.status.dataset.alert = 'continuity';
+            return;
+        }
         const revision = Number(payload.revision || 0);
         if (revision <= this.state.session.revision) return;
 
@@ -487,6 +685,7 @@ const UIEngine = {
         this.state.memory = payload.memory || this.state.memory;
         this.state.session.handoff = payload.handoff || this.state.session.handoff;
         this.state.session.presence = payload.presence || this.state.session.presence;
+        this.applyBackgroundEvents(payload.backgroundEvents);
         if (payload.lastTurn?.envelope && payload.lastTurn?.plan) {
             const plan = UIPlanSchema.normalize(payload.lastTurn.plan);
             this.state.session.lastExecution = payload.lastTurn.execution || this.state.session.lastExecution;
@@ -521,6 +720,54 @@ const UIEngine = {
         });
 
         document.addEventListener('keydown', (event) => {
+            const isMac = /mac/i.test(String(navigator.platform || ''));
+            const accel = isMac ? event.metaKey : event.ctrlKey;
+            if (accel && String(event.key || '').toLowerCase() === 'k') {
+                event.preventDefault();
+                this.input.focus();
+                this.input.select();
+                return;
+            }
+
+            if (event.altKey && event.key === 'ArrowLeft') {
+                event.preventDefault();
+                this.stepHistory(-1);
+                return;
+            }
+
+            if (event.altKey && event.key === 'ArrowRight') {
+                event.preventDefault();
+                this.stepHistory(1);
+                return;
+            }
+
+            if (event.altKey && event.shiftKey && event.key === 'ArrowLeft') {
+                event.preventDefault();
+                this.stepSceneDomain(-1);
+                return;
+            }
+
+            if (event.altKey && event.shiftKey && event.key === 'ArrowRight') {
+                event.preventDefault();
+                this.stepSceneDomain(1);
+                return;
+            }
+
+            if (event.altKey && /^[1-9]$/.test(String(event.key || ''))) {
+                event.preventDefault();
+                const idx = Math.max(0, Number(event.key) - 1);
+                this.executeQuickCommand(idx);
+                return;
+            }
+
+            if (event.altKey && String(event.key || '').toLowerCase() === 'm') {
+                if (this.container.querySelector('.scene-webdeck')) {
+                    event.preventDefault();
+                    this.toggleWebdeckMode();
+                    return;
+                }
+            }
+
             if (event.key === 'Escape') {
                 this.toggleHelp(false);
                 return;
@@ -553,6 +800,19 @@ const UIEngine = {
         });
 
         this.container.addEventListener('click', (event) => {
+            const webdeckModeBtn = event.target.closest('[data-webdeck-mode-toggle]');
+            if (webdeckModeBtn) {
+                this.toggleWebdeckMode();
+                return;
+            }
+
+            const sceneButton = event.target.closest('[data-scene-domain]');
+            if (sceneButton) {
+                const domain = String(sceneButton.dataset.sceneDomain || '').trim().toLowerCase();
+                if (domain) this.switchToSceneDomain(domain);
+                return;
+            }
+
             const suggestion = event.target.closest('[data-command]');
             if (!suggestion) return;
             const command = suggestion.dataset.command;
@@ -568,14 +828,99 @@ const UIEngine = {
             this.restoreFromHistory(Number(node.dataset.historyIndex));
         });
 
+        // Touch-first history swipe (mobile/tablet): horizontal swipe restores prior/next surface.
+        this.container.addEventListener('pointerdown', (event) => {
+            if (String(event.pointerType || '') !== 'touch') return;
+            this._swipeStart = { x: Number(event.clientX || 0), y: Number(event.clientY || 0), ts: Date.now() };
+        });
+        this.container.addEventListener('pointerup', (event) => {
+            const start = this._swipeStart;
+            this._swipeStart = null;
+            if (!start || String(event.pointerType || '') !== 'touch') return;
+            const dx = Number(event.clientX || 0) - start.x;
+            const dy = Number(event.clientY || 0) - start.y;
+            const dt = Date.now() - Number(start.ts || 0);
+            if (dt > 900) return;
+            if (Math.abs(dx) < 80 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+            if (start.y <= 120) {
+                this.stepSceneDomain(dx > 0 ? -1 : 1);
+                return;
+            }
+            this.navigateIntentHistory(dx > 0 ? -1 : 1);
+        });
+
+        this.container.addEventListener('touchstart', (event) => {
+            const touch = event.touches && event.touches.length ? event.touches[0] : null;
+            if (!touch) return;
+            this._touchSwipeStart = { x: Number(touch.clientX || 0), y: Number(touch.clientY || 0), ts: Date.now() };
+        }, { passive: true });
+        this.container.addEventListener('touchend', (event) => {
+            const start = this._touchSwipeStart;
+            this._touchSwipeStart = null;
+            const touch = event.changedTouches && event.changedTouches.length ? event.changedTouches[0] : null;
+            if (!start || !touch) return;
+            const dx = Number(touch.clientX || 0) - Number(start.x || 0);
+            const dy = Number(touch.clientY || 0) - Number(start.y || 0);
+            const dt = Date.now() - Number(start.ts || 0);
+            const isHorizontal = Math.abs(dx) > Math.abs(dy) * 1.5;
+            if (!isHorizontal || dt > 360 || Math.abs(dx) < 64) return;
+            if (Number(start.y || 0) <= 120) {
+                this.stepSceneDomain(dx > 0 ? -1 : 1);
+                return;
+            }
+            this.navigateIntentHistory(dx > 0 ? -1 : 1);
+        }, { passive: true });
+
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') {
                 this.sendPresenceHeartbeat(true).catch(() => { });
+                if (!this._sceneAnimFrame && this.container.querySelector('.scene-canvas')) {
+                    this.activateSceneGraphics();
+                }
+            } else {
+                this.teardownSceneGraphics();
             }
+        });
+
+        window.addEventListener('resize', () => {
+            this.updateShortcutHint();
+        });
+
+        window.addEventListener('offline', () => {
+            this.state.session.syncTransport = 'poll';
+            this.setConnectivity(false, 'offline');
+            if (this._ws) {
+                this._ws.close();
+                this._ws = null;
+            }
+            if (this._eventSource) {
+                this._eventSource.close();
+                this._eventSource = null;
+            }
+            this.updateStatus(this.state.session.statusMode || 'OFFLINE');
+        });
+
+        window.addEventListener('online', () => {
+            this.setConnectivity(true);
+            this.openWebSocketSync();
+            this.pollSession().catch((error) => this.handleTransportFailure('online_probe', error));
+        });
+
+        document.addEventListener('click', (event) => {
+            const target = event.target instanceof Element ? event.target : null;
+            if (!target) return;
+            const retry = target.closest('[data-offline-retry]');
+            if (!retry) return;
+            this.setConnectivity(true);
+            this.openWebSocketSync();
+            this.pollSession().catch((error) => this.handleTransportFailure('manual_retry', error));
         });
 
         window.addEventListener('beforeunload', () => {
             this.stopPresenceHeartbeat();
+            if (this._wsReconnectTimer) clearTimeout(this._wsReconnectTimer);
+            if (this._ws) this._ws.close();
+            if (this._eventSource) this._eventSource.close();
         });
     },
 
@@ -608,6 +953,10 @@ const UIEngine = {
         }
     },
 
+    navigateIntentHistory(direction) {
+        this.stepHistory(direction);
+    },
+
     async sendPresenceHeartbeat(force = false) {
         const sid = this.state.session.sessionId;
         const did = this.state.session.deviceId;
@@ -629,6 +978,16 @@ const UIEngine = {
             ? forceState
             : !this.helpOverlay.classList.contains('visible');
         this.helpOverlay.classList.toggle('visible', nextState);
+    },
+
+    toggleWebdeckMode() {
+        const current = String(this.state.webdeck?.mode || 'surface');
+        this.state.webdeck.mode = current === 'full' ? 'surface' : 'full';
+        this.saveState();
+        if (this.state.session.lastPlan && this.state.session.lastEnvelope) {
+            this.render(this.state.session.lastPlan, this.state.session.lastEnvelope, this.state.session.lastKernelTrace);
+            this.showToast(`Webdeck mode: ${this.state.webdeck.mode}`, 'info', 1400);
+        }
     },
 
     recallIntent(direction) {
@@ -662,6 +1021,27 @@ const UIEngine = {
         this.state.intentHistoryIndex = this.state.intentHistory.length;
     },
 
+    inferIntentContext(text) {
+        const lower = String(text || '').toLowerCase();
+        if (/shoe|outfit|puma|nike|adidas|shop|buy/.test(lower)) return 'shopping';
+        if (/search web|website|url|browse|summarize website|news/.test(lower)) return 'research';
+        if (/weather|location/.test(lower)) return 'weather';
+        if (/task|note|expense|graph/.test(lower)) return 'workspace';
+        return 'general';
+    },
+
+    contextFromLatest(core, execution) {
+        const latest = this.latestToolResult(execution) || {};
+        const op = String(latest.op || '').toLowerCase();
+        const kind = String(core?.kind || '').toLowerCase();
+        if (op.includes('shopping') || kind === 'shopping') return 'shopping';
+        if (op === 'web_search') return 'research';
+        if (op === 'fetch_url' || op === 'web_summarize') return 'browsing';
+        if (op.includes('weather') || kind === 'weather') return 'weather';
+        if (kind === 'webdeck') return 'browsing';
+        return this.inferIntentContext(this.state.session.lastIntent || '');
+    },
+
     showToast(message, type = 'info', duration = 1800) {
         if (!this.toast) return;
         this.toast.className = `visible tone-${type}`;
@@ -676,6 +1056,9 @@ const UIEngine = {
     async handleIntent(text) {
         if (!text) return;
         this.rememberIntent(text);
+        if (window.electronAPI?.isElectron && typeof window.electronAPI?.setIntentContext === 'function') {
+            window.electronAPI.setIntentContext(this.inferIntentContext(text));
+        }
         const handoffIntent = this.parseHandoffIntent(text);
         if (handoffIntent) {
             try {
@@ -753,6 +1136,7 @@ const UIEngine = {
                 this.inputContainer.classList.remove('active-intent');
                 return;
             }
+            this.handleTransportFailure('turn', error);
             envelope = IntentLayerCompiler.compile(text, this.state.memory);
             execution = ActionExecutor.run(envelope.stateIntent.writeOperations, this.state.memory);
             kernelTrace = this.deriveKernelTrace(execution, { target: 'local-fallback', reason: 'backend unavailable', model: null });
@@ -765,6 +1149,10 @@ const UIEngine = {
         this.state.session.lastEnvelope = envelope;
         this.state.session.lastExecution = execution;
         this.state.session.lastKernelTrace = kernelTrace;
+        const latestOps = Array.isArray(execution?.toolResults) ? execution.toolResults.map((item) => String(item?.op || '')).filter(Boolean) : [];
+        if (latestOps.includes('clear_continuity_alerts') && this.status) {
+            delete this.status.dataset.alert;
+        }
         this.render(safePlan, envelope, kernelTrace);
         this.pushHistory(text, envelope, execution, safePlan, plannerSource, kernelTrace, mergeInfo);
 
@@ -810,14 +1198,23 @@ const UIEngine = {
         this.input.placeholder = `Try: "${hint}"`;
         const blocks = this.composeFeedBlocks(plan, envelope, kernelTrace);
         const core = this.buildCoreSurface(plan, envelope, this.state.session.lastExecution);
+        if (window.electronAPI?.isElectron && typeof window.electronAPI?.setIntentContext === 'function') {
+            window.electronAPI.setIntentContext(this.contextFromLatest(core, this.state.session.lastExecution));
+        }
         const visual = this.buildPrimaryVisual(core, this.state.session.lastExecution, envelope, plan);
-        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files'].includes(core.kind);
+        const priorDomain = String(this.state.sceneDock.activeDomain || 'generic');
+        const nextDomain = String(core.kind || 'generic');
+        this.state.sceneDock.lastTransition = this.computeSceneTransition(priorDomain, nextDomain);
+        this.state.sceneDock.activeDomain = nextDomain;
+        const sceneDock = this.renderSceneDock(nextDomain);
+        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes'].includes(core.kind);
         const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
         const railBlocks = this.buildImmersiveRailBlocks(blocks);
         this.container.innerHTML = `
             <div class="workspace immersive">
                 <section class="workspace-main">
                     <div class="surface-core immersive ${escapeAttr(core.kind || 'generic')} ${escapeAttr(core.theme || '')}">
+                        ${sceneDock}
                         ${visual}
                         ${showCoreCopy ? `
                             <div class="surface-label">Workspace</div>
@@ -833,8 +1230,226 @@ const UIEngine = {
                 </aside>
             </div>
         `;
+        this.decorateQuickCommandTargets();
+        this.applySceneEntryMotion();
         this.activateSceneGraphics();
         this.maybePrefetchGraphSnapshot(core);
+    },
+
+    decorateQuickCommandTargets() {
+        const all = Array.from(this.container.querySelectorAll('[data-command]'));
+        for (const node of all) {
+            node.classList.remove('quick-hotkey-target');
+            node.removeAttribute('data-hotkey-index');
+        }
+        all.slice(0, 9).forEach((node, idx) => {
+            const index = idx + 1;
+            node.classList.add('quick-hotkey-target');
+            node.setAttribute('data-hotkey-index', String(index));
+            const baseTitle = String(node.getAttribute('title') || '').trim();
+            const suffix = `Alt+${index}`;
+            node.setAttribute('title', baseTitle ? `${baseTitle} | ${suffix}` : suffix);
+        });
+    },
+
+    applySceneEntryMotion() {
+        const surface = this.container.querySelector('.surface-core');
+        if (surface) {
+            surface.classList.remove('scene-enter');
+            surface.classList.remove(
+                'scene-domain-transition',
+                'scene-domain-transition-active',
+                'scene-workspace',
+                'scene-portal',
+                'scene-atmosphere',
+                'scene-morph',
+                'scene-forward',
+                'scene-back'
+            );
+            // Force restart of CSS keyframe when scene type changes.
+            void surface.offsetWidth;
+            surface.classList.add('scene-enter');
+            const transition = this.state.sceneDock.lastTransition || null;
+            if (transition && transition.changed) {
+                surface.classList.add(
+                    'scene-domain-transition',
+                    `scene-${transition.kind}`,
+                    `scene-${transition.direction}`
+                );
+                surface.setAttribute('data-scene-from', transition.from);
+                surface.setAttribute('data-scene-to', transition.to);
+                // Stage animation in next frame so class toggles reliably across rapid scene switches.
+                requestAnimationFrame(() => surface.classList.add('scene-domain-transition-active'));
+                setTimeout(() => {
+                    surface.classList.remove(
+                        'scene-domain-transition',
+                        'scene-domain-transition-active',
+                        'scene-workspace',
+                        'scene-portal',
+                        'scene-atmosphere',
+                        'scene-morph',
+                        'scene-forward',
+                        'scene-back'
+                    );
+                }, 420);
+            } else {
+                surface.removeAttribute('data-scene-from');
+                surface.setAttribute('data-scene-to', String(this.state.sceneDock.activeDomain || 'generic'));
+            }
+        }
+        const rail = this.container.querySelector('.workspace-side.immersive-rail');
+        if (rail) {
+            rail.classList.remove('rail-enter');
+            rail.classList.remove('rail-domain-transition');
+            void rail.offsetWidth;
+            rail.classList.add('rail-enter');
+            const transition = this.state.sceneDock.lastTransition || null;
+            if (transition && transition.changed) {
+                rail.classList.add('rail-domain-transition');
+                setTimeout(() => rail.classList.remove('rail-domain-transition'), 360);
+            }
+        }
+    },
+
+    sceneDomainOptions() {
+        return [
+            { id: 'tasks', label: 'tasks' },
+            { id: 'expenses', label: 'expenses' },
+            { id: 'notes', label: 'notes' },
+            { id: 'graph', label: 'graph' },
+            { id: 'files', label: 'files' },
+            { id: 'weather', label: 'weather' },
+            { id: 'location', label: 'location' },
+            { id: 'shopping', label: 'shopping' },
+            { id: 'webdeck', label: 'web' },
+            { id: 'social', label: 'social' },
+            { id: 'banking', label: 'banking' },
+            { id: 'contacts', label: 'contacts' },
+            { id: 'telephony', label: 'calls' },
+            { id: 'generic', label: 'general' }
+        ];
+    },
+
+    computeSceneTransition(fromDomain, toDomain) {
+        const from = String(fromDomain || 'generic');
+        const to = String(toDomain || 'generic');
+        if (from === to) {
+            return { from, to, changed: false, kind: 'morph', direction: 'forward' };
+        }
+
+        const workspace = new Set(['tasks', 'expenses', 'notes', 'graph', 'files']);
+        const portal = new Set(['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony']);
+        const atmosphere = new Set(['weather', 'location']);
+
+        let kind = 'morph';
+        if (workspace.has(to)) kind = 'workspace';
+        else if (portal.has(to)) kind = 'portal';
+        else if (atmosphere.has(to)) kind = 'atmosphere';
+
+        const order = this.sceneDomainOptions().map((item) => item.id);
+        const fromIndex = Math.max(0, order.indexOf(from));
+        const toIndex = Math.max(0, order.indexOf(to));
+        const direction = toIndex >= fromIndex ? 'forward' : 'back';
+        return { from, to, changed: true, kind, direction };
+    },
+
+    renderSceneDock(activeDomain) {
+        const options = this.sceneDomainOptions();
+        const current = String(activeDomain || 'generic');
+        return `
+            <div class="scene-dock" aria-label="scene domains">
+                ${options.map((item) => `
+                    <button
+                        class="scene-dock-node ${item.id === current ? 'active' : ''}"
+                        type="button"
+                        data-scene-domain="${escapeAttr(item.id)}"
+                        title="Switch to ${escapeAttr(item.label)} scene"
+                    >${escapeHtml(item.label)}</button>
+                `).join('')}
+            </div>
+        `;
+    },
+
+    inferHistoryEntryDomain(entry) {
+        if (!entry || typeof entry !== 'object') return 'generic';
+        const execution = entry.executionSnapshot || null;
+        const core = this.buildCoreSurface(entry.plan || {}, entry.envelope || {}, execution);
+        return String(core?.kind || 'generic');
+    },
+
+    sceneDomainToIntent(domain) {
+        const byDomain = {
+            tasks: 'show tasks',
+            expenses: 'show expenses',
+            notes: 'show notes',
+            graph: 'show graph summary',
+            files: 'show files',
+            weather: "what's the weather where i am",
+            location: 'where am i',
+            shopping: 'show me running shoes',
+            webdeck: 'open example.com',
+            social: 'show my social feed',
+            banking: 'show account balances',
+            contacts: 'show contacts',
+            telephony: 'show call status',
+            generic: 'show me what i can do'
+        };
+        return byDomain[String(domain || 'generic')] || byDomain.generic;
+    },
+
+    buildShoppingRefineCommands(brandName, rawQuery = '', category = 'shoes') {
+        const brand = String(brandName || '').trim();
+        const query = String(rawQuery || '').trim().toLowerCase();
+        const cat = String(category || 'shoes').trim().toLowerCase() || 'shoes';
+        const gender = /\bwomen|womens|female|ladies\b/.test(query) ? 'for women' : 'for men';
+        const sizeMatch = query.match(/\bsize\s*\d{1,2}(?:\s*(?:1\/2|\.5|½))?\b|\b\d{1,2}\s*(?:1\/2|\.5|½)\b/i);
+        const sizeChunk = sizeMatch ? String(sizeMatch[0]).replace(/\s+/g, ' ').trim() : '';
+        const sizePhrase = sizeChunk ? `${sizeChunk.startsWith('size') ? sizeChunk : `size ${sizeChunk}`} ` : '';
+        const stem = [brand, cat].filter(Boolean).join(' ').trim() || cat;
+        const seeds = [
+            `show me ${sizePhrase}${stem} ${gender}`.replace(/\s+/g, ' ').trim(),
+            `show me ${brand || ''} running ${cat} ${gender}`.replace(/\s+/g, ' ').trim(),
+            `show me ${brand || ''} lifestyle ${cat} ${gender}`.replace(/\s+/g, ' ').trim(),
+            `show me ${brand || ''} ${cat} on sale ${gender}`.replace(/\s+/g, ' ').trim(),
+        ];
+        const out = [];
+        const seen = new Set();
+        for (const item of seeds) {
+            const cmd = String(item || '').trim();
+            const key = cmd.toLowerCase();
+            if (!cmd || seen.has(key)) continue;
+            seen.add(key);
+            out.push(cmd);
+            if (out.length >= 4) break;
+        }
+        return out;
+    },
+
+    switchToSceneDomain(domain) {
+        const target = String(domain || '').trim().toLowerCase();
+        if (!target) return;
+        let matchIndex = -1;
+        for (let i = this.state.history.length - 1; i >= 0; i -= 1) {
+            const entry = this.state.history[i];
+            const entryDomain = this.inferHistoryEntryDomain(entry);
+            if (entryDomain === target) {
+                matchIndex = i;
+                break;
+            }
+        }
+        if (matchIndex >= 0) {
+            this.restoreFromHistory(matchIndex);
+            return;
+        }
+        this.handleIntent(this.sceneDomainToIntent(target));
+    },
+
+    stepSceneDomain(delta) {
+        const options = this.sceneDomainOptions().map((item) => item.id);
+        const current = String(this.state.sceneDock.activeDomain || 'generic');
+        const index = Math.max(0, options.indexOf(current));
+        const next = (index + options.length + Number(delta || 0)) % options.length;
+        this.switchToSceneDomain(options[next]);
     },
 
     normalizeGraphSnapshot(snapshot) {
@@ -893,7 +1508,7 @@ const UIEngine = {
 
     buildImmersiveRailBlocks(blocks) {
         const list = Array.isArray(blocks) ? blocks : [];
-        const preferredOrder = ['trace-result', 'trace-next', 'trace-system', 'trace-connectors'];
+        const preferredOrder = ['trace-result', 'trace-events', 'trace-next', 'trace-system', 'trace-connectors'];
         const sorted = [...list].sort((a, b) => preferredOrder.indexOf(a.id) - preferredOrder.indexOf(b.id));
         return sorted.slice(0, 4).map((block) => this.renderFeedBlock(block)).join('');
     },
@@ -1012,6 +1627,7 @@ const UIEngine = {
             .map((entry) => `${entry.ok ? 'ok' : 'denied'} ${entry.op} | dT ${entry.diff?.tasks ?? 0}, dE ${entry.diff?.expenses ?? 0}, dN ${entry.diff?.notes ?? 0}`);
         const systemItems = this.buildSystemItems(trace, policyCodes, diff, envelope);
         const connectorAccessItems = this.buildConnectorAccessItems(this.state.session.lastExecution);
+        const liveEventItems = this.buildLiveEventItems();
 
         const primary = [
             {
@@ -1020,6 +1636,12 @@ const UIEngine = {
                 label: 'Result',
                 items: resultItems
             },
+            ...(liveEventItems.length ? [{
+                id: 'trace-events',
+                type: 'list',
+                label: 'Live Events',
+                items: liveEventItems
+            }] : []),
             {
                 id: 'trace-next',
                 type: 'list',
@@ -1189,6 +1811,20 @@ const UIEngine = {
         ];
     },
 
+    buildLiveEventItems() {
+        const items = Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+        return items
+            .slice(-4)
+            .reverse()
+            .map((item) => {
+                const when = Number(item?.ts || 0);
+                const stamp = when ? new Date(when).toLocaleTimeString() : '';
+                const title = String(item?.title || 'event').trim();
+                const message = String(item?.message || '').trim();
+                return `${stamp ? `${stamp} | ` : ''}${title}${message ? `: ${message}` : ''}`;
+            });
+    },
+
     buildExecutionResultItems(execution) {
         const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
         const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
@@ -1240,7 +1876,17 @@ const UIEngine = {
         const fallbackSummary = plan.subtitle || 'Surface online.';
         const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
         const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
-        if (!latest || !latest.ok) {
+        const domains = Array.isArray(envelope?.stateIntent?.readDomains) ? envelope.stateIntent.readDomains : [];
+        const domain = String(domains[0] || 'generic');
+        if (!latest) {
+            if (domain === 'tasks') return { headline: 'Task Flow', summary: 'Generated task workspace', variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
+            if (domain === 'expenses') return { headline: 'Spend Pulse', summary: 'Generated expense workspace', variant: 'result', kind: 'expenses', theme: 'theme-expenses' };
+            if (domain === 'notes') return { headline: 'Knowledge Stream', summary: 'Generated notes workspace', variant: 'result', kind: 'notes', theme: 'theme-notes' };
+            if (domain === 'graph') return { headline: 'System Graph', summary: 'Generated relation workspace', variant: 'result', kind: 'graph', theme: 'theme-graph' };
+            if (domain === 'files') return { headline: 'File Surface', summary: 'Generated file workspace', variant: 'result', kind: 'files', theme: 'theme-files' };
+            return { headline: fallbackHeadline, summary: fallbackSummary, variant: 'intent', kind: 'generic', theme: 'theme-neutral' };
+        }
+        if (!latest.ok) {
             return { headline: fallbackHeadline, summary: fallbackSummary, variant: 'intent', kind: 'generic', theme: 'theme-neutral' };
         }
         if (latest.op === 'weather_forecast') {
@@ -1408,8 +2054,6 @@ const UIEngine = {
             };
         }
         const summary = String(latest.message || fallbackSummary);
-        const domains = Array.isArray(envelope?.stateIntent?.readDomains) ? envelope.stateIntent.readDomains : [];
-        const domain = String(domains[0] || 'generic');
         if (domain === 'tasks') {
             return { headline: 'Task Flow', summary: 'Generated task workspace', variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
         }
@@ -1465,6 +2109,10 @@ const UIEngine = {
                 const brandPrimary = String(sourceTarget?.brandColors?.primary || '#1d1d1b').trim();
                 const brandAccent  = String(sourceTarget?.brandColors?.accent  || '#00a651').trim();
                 const fitSignal    = String(info.query || this.state.session.lastIntent || '').trim();
+                const refineCommands = this.buildShoppingRefineCommands(brandName || dominantBrand, fitSignal, String(info.category || 'shoes'));
+                const refineHtml = refineCommands.map((cmd) => `
+                    <button type="button" class="shop-refine-chip" data-command="${escapeAttr(cmd)}">${escapeHtml(cmd.replace(/^show me\s+/i, ''))}</button>
+                `).join('');
                 // Semantic activity detection — drives the canvas environment
                 const titleCorpus = sourceItems.map(i => String(i.title || '')).join(' ');
                 const activityStr = (fitSignal + ' ' + titleCorpus).toLowerCase();
@@ -1485,6 +2133,7 @@ const UIEngine = {
                 const heroTitle    = String(hero.title || `${brandName} picks`).trim();
                 const heroPrice    = hero.priceUsd ? formatCurrency(Number(hero.priceUsd)) : '';
                 const heroUrl      = String(hero.url || brandLink).trim();
+                const liveFrameUrl = brandLink;
                 const railItems    = sourceItems.slice(1).map((item) => {
                     const imgSrc  = String(item.imageUrl || '').trim()
                                       .replace(/b_rgb:[0-9a-fA-F]{3,6}/, `b_rgb:${heroBgHex}`);
@@ -1523,15 +2172,18 @@ const UIEngine = {
                             <span>${escapeHtml(String(sourceItems.length))} products</span>
                             <span>intent matched</span>
                         </div>
+                        ${refineHtml ? `<div class="shop-refine-row">${refineHtml}</div>` : ''}
                         <div class="shop-stage-body">
-                            <a class="shop-stage-hero" href="${escapeAttr(heroUrl)}" target="_blank" rel="noopener noreferrer">
-                                ${heroImage ? `<img src="${escapeAttr(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="eager" />` : '<div class="shop-stage-hero-fallback"></div>'}
+                            <div class="shop-stage-hero">
+                                ${liveFrameUrl ? `<iframe class="shop-stage-live-frame" src="${escapeAttr(liveFrameUrl)}" title="${escapeAttr(`${brandName || 'brand'} live source`)}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>` : ''}
+                                ${heroImage ? `<img class="shop-stage-hero-fallback-image" src="${escapeAttr(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="lazy" />` : '<div class="shop-stage-hero-fallback"></div>'}
                                 <div class="shop-stage-hero-tint"></div>
                                 <div class="shop-stage-hero-meta">
                                     <div class="shop-stage-hero-title">${escapeHtml(heroTitle)}</div>
                                     ${heroPrice ? `<div class="shop-stage-hero-price">${escapeHtml(heroPrice)}</div>` : ''}
+                                    <a class="shop-stage-open-live" href="${escapeAttr(heroUrl)}" target="_blank" rel="noopener noreferrer">open product</a>
                                 </div>
-                            </a>
+                            </div>
                             <div class="shop-stage-rail">
                                 ${railItems}
                             </div>
@@ -1559,6 +2211,10 @@ const UIEngine = {
                     </a>
                 `;
             }).join('');
+            const refineCommands = this.buildShoppingRefineCommands(dominantBrand, String(info.query || this.state.session.lastIntent || ''), String(info.category || 'shoes'));
+            const refineHtml = refineCommands.map((cmd) => `
+                <button type="button" class="shop-refine-chip" data-command="${escapeAttr(cmd)}">${escapeHtml(cmd.replace(/^show me\s+/i, ''))}</button>
+            `).join('');
             return `
                 <div class="scene scene-shopping interactive">
                     <div class="scene-orb orb-a"></div>
@@ -1570,13 +2226,14 @@ const UIEngine = {
                             ${escapeHtml(brandLabel)}
                         </a>
                     </div>
+                    ${refineHtml ? `<div class="shop-refine-row shop-refine-row-catalog">${refineHtml}</div>` : ''}
                     <div class="shop-gallery shop-gallery-masonry">${cards}</div>
                 </div>
             `;
         }
         if (core.kind === 'social') {
             const info = core.info || {};
-            const items = Array.isArray(info.items) ? info.items.slice(0, 8) : [];
+            const items = Array.isArray(info.items) ? info.items.slice(0, 12) : [];
             const source = String(info.source || 'scaffold').trim();
             const message = String(info.message || '').trim();
             const delivery = String(info.delivery || '').trim();
@@ -1661,7 +2318,7 @@ const UIEngine = {
                 return `<article class="contacts-card">
                     <div class="contacts-name">${escapeHtml(name)}</div>
                     <div class="contacts-meta">${escapeHtml([label, phone].filter(Boolean).join(' | '))}</div>
-                    ${phone ? `<button class="contacts-call-btn" data-phone="${escapeAttr(phone)}" type="button">prepare call</button>` : ''}
+                    ${phone ? `<button class="contacts-call-btn" data-command="${escapeAttr(`confirm call ${phone}`)}" type="button">prepare call</button>` : ''}
                 </article>`;
             }).join('');
             return `
@@ -1798,6 +2455,7 @@ const UIEngine = {
                 <div class="tasks-row">
                     <span class="tasks-row-index">${escapeHtml(String(idx + 1))}</span>
                     <span class="tasks-row-title">${escapeHtml(String(item.title || 'Task'))}</span>
+                    ${topOpen.length ? `<button class="tasks-row-action" type="button" data-command="${escapeAttr(`complete task ${idx + 1}`)}">complete</button>` : ''}
                 </div>
             `).join('');
             const doneHtml = (topDone.length ? topDone : [{ title: 'No completed tasks' }]).map((item) => `
@@ -1830,7 +2488,11 @@ const UIEngine = {
             const treeHtml = items.map((item) => {
                 const name = String(item?.name || item || '').trim();
                 const type = String(item?.type || (name.endsWith('/') ? 'dir' : 'file')).trim();
-                return `<div class="files-node ${escapeAttr(type)}">${escapeHtml(name || '(item)')}</div>`;
+                const cleanBase = path && path !== '.' ? String(path).replace(/\/+$/g, '') : '';
+                const cleanName = name.replace(/\/+$/g, '');
+                const nodePath = cleanBase ? `${cleanBase}/${cleanName}` : cleanName;
+                const command = type === 'dir' ? `list files ${nodePath}` : `read file ${nodePath}`;
+                return `<button class="files-node ${escapeAttr(type)}" type="button" data-command="${escapeAttr(command)}">${escapeHtml(name || '(item)')}</button>`;
             }).join('');
             return `<div class="scene scene-files interactive">
                 <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
@@ -1846,24 +2508,72 @@ const UIEngine = {
             </div>`;
         }
         if (core.kind === 'expenses') {
-            const expenses = (this.state.memory?.expenses || []).slice(0, 6);
+            const expenses = (this.state.memory?.expenses || []).slice(0, 12);
             const total = expenses.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-            const bars = expenses.map((e) => {
-                const amount = Number(e.amount || 0);
-                const pct = Math.max(8, Math.min(100, (amount / Math.max(1, total)) * 100));
-                return `<div class="expense-row"><div class="expense-label">${escapeHtml(String(e.category || 'misc'))}</div><div class="expense-bar"><span style="width:${pct}%"></span></div><div class="expense-amt">${escapeHtml(formatCurrency(amount))}</div></div>`;
+            const byCategory = new Map();
+            for (const e of expenses) {
+                const k = String(e?.category || 'misc').trim().toLowerCase() || 'misc';
+                byCategory.set(k, (byCategory.get(k) || 0) + Number(e?.amount || 0));
+            }
+            const topCats = Array.from(byCategory.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 5);
+            const bars = topCats.map(([category, amount]) => {
+                const pct = Math.max(6, Math.min(100, (Number(amount || 0) / Math.max(1, total)) * 100));
+                return `<div class="expenses-cat-row">
+                    <div class="expenses-cat-label">${escapeHtml(category)}</div>
+                    <div class="expenses-cat-bar"><span style="width:${pct}%"></span></div>
+                    <div class="expenses-cat-amt">${escapeHtml(formatCurrency(Number(amount || 0)))}</div>
+                </div>`;
             }).join('');
-            return `<div class="scene scene-domain scene-expenses">
+            const ledger = expenses.slice(0, 8).map((e) => {
+                const category = String(e?.category || 'misc').trim();
+                const note = String(e?.note || '').trim();
+                const amount = Number(e?.amount || 0);
+                return `<div class="expenses-ledger-row">
+                    <div class="expenses-ledger-main">${escapeHtml(category)}</div>
+                    <div class="expenses-ledger-note">${escapeHtml(note || '-')}</div>
+                    <div class="expenses-ledger-amt">${escapeHtml(formatCurrency(amount))}</div>
+                </div>`;
+            }).join('');
+            const avg = expenses.length ? total / expenses.length : 0;
+            return `<div class="scene scene-domain scene-expenses interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="expenses" data-total="${escapeAttr(String(total.toFixed(2)))}" data-items="${escapeAttr(String(expenses.length))}"></canvas>
-                <div class="expense-panel">${bars || '<div class="expense-row"><div class="expense-label">no spend</div><div class="expense-bar"><span style="width:12%"></span></div><div class="expense-amt">$0.00</div></div>'}</div>
+                <div class="expenses-shell">
+                    <div class="expenses-kpi-card">
+                        <div class="expenses-kpi-label">total spend</div>
+                        <div class="expenses-kpi-value">${escapeHtml(formatCurrency(total))}</div>
+                        <div class="expenses-kpi-sub">${escapeHtml(String(expenses.length))} entries | avg ${escapeHtml(formatCurrency(avg))}</div>
+                    </div>
+                    <div class="expenses-cats-card">${bars || '<div class="expenses-cat-row"><div class="expenses-cat-label">no spend</div><div class="expenses-cat-bar"><span style="width:12%"></span></div><div class="expenses-cat-amt">$0.00</div></div>'}</div>
+                    <div class="expenses-ledger-card">${ledger || '<div class="expenses-ledger-row"><div class="expenses-ledger-main">No expenses yet</div><div class="expenses-ledger-note">-</div><div class="expenses-ledger-amt">$0.00</div></div>'}</div>
+                </div>
             </div>`;
         }
         if (core.kind === 'notes') {
-            const notes = (this.state.memory?.notes || []).slice(0, 6);
-            const tiles = notes.map((n) => `<div class="note-tile">${escapeHtml(String(n.text || '').slice(0, 90) || 'note')}</div>`).join('');
-            return `<div class="scene scene-domain scene-notes">
+            const notes = (this.state.memory?.notes || []).slice(0, 16);
+            const tiles = notes.map((n, idx) => {
+                const text = String(n.text || '').trim();
+                const stamp = Number(n.createdAt || 0);
+                const shortDate = stamp ? new Date(stamp).toLocaleDateString() : 'recent';
+                const lines = text.split(/\s+/).slice(0, 20).join(' ');
+                return `<article class="notes-card ${idx % 5 === 0 ? 'feature' : ''}">
+                    <div class="notes-card-meta">${escapeHtml(shortDate)}</div>
+                    <div class="notes-card-text">${escapeHtml(lines || 'note')}</div>
+                </article>`;
+            }).join('');
+            const summary = notes.length
+                ? `${notes.length} notes active`
+                : 'No notes yet';
+            return `<div class="scene scene-domain scene-notes interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="notes" data-count="${escapeAttr(String(notes.length))}"></canvas>
-                <div class="notes-masonry">${tiles || '<div class="note-tile">No notes yet.</div>'}</div>
+                <div class="notes-shell">
+                    <div class="notes-headline">
+                        <div class="notes-title">knowledge stream</div>
+                        <div class="notes-sub">${escapeHtml(summary)}</div>
+                    </div>
+                    <div class="notes-wall">${tiles || '<article class="notes-card"><div class="notes-card-text">No notes yet.</div></article>'}</div>
+                </div>
             </div>`;
         }
         if (core.kind === 'graph') {
@@ -1967,13 +2677,16 @@ const UIEngine = {
             const op = String(info.op || 'fetch_url');
             const isSearch = op === 'web_search';
             const isMobile = typeof window !== 'undefined' && window.innerWidth <= 600;
+            const isElectron = Boolean(window.electronAPI?.isElectron);
+            const webdeckMode = String(this.state.webdeck?.mode || 'surface');
+            const isFullMode = webdeckMode === 'full';
             const url = String(info.url || '').trim();
             const title = String(info.title || (isSearch ? `Search: ${String(info.query || '').trim()}` : url)).trim();
             const excerpt = String(info.excerpt || '').trim();
             const favicon = String(info.favicon || '').trim();
             const thumbnail = String(info.thumbnail || '').trim();
             const source = String(info.source || 'scaffold').trim();
-            const items = Array.isArray(info.items) ? info.items.slice(0, 8) : [];
+            const items = Array.isArray(info.items) ? info.items.slice(0, 12) : [];
             const siteTarget = (info.siteTarget && typeof info.siteTarget === 'object') ? info.siteTarget : null;
 
             const safeHostname = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return String(u || '').slice(0, 40); } };
@@ -2009,8 +2722,43 @@ const UIEngine = {
                 ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(String(siteTarget.url || ''))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(siteTarget.label || 'Open source'))}</a>`
                 : (url ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open page</a>` : '');
             const mobileClass = isMobile ? ' webdeck-mobile' : '';
+            const modeClass = isFullMode ? ' webdeck-full' : '';
             const sourceUrl = String(siteTarget?.url || url || '').trim();
             const sourceHost = String(siteTarget?.host || '').trim() || (sourceUrl ? safeHostname(sourceUrl) : '');
+            const frameUrl = sourceUrl || (items.length ? String(items[0]?.url || '').trim() : '');
+            const topItemUrl = items.length ? String((items[0] || {}).url || '').trim() : '';
+            const query = String(info.query || '').trim();
+            const actionCommands = (() => {
+                const actions = [];
+                const seen = new Set();
+                const add = (cmd) => {
+                    const value = String(cmd || '').trim();
+                    if (!value) return;
+                    const key = value.toLowerCase();
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    actions.push(value);
+                };
+                if (isSearch && query) {
+                    add(`search web ${query}`);
+                }
+                if (topItemUrl) {
+                    add(`summarize website ${topItemUrl}`);
+                }
+                if (url) {
+                    add(`summarize website ${url}`);
+                }
+                if (!actions.length && query) {
+                    add(`search web ${query}`);
+                }
+                return actions.slice(0, 3);
+            })();
+            const actionButtons = actionCommands.map((cmd) => {
+                const label = cmd
+                    .replace(/^search web\s+/i, 'search: ')
+                    .replace(/^summarize website\s+/i, 'summarize: ');
+                return `<button class="webdeck-action-btn" type="button" data-command="${escapeAttr(cmd)}">${escapeHtml(label)}</button>`;
+            }).join('');
             const hostCounts = (() => {
                 const counts = new Map();
                 for (const item of items) {
@@ -2023,18 +2771,43 @@ const UIEngine = {
             const hostListHtml = hostCounts.length
                 ? hostCounts.map(([host, count]) => `<div class="webdeck-host-row"><span>${escapeHtml(String(host))}</span><span>${escapeHtml(String(count))}</span></div>`).join('')
                 : '<div class="webdeck-host-empty">No host breakdown</div>';
+            const fullViewUrl = frameUrl || '';
+            const liveSurfaceHtml = (isFullMode && fullViewUrl)
+                ? (isElectron
+                    ? `
+                                <div class="webdeck-live-surface">
+                                    <webview class="webdeck-live-frame webdeck-webview" src="${escapeAttr(fullViewUrl)}" allowpopups partition="persist:genome-browser"></webview>
+                                    <div class="webdeck-live-meta">
+                                        <span>live source: ${escapeHtml(safeHostname(fullViewUrl))}</span>
+                                        <a href="${escapeAttr(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
+                                    </div>
+                                </div>
+                            `
+                    : `
+                                <div class="webdeck-live-surface">
+                                    <iframe class="webdeck-live-frame" src="${escapeAttr(fullViewUrl)}" title="${escapeAttr(title || 'Web live surface')}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
+                                    <div class="webdeck-live-meta">
+                                        <span>live source: ${escapeHtml(safeHostname(fullViewUrl))}</span>
+                                        <a href="${escapeAttr(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
+                                    </div>
+                                </div>
+                            `)
+                : '';
             return `<div class="scene scene-webdeck interactive">
                 <canvas class="scene-canvas webdeck-canvas" data-scene="webdeck"></canvas>
-                <div class="webdeck${mobileClass}">
+                <div class="webdeck${mobileClass}${modeClass}">
                     <div class="webdeck-chrome">
                         <div class="webdeck-nav-dots"><span></span><span></span><span></span></div>
                         ${faviconHtml}
                         <div class="webdeck-bar">${escapeHtml(barText)}</div>
                         <div class="webdeck-source-chip">${escapeHtml(source)}</div>
+                        <button class="webdeck-mode-btn" type="button" data-webdeck-mode-toggle>${isFullMode ? 'surface view' : 'full view'}</button>
                         ${directBtn}
                     </div>
+                    ${actionButtons ? `<div class="webdeck-actions">${actionButtons}</div>` : ''}
                     <div class="webdeck-body">
-                        <div class="webdeck-results">
+                        <div class="webdeck-results ${liveSurfaceHtml ? 'with-live-frame' : ''}">
+                            ${liveSurfaceHtml}
                             ${resultsHtml || '<div class="webdeck-empty">No content preview.</div>'}
                         </div>
                         <aside class="webdeck-inspector">
@@ -2287,13 +3060,29 @@ const UIEngine = {
         } else {
             this._sceneRenderer = this.makeGenericRenderer(canvas);
         }
-        const loop = () => {
+        let lastFrameAt = 0;
+        const loop = (ts) => {
             if (typeof this._sceneRenderer === 'function') {
-                this._sceneRenderer();
+                const mobile = this.isMobileViewport();
+                const hidden = document.visibilityState !== 'visible';
+                const targetFps = hidden ? 8 : (mobile ? 30 : 60);
+                const minDelta = 1000 / targetFps;
+                const now = Number(ts || performance.now());
+                if (!lastFrameAt || (now - lastFrameAt) >= minDelta) {
+                    this._sceneRenderer();
+                    lastFrameAt = now;
+                }
                 this._sceneAnimFrame = requestAnimationFrame(loop);
             }
         };
-        loop();
+        this._sceneAnimFrame = requestAnimationFrame(loop);
+    },
+
+    isMobileViewport() {
+        return Boolean(
+            (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+            || window.innerWidth <= 900
+        );
     },
 
     fitCanvas(canvas) {
@@ -3542,6 +4331,7 @@ const UIEngine = {
             summary: execution.message || plan.subtitle,
             timestamp: Date.now(),
             envelope,
+            executionSnapshot: execution ? JSON.parse(JSON.stringify(execution)) : null,
             plan,
             kernelTrace,
             merge,
@@ -3552,6 +4342,37 @@ const UIEngine = {
         if (this.state.history.length > HISTORY_LIMIT) this.state.history.shift();
         this.state.session.activeHistoryIndex = this.state.history.length - 1;
         this.updateHistoryReel();
+    },
+
+    stepHistory(delta) {
+        const size = this.state.history.length;
+        if (!size) return;
+        const current = Number.isInteger(this.state.session.activeHistoryIndex)
+            ? this.state.session.activeHistoryIndex
+            : (size - 1);
+        const target = Math.max(0, Math.min(size - 1, current + Number(delta || 0)));
+        if (target === current) return;
+        this.restoreFromHistory(target);
+    },
+
+    executeQuickCommand(index = 0) {
+        const roots = [
+            this.container.querySelector('.workspace-main'),
+            this.container.querySelector('.workspace-side'),
+        ].filter(Boolean);
+        const commands = [];
+        for (const root of roots) {
+            const nodes = Array.from(root.querySelectorAll('[data-command]'));
+            for (const node of nodes) {
+                const cmd = String(node.getAttribute('data-command') || '').trim();
+                if (cmd) commands.push(cmd);
+            }
+        }
+        const cmd = commands[Math.max(0, Number(index || 0))];
+        if (!cmd) return;
+        this.input.value = cmd;
+        this.input.focus();
+        this.handleIntent(cmd);
     },
 
     updateHistoryReel() {
@@ -3608,6 +4429,13 @@ const UIEngine = {
             this.state.session.handoff = parsed.handoff || this.state.session.handoff;
             this.state.session.presence = parsed.presence || this.state.session.presence;
             this.state.session.revision = Number(parsed.revision || 0);
+            this.state.runtimeEvents = Array.isArray(parsed.runtimeEvents)
+                ? parsed.runtimeEvents.filter((item) => item && typeof item === 'object').slice(-8)
+                : [];
+            const mode = String(parsed?.uiPrefs?.webdeckMode || '').toLowerCase();
+            if (mode === 'surface' || mode === 'full') {
+                this.state.webdeck.mode = mode;
+            }
         } catch {
             this.state.memory = structuredClone(DEFAULT_MEMORY);
             this.state.history = [];
@@ -3625,7 +4453,11 @@ const UIEngine = {
             deviceId: this.state.session.deviceId,
             handoff: this.state.session.handoff,
             presence: this.state.session.presence,
-            revision: this.state.session.revision
+            revision: this.state.session.revision,
+            runtimeEvents: this.state.runtimeEvents,
+            uiPrefs: {
+                webdeckMode: this.state.webdeck.mode
+            }
         }));
         if (this.state.session.sessionId) {
             localStorage.setItem(SESSION_STORAGE_KEY, this.state.session.sessionId);
@@ -3633,11 +4465,27 @@ const UIEngine = {
     },
 
     updateStatus(mode) {
+        this.state.session.statusMode = String(mode || 'READY');
         const m = this.state.memory;
         const objectCount = m.tasks.length + m.expenses.length + m.notes.length;
         const sid = this.state.session.sessionId ? this.state.session.sessionId.slice(0, 8) : '-';
         const sync = this.state.session.syncTransport.toUpperCase();
-        this.status.innerText = `MODE: ${mode} | SYNC: ${sync} | SESSION: ${sid} | OBJECTS: ${objectCount} | LATENCY: ${this.state.metrics.latency}ms | ENTROPY: ${this.state.metrics.entropy.toFixed(3)}`;
+        const net = this.state.session.networkOnline ? 'ONLINE' : 'OFFLINE';
+        const retry = Number(this.state.session.reconnectAttempts || 0);
+        const retryPart = retry > 0 && !this.state.session.networkOnline ? ` | RETRY: ${retry}` : '';
+        this.status.innerText = `MODE: ${this.state.session.statusMode} | SYNC: ${sync} | NET: ${net}${retryPart} | SESSION: ${sid} | OBJECTS: ${objectCount} | LATENCY: ${this.state.metrics.latency}ms | ENTROPY: ${this.state.metrics.entropy.toFixed(3)}`;
+        this.updateShortcutHint();
+    },
+
+    updateShortcutHint() {
+        if (!this.shortcutHint) return;
+        const isTouchLike = typeof window !== 'undefined'
+            && ((window.matchMedia && window.matchMedia('(pointer: coarse)').matches) || window.innerWidth <= 900);
+        if (isTouchLike) {
+            this.shortcutHint.innerText = 'Top-edge swipe: scene dock | Swipe left/right: history';
+            return;
+        }
+        this.shortcutHint.innerText = 'Alt+1..9 run | Alt+<-/-> history | Alt+Shift+<-/-> scenes | Alt+M webdeck mode | Ctrl/Cmd+K focus';
     },
 
     weatherHeroImageUrl(condition) {
@@ -4138,6 +4986,10 @@ function escapeAttr(value) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+if (typeof window !== 'undefined') {
+    window.__GENOME_UI_ENGINE__ = UIEngine;
 }
 
 UIEngine.init();

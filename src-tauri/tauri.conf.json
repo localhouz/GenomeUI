@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Genome Surface OS",
+  "version": "0.1.0",
+  "identifier": "com.genome.surface",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Genome Surface OS",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "../public/icon-192.png",
+      "../public/icon-512.png"
+    ],
+    "iOS": {
+      "minimumSystemVersion": "16.0"
+    },
+    "android": {
+      "minSdkVersion": 24
+    }
+  }
+}
