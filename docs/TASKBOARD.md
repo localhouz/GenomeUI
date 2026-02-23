@@ -6079,7 +6079,7 @@ Notes:
 ---
 
 ## T292 - Track 11 Integration Checkpoint Commit
-Status: in_progress
+Status: done
 Track: G (desktop/mobile shell release checkpoint)
 Priority: P1
 Dependencies: T291
@@ -6091,6 +6091,9 @@ Deliverables:
 Acceptance:
 - git history contains an explicit Track 11 checkpoint commit
 - known packaging blocker documented for operator follow-up
+
+Notes:
+- checkpoint commits: `475dc68`, `7898b46`
 
 ## Suggested Execution Order
 1. T3
