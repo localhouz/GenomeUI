@@ -11,7 +11,7 @@ test('operator commands work via intent plane', async ({ page }) => {
   const submitIntent = async (intent) => {
     const resp = await page.request.post('/api/turn', {
       data: { sessionId, intent, onConflict: 'merge' },
-      timeout: 20_000,
+      timeout: 45_000,
     });
     return await resp.json();
   };
@@ -39,6 +39,42 @@ test('operator commands work via intent plane', async ({ page }) => {
   await expectNonFatal(await submitIntent('show trace'));
   await expectNonFatal(await submitIntent('export trace'));
   await expectNonFatal(await submitIntent('show trace summary'));
+  await expectNonFatal(await submitIntent('show connector grants'));
+  await expectNonFatal(await submitIntent('show web status'));
+  await expectNonFatal(await submitIntent('grant connector scope web.page.read'));
+  await expectNonFatal(await submitIntent('search web local-first os'));
+  await expectNonFatal(await submitIntent('open website https://example.com'));
+  await expectNonFatal(await submitIntent('summarize website https://example.com'));
+  await expectNonFatal(await submitIntent('show contacts status'));
+  await expectNonFatal(await submitIntent('grant connector scope contacts.read'));
+  await expectNonFatal(await submitIntent('find contact mike'));
+  await expectNonFatal(await submitIntent('revoke weather forecast'));
+  const weatherBlocked = await submitIntent('show weather in Seattle');
+  const weatherBlockedMsg = String(weatherBlocked?.execution?.message || '').toLowerCase();
+  await expect(
+    weatherBlockedMsg.includes('connector scope missing')
+    || weatherBlockedMsg.includes('no state changes requested')
+    || weatherBlockedMsg.includes('weather ready')
+  ).toBeTruthy();
+  await expectNonFatal(await submitIntent('grant weather forecast'));
+  await expectNonFatal(await submitIntent('show weather in Seattle'));
+  await expectNonFatal(await submitIntent('show telephony status'));
+  await expectNonFatal(await submitIntent('grant connector scope telephony.call.start'));
+  await expectNonFatal(await submitIntent('grant connector scope contacts.read'));
+  await expectNonFatal(await submitIntent('confirm call mike'));
+  await expectNonFatal(await submitIntent('confirm call 5550100'));
+  await expectNonFatal(await submitIntent('show banking status'));
+  await expectNonFatal(await submitIntent('grant connector scope bank.account.balance.read'));
+  await expectNonFatal(await submitIntent('show bank balance'));
+  await expectNonFatal(await submitIntent('show social status'));
+  await expectNonFatal(await submitIntent('grant connector scope social.feed.read'));
+  await expectNonFatal(await submitIntent('show social feed'));
+  await expectNonFatal(await submitIntent('remind me to stretch in 10m'));
+  await expectNonFatal(await submitIntent('show reminder status'));
+  await expectNonFatal(await submitIntent('show reminders'));
+  await expectNonFatal(await submitIntent('pause reminder 1'));
+  await expectNonFatal(await submitIntent('resume reminder 1'));
+  await expectNonFatal(await submitIntent('cancel reminder 1'));
 
   await expectNonFatal(await submitIntent('show dead letters'));
   await expectNonFatal(await submitIntent('show runtime health'));

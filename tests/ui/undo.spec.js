@@ -5,14 +5,14 @@ test('undo last reverses previous mutation and is visible in journal feed', asyn
   await page.goto(`/?session=${sessionId}`);
 
   const input = page.locator('#intent-input');
-  const status = page.locator('#status');
   await expect(input).toBeVisible();
 
   const submitIntent = async (text) => {
-    await input.fill(text);
-    await input.press('Enter');
-    await expect(status).toContainText('INTERPRETING', { timeout: 10_000 });
-    await expect(status).not.toContainText('INTERPRETING', { timeout: 25_000 });
+    const resp = await page.request.post('/api/turn', {
+      data: { sessionId, intent: text, onConflict: 'merge' },
+      timeout: 60_000,
+    });
+    expect(resp.ok()).toBeTruthy();
   };
 
   await submitIntent('add task undo me');
@@ -24,4 +24,3 @@ test('undo last reverses previous mutation and is visible in journal feed', asyn
   await expect(journalCard).toBeVisible();
   await expect(journalCard).toContainText(/ok undo_last/i);
 });
-

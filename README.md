@@ -45,6 +45,14 @@ Current sprint execution board: `docs/TASKBOARD.md`.
    ```bash
    npm run os:test
    ```
+   Connector/unit test suite:
+   ```bash
+   npm run os:test:unit
+   ```
+   Deterministic connector replay suite (offline/mock provider):
+   ```bash
+   npm run os:test:connectors
+   ```
    Mutation replay smoke test:
    ```bash
    npm run os:test:replay
@@ -81,6 +89,17 @@ Realtime sync transport priority:
 ## 🖥 Backend (Python / venv)
 FastAPI service in `backend/main.py` provides:
 - `POST /api/session/init`
+- `GET /api/connectors`
+- `GET /api/connectors/providers`
+- `GET /api/connectors/grants`
+- `POST /api/connectors/grants`
+- `GET /api/connectors/secrets`
+- `POST /api/connectors/secrets`
+- `GET /api/connectors/mock/weather?location=Seattle`
+- `GET /api/connectors/mock/banking?limit=5`
+- `GET /api/connectors/mock/social`
+- `GET /api/connectors/mock/web?url=https://example.com`
+- `GET /api/connectors/mock/contacts?query=mike`
 - `GET /api/session/{sessionId}`
 - `GET /api/session/{sessionId}/presence`
 - `POST /api/session/{sessionId}/presence`
@@ -90,6 +109,106 @@ FastAPI service in `backend/main.py` provides:
 - `GET /api/session/{sessionId}/trace?limit=50&ok=&intent_class=&route_reason=&format=json|ndjson`
 - `GET /api/session/{sessionId}/trace/summary?limit=200`
 - `GET /api/session/{sessionId}/graph?limit=200`
+- `GET /api/session/{sessionId}/graph/schema`
+- `GET /api/session/{sessionId}/graph/health`
+- `GET /api/session/{sessionId}/graph/components?relation=depends_on&limit=20`
+- `GET /api/session/{sessionId}/graph/hubs?relation=depends_on&limit=10`
+- `GET /api/session/{sessionId}/graph/events?kind=link_entities&limit=20`
+- `GET /api/session/{sessionId}/graph/summary?relation=depends_on&limit=10`
+- `GET /api/session/{sessionId}/graph/relation-matrix?relation=depends_on&limit=100`
+- `GET /api/session/{sessionId}/graph/anomalies?limit=20`
+- `GET /api/session/{sessionId}/graph/guidance?limit=8`
+- `GET /api/session/{sessionId}/graph/score`
+- `GET /api/session/{sessionId}/graph/score-trend?window_ms=3600000&buckets=8`
+- `GET /api/session/{sessionId}/graph/score-guidance?limit=6`
+- `GET /api/session/{sessionId}/graph/score-alerts?limit=10`
+- `GET /api/session/{sessionId}/graph/score-alerts-history?window_ms=3600000&buckets=8&limit=5`
+- `GET /api/session/{sessionId}/graph/score-remediation?limit=6`
+- `GET /api/session/{sessionId}/graph/score-forecast?horizon_ms=3600000&step_buckets=6`
+- `GET /api/session/{sessionId}/graph/score-forecast-guidance?limit=6`
+- `GET /api/session/{sessionId}/graph/score-guardrails?warn_below=75&fail_below=60`
+- `GET /api/session/{sessionId}/graph/score-autopilot-preview?limit=6`
+- `POST /api/session/{sessionId}/graph/score-autopilot/run` with `{ "mode": "dry_run|apply", "limit": 6 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/guidance?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-drift?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-actions?window_ms=86400000&limit=6`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 6 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-guidance?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-drift?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-guidance?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance?window_ms=86400000&limit=6`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 6 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-drift?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-trend?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-offenders?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-timeline?window_ms=86400000&limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-matrix?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-summary?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-summary?window_ms=86400000&limit=8`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance?window_ms=86400000&limit=8`
+- `POST /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run` with `{ "mode": "dry_run|apply", "windowMs": 86400000, "limit": 8 }`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-history?limit=20`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-metrics?window_ms=86400000`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-anomalies?window_ms=86400000&limit=10`
+- `GET /api/session/{sessionId}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-history?limit=20`
+- `GET /api/session/{sessionId}/graph/query?kind=task&relation=depends_on&q=onboard&done=false&limit=20`
+- `GET /api/session/{sessionId}/graph/neighborhood?kind=task&selector=1&depth=2&relation=depends_on&limit=40`
+- `GET /api/session/{sessionId}/graph/path?source_kind=task&source=1&target_kind=task&target=2&relation=depends_on&directed=true`
 - `GET /api/session/{sessionId}/graph/dependencies?task=<selector>&mode=summary|chain|blockers|impact`
 - `GET /api/session/{sessionId}/jobs?limit=100`
 - `GET /api/session/{sessionId}/dead-letters?limit=100`
@@ -334,6 +453,114 @@ Scheduler command example:
 - `show dependency chain for task 1`
 - `show blockers for task 1`
 - `show impact for task 1`
+- `show graph schema`
+- `show graph health`
+- `show graph components relation depends_on limit 10`
+- `show graph hubs relation depends_on limit 10`
+- `show graph events limit 20`
+- `show graph summary relation depends_on limit 10`
+- `show graph relation matrix relation depends_on limit 100`
+- `show graph anomalies limit 20`
+- `show graph guidance limit 8`
+- `show graph score`
+- `show graph score trend window 1h buckets 8`
+- `show graph score guidance limit 6`
+- `show graph score alerts limit 10`
+- `show graph score alerts history window 1h buckets 8 limit 5`
+- `show graph score remediation limit 6`
+- `show graph score forecast horizon 1h steps 6`
+- `show graph score forecast guidance limit 6`
+- `show graph score guardrails warn below 75 fail below 60`
+- `show graph score autopilot preview limit 6`
+- `run graph score autopilot dry run limit 6`
+- `run graph score autopilot apply limit 6`
+- `show graph score autopilot history limit 20`
+- `show graph score autopilot metrics window 24h`
+- `show graph score autopilot anomalies window 24h limit 10`
+- `show graph score autopilot guidance window 24h limit 8`
+- `show graph score autopilot policy window 24h`
+- `show graph score autopilot policy drift window 24h`
+- `show graph score autopilot policy alignment actions window 24h limit 6`
+- `run graph score autopilot policy alignment dry run window 24h limit 6`
+- `run graph score autopilot policy alignment apply window 24h limit 6`
+- `show graph score autopilot policy alignment history limit 20`
+- `show graph score autopilot policy alignment metrics window 24h`
+- `show graph score autopilot policy alignment anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment guidance window 24h limit 8`
+- `show graph score autopilot policy alignment policy window 24h`
+- `show graph score autopilot policy alignment policy drift window 24h`
+- `show graph score autopilot policy alignment policy guidance window 24h limit 8`
+- `run graph score autopilot policy alignment policy dry run window 24h limit 8`
+- `run graph score autopilot policy alignment policy apply window 24h limit 8`
+- `show graph score autopilot policy alignment policy history limit 20`
+- `show graph score autopilot policy alignment policy metrics window 24h`
+- `show graph score autopilot policy alignment policy anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend window 24h`
+- `show graph score autopilot policy alignment policy trend guidance window 24h limit 6`
+- `run graph score autopilot policy alignment policy trend guidance dry run window 24h limit 6`
+- `run graph score autopilot policy alignment policy trend guidance apply window 24h limit 6`
+- `show graph score autopilot policy alignment policy trend guidance history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy drift window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance dry run window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance apply window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance dry run window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance apply window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state trend window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state offenders window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state timeline window 24h limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state matrix window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance dry run window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance apply window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state summary window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state dry run window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state summary window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance window 24h limit 8`
+- `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance dry run window 24h limit 8`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run history limit 20`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run metrics window 24h`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run anomalies window 24h limit 10`
+- `show graph score autopilot policy alignment policy trend guidance policy guidance state history limit 20`
+- `show graph kind task limit 5`
+- `show graph neighborhood for task 1 depth 2`
+- `show graph path task 1 to task 2 relation depends_on directed on`
+- `show open tasks graph limit 20`
 - `simulate persist failure on` / `simulate persist failure off`
 - `retry persist now`
 - `compact journal keep 200` (requires `confirm compact journal keep 200`)
@@ -341,14 +568,34 @@ Scheduler command example:
 - `claim handoff <token>`
 - `list files .`
 - `read file README.md`
+- `grant connector scope web.page.read`
+- `show web status`
+- `search web local-first os`
 - `fetch url https://example.com`
+- `open website https://example.com`
+- `summarize website https://example.com`
+- `show contacts status`
+- `grant connector scope contacts.read`
+- `show contacts`
+- `find contact mike`
+- `confirm call mike`
+- `remind me to stretch in 10m`
+- `show reminders`
+- `show reminder status`
+- `pause reminder 1`
+- `resume reminder 1`
+- `cancel reminder 1`
 
 Policy notes for new capability domains:
 - `files` domain is workspace-scoped only (paths outside repo root are denied)
-- `web` domain allows only public `http/https` URLs (localhost/private targets are denied)
+- `web` domain requires `web.page.read` scope and allows only public `http/https` URLs (localhost/private targets are denied)
+- `contacts` domain requires `contacts.read` scope and returns local scaffold contact matches
+- named telephony targets (for example `call mike`) require both `telephony.call.start` and `contacts.read`
 
 Operator guide:
 - `docs/OPERATOR_RUNBOOK.md`
+- `docs/CONNECTOR_SPEC_V1.md`
+- `docs/CONNECTOR_ADAPTER_CONTRACTS.md`
 
 Audit and restore:
 - audit log supports policy/domain/risk filters and NDJSON export

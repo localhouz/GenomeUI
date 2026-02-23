@@ -1,0 +1,63 @@
+# Synapse Ignore Patterns
+# Lines starting with # are comments
+# Use ! to negate a pattern (allow-list)
+
+# This file uses gitignore-style patterns
+# https://git-scm.com/docs/gitignore
+
+# Version control
+.git/
+.svn/
+.hg/
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sensitive files (IMPORTANT!)
+.env
+.env.local
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.yaml
+secrets.json
+private/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Large database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Synapse internal
+.synapse/
+synapse_data/
+
+# Add your custom patterns below:

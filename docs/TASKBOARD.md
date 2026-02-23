@@ -3322,6 +3322,2394 @@ Notes:
 - updated `tests/ui/operator.spec.js`, `tests/ui/handoff.spec.js`, `tests/ui/jobs.spec.js`, `tests/ui/trace.spec.js`
 - validated with `npm run ui:test`, `npm run os:test:replay`, `npm run os:test:handoff`
 
+---
+
+## T143 - Graph-First Query + Schema Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T142
+
+Deliverables:
+- graph schema endpoint (`GET /api/session/{id}/graph/schema`)
+- graph query endpoint (`GET /api/session/{id}/graph/query?kind=&relation=&q=&done=&limit=`)
+- intent commands:
+  - `show graph schema`
+  - `show graph kind task limit 5`
+  - `show open tasks graph limit 20`
+- operator/runtime handlers for `graph_schema` and `graph_query`
+
+Acceptance:
+- graph schema returns canonical kinds + counts
+- graph query returns filtered entity/relation slices with compact labels
+- replay and UI tests validate both endpoint and intent-plane command paths
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T144 - Graph Neighborhood Introspection
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T143
+
+Deliverables:
+- graph neighborhood endpoint (`GET /api/session/{id}/graph/neighborhood?kind=&selector=&depth=&relation=&limit=`)
+- intent command (`show graph neighborhood for task 1 depth 2`)
+- bounded neighborhood traversal (`nodes`, `edges`, source-centered depth layering)
+
+Acceptance:
+- endpoint returns source-centered neighborhood summary (`nodes`, `edges`, `depth`, `sourceLabel`)
+- command surfaces compact neighborhood preview in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T145 - Graph Pathfinding Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T144
+
+Deliverables:
+- graph path endpoint (`GET /api/session/{id}/graph/path?source_kind=&source=&target_kind=&target=&relation=&directed=`)
+- intent command (`show graph path task 1 to task 2 relation depends_on directed on`)
+- shortest-path traversal summary (`pathFound`, `pathLength`, path nodes/edges)
+
+Acceptance:
+- endpoint returns directed/undirected path summary and compact path nodes/edges
+- command surfaces path length + source/target + compact path line in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T146 - Graph Health Diagnostics
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T145
+
+Deliverables:
+- graph health endpoint (`GET /api/session/{id}/graph/health`)
+- intent command (`show graph health`)
+- health summary over graph integrity (`isolatedEntities`, `danglingRelations`, task ready/blocked distribution)
+
+Acceptance:
+- endpoint returns graph health summary payload with status
+- command surfaces compact graph health lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T147 - Graph Components Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T146
+
+Deliverables:
+- graph components endpoint (`GET /api/session/{id}/graph/components?relation=&limit=`)
+- intent command (`show graph components relation depends_on limit 10`)
+- component summary (`components`, `largest`, `singletons`) + compact component samples
+
+Acceptance:
+- endpoint returns connected component summary and top component slices
+- command surfaces compact components lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T148 - Graph Hubs Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T147
+
+Deliverables:
+- graph hubs endpoint (`GET /api/session/{id}/graph/hubs?relation=&limit=`)
+- intent command (`show graph hubs relation depends_on limit 10`)
+- degree-ranked hub summary (`maxDegree`, `in`, `out`, `total`)
+
+Acceptance:
+- endpoint returns degree-ranked hub summary
+- command surfaces compact hub lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T149 - Graph Events Timeline Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T148
+
+Deliverables:
+- graph events endpoint (`GET /api/session/{id}/graph/events?kind=&limit=`)
+- intent command (`show graph events limit 20`)
+- timeline-style event summary (`count`, `returned`, `latestTs`, top kinds)
+
+Acceptance:
+- endpoint returns graph event summary and compact event items
+- command surfaces compact event timeline lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T150 - Graph Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T149
+
+Deliverables:
+- graph summary endpoint (`GET /api/session/{id}/graph/summary?relation=&limit=`)
+- intent command (`show graph summary relation depends_on limit 10`)
+- consolidated summary payload (schema + health + components + hubs + events)
+
+Acceptance:
+- endpoint returns consolidated graph summary sections
+- command surfaces compact graph summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T151 - Graph Relation Matrix Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T150
+
+Deliverables:
+- graph relation matrix endpoint (`GET /api/session/{id}/graph/relation-matrix?relation=&limit=`)
+- intent command (`show graph relation matrix relation depends_on limit 100`)
+- source-kind x target-kind relation count rows
+
+Acceptance:
+- endpoint returns matrix rows and aggregate summary counts
+- command surfaces compact matrix lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T152 - Graph Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T151
+
+Deliverables:
+- graph anomalies endpoint (`GET /api/session/{id}/graph/anomalies?limit=`)
+- intent command (`show graph anomalies limit 20`)
+- anomaly summary (`status`, counts by severity/type) with compact anomaly items
+
+Acceptance:
+- endpoint returns anomaly summary and items
+- command surfaces compact anomalies lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T153 - Graph Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T152
+
+Deliverables:
+- graph guidance endpoint (`GET /api/session/{id}/graph/guidance?limit=`)
+- intent command (`show graph guidance limit 8`)
+- actionable guidance items derived from graph health/anomalies/matrix signals
+
+Acceptance:
+- endpoint returns guidance summary + prioritized guidance commands
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T154 - Graph Score Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T153
+
+Deliverables:
+- graph score endpoint (`GET /api/session/{id}/graph/score`)
+- intent command (`show graph score`)
+- deterministic graph score/grade from health + anomaly severity signals
+
+Acceptance:
+- endpoint returns score payload (`score`, `grade`, `status`, `signals`)
+- command surfaces compact score lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T155 - Graph Score Trend Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T154
+
+Deliverables:
+- graph score trend endpoint (`GET /api/session/{id}/graph/score-trend?window_ms=&buckets=`)
+- intent command (`show graph score trend window 1h buckets 8`)
+- bucketed trend summary over event activity (`currentScore`, `firstScore`, `lastScore`, `trend`)
+
+Acceptance:
+- endpoint returns trend summary + bucket series
+- command surfaces compact trend lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T156 - Graph Score Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T155
+
+Deliverables:
+- graph score guidance endpoint (`GET /api/session/{id}/graph/score-guidance?limit=`)
+- intent command (`show graph score guidance limit 6`)
+- prioritized commands derived from score + trend + anomaly signals
+
+Acceptance:
+- endpoint returns score-guidance summary and actionable items
+- command surfaces compact score-guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T157 - Graph Score Alerts Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T156
+
+Deliverables:
+- graph score alerts endpoint (`GET /api/session/{id}/graph/score-alerts?limit=`)
+- intent command (`show graph score alerts limit 10`)
+- prioritized alert list derived from score, trend, and anomaly severity
+
+Acceptance:
+- endpoint returns alert summary (`score`, `grade`, `trend`, `alertCount`) plus items
+- command surfaces compact alert lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T158 - Graph Score Alerts History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T157
+
+Deliverables:
+- graph score alerts history endpoint (`GET /api/session/{id}/graph/score-alerts-history?window_ms=&buckets=&limit=`)
+- intent command (`show graph score alerts history window 1h buckets 8 limit 5`)
+- bucketed alert-signal history (`totalAlertSignals`, `peakAlertCount`) with top risk buckets
+
+Acceptance:
+- endpoint returns history summary + ranked alert buckets
+- command surfaces compact alert-history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T159 - Graph Score Remediation Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T158
+
+Deliverables:
+- graph score remediation endpoint (`GET /api/session/{id}/graph/score-remediation?limit=`)
+- intent command (`show graph score remediation limit 6`)
+- ranked remediation actions synthesized from score, alerts, alert-history, and guidance signals
+
+Acceptance:
+- endpoint returns remediation summary and actionable command list
+- command surfaces compact remediation lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T160 - Graph Score Forecast Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T159
+
+Deliverables:
+- graph score forecast endpoint (`GET /api/session/{id}/graph/score-forecast?horizon_ms=&step_buckets=`)
+- intent command (`show graph score forecast horizon 1h steps 6`)
+- projected score trajectory with risk labels derived from score trend and alert pressure
+
+Acceptance:
+- endpoint returns forecast summary + step series
+- command surfaces compact forecast lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T161 - Graph Score Forecast Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T160
+
+Deliverables:
+- graph score forecast guidance endpoint (`GET /api/session/{id}/graph/score-forecast-guidance?limit=`)
+- intent command (`show graph score forecast guidance limit 6`)
+- preemptive action list synthesized from forecast direction/risk and remediation signals
+
+Acceptance:
+- endpoint returns guidance summary + ranked commands
+- command surfaces compact forecast-guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T162 - Graph Score Guardrails Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T161
+
+Deliverables:
+- graph score guardrails endpoint (`GET /api/session/{id}/graph/score-guardrails?warn_below=&fail_below=`)
+- intent command (`show graph score guardrails warn below 75 fail below 60`)
+- guardrail status surface over current score + forecast minimum
+
+Acceptance:
+- endpoint returns guardrail status summary with breach count and breach steps
+- command surfaces compact guardrail lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T163 - Graph Score Autopilot Preview Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T162
+
+Deliverables:
+- graph score autopilot preview endpoint (`GET /api/session/{id}/graph/score-autopilot-preview?limit=`)
+- intent command (`show graph score autopilot preview limit 6`)
+- ranked non-mutating action preview synthesized from guardrails + forecast-guidance + remediation
+
+Acceptance:
+- endpoint returns autopilot summary + ranked commands
+- command surfaces compact autopilot preview lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T164 - Graph Score Autopilot Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T163
+
+Deliverables:
+- graph score autopilot run endpoint (`POST /api/session/{id}/graph/score-autopilot/run`)
+- intent command (`run graph score autopilot dry run limit 6` / `run graph score autopilot apply limit 6`)
+- dry-run/apply execution summary over autopilot preview actions
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns run summary + selected actions
+- apply mode appends graph autopilot run event for auditability
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T165 - Graph Score Autopilot History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T164
+
+Deliverables:
+- graph score autopilot history endpoint (`GET /api/session/{id}/graph/score-autopilot/history?limit=`)
+- intent command (`show graph score autopilot history limit 20`)
+- recent autopilot run timeline with apply/dry-run counts and action volume
+
+Acceptance:
+- endpoint returns history summary and recent run items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T166 - Graph Score Autopilot Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T165
+
+Deliverables:
+- graph score autopilot metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/metrics?window_ms=`)
+- intent command (`show graph score autopilot metrics window 24h`)
+- aggregate run metrics over time window (apply/dry mix, avg action volume, status counts, top commands)
+
+Acceptance:
+- endpoint returns metrics summary and top-command frequencies
+- command surfaces compact autopilot metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T167 - Graph Score Autopilot Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T166
+
+Deliverables:
+- graph score autopilot anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot anomalies window 24h limit 10`)
+- anomaly detection over autopilot run stream (apply bursts, fail-heavy windows, high action-volume runs)
+
+Acceptance:
+- endpoint returns anomaly summary + prioritized anomaly items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T168 - Graph Score Autopilot Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T167
+
+Deliverables:
+- graph score autopilot guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot guidance window 24h limit 8`)
+- prioritized autopilot-level operator actions synthesized from metrics + anomalies + guardrails
+
+Acceptance:
+- endpoint returns guidance summary + ranked action commands
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T169 - Graph Score Autopilot Policy Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T168
+
+Deliverables:
+- graph score autopilot policy endpoint (`GET /api/session/{id}/graph/score-autopilot/policy?window_ms=`)
+- intent command (`show graph score autopilot policy window 24h`)
+- recommended autopilot posture (`safe|balanced|aggressive`) and thresholds from guardrails + anomalies + run mix
+
+Acceptance:
+- endpoint returns policy payload (`mode`, thresholds, dry-run preference, apply ratio cap) with rationale
+- command surfaces compact policy lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T170 - Graph Score Autopilot Policy Drift Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T169
+
+Deliverables:
+- graph score autopilot policy drift endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-drift?window_ms=`)
+- intent command (`show graph score autopilot policy drift window 24h`)
+- policy-vs-behavior drift checks (apply ratio cap, dry-run preference, fail ratio)
+
+Acceptance:
+- endpoint returns drift summary + per-check evaluation lines
+- command surfaces compact drift lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T171 - Graph Score Autopilot Policy Alignment Actions Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T170
+
+Deliverables:
+- graph score autopilot policy alignment actions endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-actions?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment actions window 24h limit 6`)
+- prioritized corrective commands synthesized from policy drift checks
+
+Acceptance:
+- endpoint returns alignment summary + ranked actions
+- command surfaces compact alignment-action lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T172 - Graph Score Autopilot Policy Alignment Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T171
+
+Deliverables:
+- policy alignment run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-run`)
+- intent command (`run graph score autopilot policy alignment dry run window 24h limit 6`)
+- dry-run/apply execution summary for alignment actions with audit event on apply
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns run summary + selected actions
+- apply mode appends `graph_score_autopilot_policy_alignment_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T173 - Graph Score Autopilot Policy Alignment History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T172
+
+Deliverables:
+- policy alignment history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-history?limit=`)
+- intent command (`show graph score autopilot policy alignment history limit 20`)
+- recent policy-alignment run history with apply/dry mix and action volume
+
+Acceptance:
+- endpoint returns history summary + recent run items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T174 - Graph Score Autopilot Policy Alignment Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T173
+
+Deliverables:
+- policy alignment metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment metrics window 24h`)
+- windowed aggregates for alignment runs (apply/dry mix, avg action volume, status counts, top commands)
+
+Acceptance:
+- endpoint returns metrics summary + top command frequencies
+- command surfaces compact metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T175 - Graph Score Autopilot Policy Alignment Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T174
+
+Deliverables:
+- policy alignment anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment anomalies window 24h limit 10`)
+- anomaly detection over alignment runs (apply bursts, drift-heavy windows, high action volume)
+
+Acceptance:
+- endpoint returns anomaly summary + prioritized anomaly items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T176 - Graph Score Autopilot Policy Alignment Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T175
+
+Deliverables:
+- policy alignment guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment guidance window 24h limit 8`)
+- prioritized corrective guidance synthesized from alignment drift + anomalies + metrics
+
+Acceptance:
+- endpoint returns guidance summary + ranked action commands
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T177 - Graph Score Autopilot Policy Alignment Policy Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T176
+
+Deliverables:
+- policy alignment policy endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy window 24h`)
+- recommended alignment-run posture (`mode`, dry-run preference, apply cap, action cap, drift-check budget)
+
+Acceptance:
+- endpoint returns policy payload + summary/rationale
+- command surfaces compact policy lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T178 - Graph Score Autopilot Policy Alignment Policy Drift Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T177
+
+Deliverables:
+- alignment policy drift endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-drift?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy drift window 24h`)
+- policy-vs-behavior drift checks (apply ratio, dry-run preference, action volume, non-aligned run budget)
+
+Acceptance:
+- endpoint returns drift summary + per-check evaluation lines
+- command surfaces compact drift lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T179 - Graph Score Autopilot Policy Alignment Policy Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T178
+
+Deliverables:
+- alignment policy guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy guidance window 24h limit 8`)
+- prioritized policy-level corrective commands synthesized from alignment policy drift checks
+
+Acceptance:
+- endpoint returns guidance summary + ranked actions
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T180 - Graph Score Autopilot Policy Alignment Policy Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T179
+
+Deliverables:
+- alignment policy run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-run`)
+- intent command (`run graph score autopilot policy alignment policy dry run window 24h limit 8`)
+- dry-run/apply execution summary for policy-level guidance actions with audit event on apply
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns run summary + selected actions
+- apply mode appends `graph_score_autopilot_policy_alignment_policy_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T181 - Graph Score Autopilot Policy Alignment Policy History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T180
+
+Deliverables:
+- alignment policy history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy history limit 20`)
+- recent policy-level run history with apply/dry mix and action volume
+
+Acceptance:
+- endpoint returns history summary + recent run items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T182 - Graph Score Autopilot Policy Alignment Policy Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T181
+
+Deliverables:
+- alignment policy metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy metrics window 24h`)
+- windowed aggregates for policy-level runs (apply/dry mix, avg action volume, status counts, top commands)
+
+Acceptance:
+- endpoint returns metrics summary + top command frequencies
+- command surfaces compact metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T183 - Graph Score Autopilot Policy Alignment Policy Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T182
+
+Deliverables:
+- alignment policy anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy anomalies window 24h limit 10`)
+- anomaly detection for policy-level runs (apply bursts, non-aligned windows, high action volume)
+
+Acceptance:
+- endpoint returns anomaly summary + prioritized anomaly items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T184 - Graph Score Autopilot Policy Alignment Policy Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T183
+
+Deliverables:
+- alignment policy summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy summary window 24h limit 8`)
+- consolidated policy view (policy + drift + metrics + anomalies + guidance actions)
+
+Acceptance:
+- endpoint returns summary rollup and compact guidance items
+- command surfaces compact summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T185 - Graph Score Autopilot Policy Alignment Policy Trend Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T184
+
+Deliverables:
+- alignment policy trend endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend window 24h`)
+- current-vs-previous window trend summary for run volume, apply pressure, non-aligned runs, and action volume
+
+Acceptance:
+- endpoint returns trend direction and delta signals between adjacent windows
+- command surfaces compact trend lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T186 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T185
+
+Deliverables:
+- alignment policy trend guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance window 24h limit 6`)
+- direction-aware next actions synthesized from trend deltas
+
+Acceptance:
+- endpoint returns trend direction plus prioritized guidance actions
+- command surfaces compact trend-guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T187 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T186
+
+Deliverables:
+- trend-guidance run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-run`)
+- intent commands:
+  - `run graph score autopilot policy alignment policy trend guidance dry run window 24h limit 6`
+  - `run graph score autopilot policy alignment policy trend guidance apply window 24h limit 6`
+- dry-run/apply execution summary for direction-aware trend guidance actions with audit event on apply
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns run summary + selected commands
+- apply mode appends `graph_score_autopilot_policy_alignment_policy_trend_guidance_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T188 - Graph Score Autopilot Policy Alignment Policy Trend Guidance History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T187
+
+Deliverables:
+- trend-guidance history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance history limit 20`)
+- recent trend-guidance run timeline with apply/dry mix, direction status, and action volume
+
+Acceptance:
+- endpoint returns history summary + recent run items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T189 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T188
+
+Deliverables:
+- trend-guidance metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance metrics window 24h`)
+- windowed aggregate metrics (apply/dry mix, avg action volume, status + direction counts, top commands)
+
+Acceptance:
+- endpoint returns metrics summary + top-command frequencies
+- command surfaces compact metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T190 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T189
+
+Deliverables:
+- trend-guidance anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance anomalies window 24h limit 10`)
+- anomaly detection over trend-guidance runs (apply bursts, drift-heavy windows, high action volume)
+
+Acceptance:
+- endpoint returns anomaly summary + prioritized anomaly items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T191 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T190
+
+Deliverables:
+- trend-guidance summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance summary window 24h limit 8`)
+- consolidated trend-guidance view (trend + metrics + anomalies + guidance actions)
+
+Acceptance:
+- endpoint returns summary rollup and compact guidance items
+- command surfaces compact summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T192 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T191
+
+Deliverables:
+- trend-guidance policy endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy window 24h`)
+- recommended posture (`mode`, dry-run preference, apply ratio cap, action cap, anomaly budget) from trend + metrics + anomalies
+
+Acceptance:
+- endpoint returns policy payload + summary status/direction
+- command surfaces compact policy lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T193 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Drift Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T192
+
+Deliverables:
+- trend-guidance policy drift endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-drift?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy drift window 24h`)
+- policy-vs-behavior drift checks (apply ratio cap, action volume cap, direction/mode consistency)
+
+Acceptance:
+- endpoint returns drift summary + per-check evaluation lines
+- command surfaces compact drift lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T194 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T193
+
+Deliverables:
+- trend-guidance policy guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance window 24h limit 8`)
+- prioritized corrective commands synthesized from trend-guidance policy drift checks
+
+Acceptance:
+- endpoint returns guidance summary + ranked actions
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T195 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T194
+
+Deliverables:
+- policy-guidance run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-run`)
+- intent commands:
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance dry run window 24h limit 8`
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance apply window 24h limit 8`
+- dry-run/apply execution summary for policy-guidance actions with audit event on apply
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns run summary + selected commands
+- apply mode appends `graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T196 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T195
+
+Deliverables:
+- policy-guidance history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance history limit 20`)
+- recent policy-guidance run timeline with apply/dry mix, status, policy mode, and action volume
+
+Acceptance:
+- endpoint returns history summary + recent run items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T197 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T196
+
+Deliverables:
+- policy-guidance metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance metrics window 24h`)
+- windowed aggregate metrics (apply/dry mix, avg action volume, status + policy-mode counts, top commands)
+
+Acceptance:
+- endpoint returns metrics summary + top-command frequencies
+- command surfaces compact metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T198 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T197
+
+Deliverables:
+- policy-guidance anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance anomalies window 24h limit 10`)
+- anomaly detection over policy-guidance runs (apply bursts, drift-heavy windows, high action volume)
+
+Acceptance:
+- endpoint returns anomaly summary + prioritized anomaly items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T199 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T198
+
+Deliverables:
+- policy-guidance summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance summary window 24h limit 8`)
+- consolidated summary rollup (policy posture + drift + metrics + anomalies + guidance actions)
+
+Acceptance:
+- endpoint returns summary rollup and compact guidance items
+- command surfaces compact summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T200 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T199
+
+Deliverables:
+- policy-guidance state endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state window 24h`)
+- compact state classification (`steady|watch|improving|unstable`) with severity derived from posture, drift, anomalies, and guidance pressure
+
+Acceptance:
+- endpoint returns deterministic state + severity summary
+- command surfaces concise state/severity lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T201 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T200
+
+Deliverables:
+- policy-guidance state history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state history limit 20`)
+- recent state timeline over policy-guidance runs with state/severity aggregates
+
+Acceptance:
+- endpoint returns deterministic history items and aggregate counts
+- command surfaces compact states/severity lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T202 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T201
+
+Deliverables:
+- policy-guidance state metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state metrics window 24h`)
+- windowed aggregates for state/severity/mode/status distribution and action volume
+
+Acceptance:
+- endpoint returns deterministic metrics summary for the requested window
+- command surfaces compact state and severity count lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T203 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T202
+
+Deliverables:
+- policy-guidance state anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state anomalies window 24h limit 10`)
+- anomaly detection for unstable windows and state churn across policy-guidance runs
+
+Acceptance:
+- endpoint returns deterministic anomaly summary + prioritized items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T204 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T203
+
+Deliverables:
+- policy-guidance state summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state summary window 24h limit 8`)
+- consolidated state rollup (current state posture + window metrics + anomalies + history slice)
+
+Acceptance:
+- endpoint returns deterministic summary with compact history items
+- command surfaces concise state posture lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T205 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T204
+
+Deliverables:
+- policy-guidance state guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance window 24h limit 8`)
+- prioritized next actions synthesized from state posture, anomalies, drift status, and run coverage
+
+Acceptance:
+- endpoint returns deterministic guidance summary + ranked actions
+- command surfaces compact guidance lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T206 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T205
+
+Deliverables:
+- state-guidance run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-run`)
+- intent commands:
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance dry run window 24h limit 8`
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance apply window 24h limit 8`
+- dry-run/apply execution summary for state-guidance actions with audit event on apply
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns selected command set
+- apply mode appends `graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T207 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T206
+
+Deliverables:
+- state-guidance history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance history limit 20`)
+- recent state-guidance run timeline with apply/dry mix, state/severity mix, and action volume
+
+Acceptance:
+- endpoint returns deterministic history summary + recent items
+- command surfaces compact history lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T208 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T207
+
+Deliverables:
+- state-guidance metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance metrics window 24h`)
+- windowed aggregate metrics (apply/dry mix, avg action volume, state/severity/status distribution, top commands)
+
+Acceptance:
+- endpoint returns deterministic metrics summary + top-command frequencies
+- command surfaces compact metrics lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T209 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T208
+
+Deliverables:
+- state-guidance anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance anomalies window 24h limit 10`)
+- anomaly detection over state-guidance runs (apply bursts, unstable windows, high action volume)
+
+Acceptance:
+- endpoint returns deterministic anomaly summary + prioritized items
+- command surfaces compact anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T210 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T209
+
+Deliverables:
+- state-guidance summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance summary window 24h limit 8`)
+- consolidated state-guidance rollup (guidance posture + history + metrics + anomalies)
+
+Acceptance:
+- endpoint returns deterministic summary with compact action items
+- command surfaces concise summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T211 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T210
+
+Deliverables:
+- state-guidance state endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state window 24h`)
+- normalized posture rollup (`critical|watch|healthy|steady`) derived from state-guidance summary state/severity/status/anomaly signals
+
+Acceptance:
+- endpoint returns deterministic state snapshot with posture and source summary fields
+- command surfaces concise posture/state/severity lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T212 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Trend Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T211
+
+Deliverables:
+- state-guidance state trend endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-trend?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state trend window 24h`)
+- comparative trend rollup across current/previous windows (direction + posture drift + unstable/critical/action deltas)
+
+Acceptance:
+- endpoint returns deterministic trend summary with current/previous state posture snapshots
+- command surfaces concise direction/posture and delta lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T213 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Offenders Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T212
+
+Deliverables:
+- state-guidance state offenders endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-offenders?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state offenders window 24h limit 8`)
+- ranked offender extraction over state-guidance runs (critical/unstable/action-weighted command scoring)
+
+Acceptance:
+- endpoint returns deterministic offender ranking with compact severity/action stats
+- command surfaces concise offender/critical/unstable lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T214 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Timeline Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T213
+
+Deliverables:
+- state-guidance state timeline endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-timeline?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state timeline window 24h limit 20`)
+- chronological timeline surface for state-guidance runs (mode/state/severity/status/actions snapshots)
+
+Acceptance:
+- endpoint returns deterministic timeline items plus apply/dry and critical/unstable summary rollup
+- command surfaces concise timeline count/apply/dry lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T215 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Matrix Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T214
+
+Deliverables:
+- state-guidance state matrix endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-matrix?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state matrix window 24h`)
+- matrix aggregation surface over state/severity/status combinations for state-guidance runs
+
+Acceptance:
+- endpoint returns deterministic matrix cells plus state/severity/status count rollups
+- command surfaces concise matrix runs/cells lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T216 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T215
+
+Deliverables:
+- state-guidance state guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance window 24h limit 8`)
+- synthesized actions from state trend/offenders/timeline/matrix signals
+
+Acceptance:
+- endpoint returns deterministic guidance summary plus prioritized action list
+- command surfaces concise direction/posture/action lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T217 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T216
+
+Deliverables:
+- state-guidance state guidance run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-run`)
+- intent commands:
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance dry run window 24h limit 8`
+  - `run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance apply window 24h limit 8`
+- dry-run/apply executor for synthesized state-guidance-state actions with apply event emission
+
+Acceptance:
+- endpoint supports `mode=dry_run|apply` and returns selected command set
+- apply mode appends `graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run` event
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T218 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T217
+
+Deliverables:
+- state-guidance state guidance history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance history limit 20`)
+- recent run timeline for state-guidance-state guidance execution (apply/dry mix, direction/posture counts, action volume)
+
+Acceptance:
+- endpoint returns deterministic history summary + recent items
+- command surfaces concise apply/dry and direction lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T219 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T218
+
+Deliverables:
+- state-guidance state guidance metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance metrics window 24h`)
+- windowed aggregate metrics for guidance-run execution (apply/dry mix, avg actions, direction/posture distribution, top commands)
+
+Acceptance:
+- endpoint returns deterministic metrics summary and top command frequencies
+- command surfaces concise metrics and avg-action lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T220 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T219
+
+Deliverables:
+- state-guidance state guidance anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance anomalies window 24h limit 10`)
+- anomaly detection over guidance-run execution windows (apply burst, worse trend ratio, critical posture ratio, high action load)
+
+Acceptance:
+- endpoint returns deterministic anomaly summary + prioritized items
+- command surfaces concise anomaly lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T221 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T220
+
+Deliverables:
+- state-guidance state guidance summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance summary window 24h limit 8`)
+- consolidated summary rollup of guidance, history, metrics, and anomalies for the guidance-state layer
+
+Acceptance:
+- endpoint returns deterministic summary with compact action items
+- command surfaces concise direction/posture/action summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T222 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T221
+
+Deliverables:
+- state-guidance state guidance state endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state window 24h`)
+- normalized state posture rollup for the guidance-state chain (`state`, `posture`, `direction`, `runs`, `anomalies`, `actions`)
+
+Acceptance:
+- endpoint returns deterministic state summary and message payload
+- command surfaces concise state/posture/direction preview lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T223 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T222
+
+Deliverables:
+- state-guidance state guidance state history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state history limit 20`)
+- normalized historical state rollup (`stateCounts`, `directionCounts`, `postureCounts`) over guidance-state runs
+
+Acceptance:
+- endpoint returns deterministic state-history summary and typed rows
+- command surfaces concise states line and run-state timeline lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T224 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T223
+
+Deliverables:
+- state-guidance state guidance state metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state metrics window 24h`)
+- windowed aggregate metrics over normalized state runs (`count`, `applyCount`, `dryRunCount`, `avgActions`, `stateCounts`)
+
+Acceptance:
+- endpoint returns deterministic metrics summary for selected window
+- command surfaces concise count/apply-dry/avg-actions and state distribution lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T225 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T224
+
+Deliverables:
+- state-guidance state guidance state anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state anomalies window 24h limit 10`)
+- anomaly signals for unstable/high-action state runs and elevated unstable/worse/apply/high-action ratios
+
+Acceptance:
+- endpoint returns deterministic anomaly summary and ordered anomaly items
+- command surfaces concise anomaly count and ratio summary lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T226 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T225
+
+Deliverables:
+- state-guidance state guidance state summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state summary window 24h limit 8`)
+- consolidated summary over state snapshot + state history + state metrics + state anomalies
+
+Acceptance:
+- endpoint returns deterministic state summary payload with compact rollup fields
+- command surfaces concise state/posture/direction and anomalies/avg-actions/history lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T227 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T226
+
+Deliverables:
+- state-guidance state guidance state run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run`)
+- intent command (`run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state dry run window 24h limit 8`)
+- dry/apply execution wrapper around state-summary recommendations with recorded apply event
+
+Acceptance:
+- endpoint supports `dry_run|apply` and returns deterministic mode/state/posture/direction summary
+- command surfaces concise mode/state/posture/direction + actions/applied preview lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T228 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T227
+
+Deliverables:
+- state-guidance state guidance state run history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run history limit 20`)
+- historical rollup for state-run events with apply/dry mix and state/posture/direction distribution
+
+Acceptance:
+- endpoint returns deterministic run-history summary and typed rows
+- command surfaces concise count/apply-dry/state-distribution lines in operator feed
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T229 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T228
+
+Deliverables:
+- state-guidance state guidance state run metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run metrics window 24h`)
+- windowed aggregates over state-run events (`count`, `applyCount`, `dryRunCount`, `avgActions`, state/posture/direction distributions, top commands)
+
+Acceptance:
+- endpoint returns deterministic run-metrics summary for selected window
+- command surfaces concise count/apply-dry/avg-actions/state distribution lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T230 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T229
+
+Deliverables:
+- state-guidance state guidance state run anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run anomalies window 24h limit 10`)
+- anomaly signals for run-layer apply bursts, unstable/worse/high-action ratios, and apply+unstable outliers
+
+Acceptance:
+- endpoint returns deterministic anomaly summary and ordered anomaly items
+- command surfaces concise run anomaly count and ratio summary lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T231 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T230
+
+Deliverables:
+- state-guidance state guidance state run summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run summary window 24h limit 8`)
+- consolidated run-layer summary over state snapshot + run history + run metrics + run anomalies
+
+Acceptance:
+- endpoint returns deterministic run summary payload with compact rollup fields
+- command surfaces concise state/posture/direction and run-anomalies/avg-actions/history lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T232 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T231
+
+Deliverables:
+- state-guidance state guidance state run state endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state window 24h`)
+- normalized run-state posture rollup (`state`, `posture`, `direction`, `runCount`, `runAnomalies`, `avgActions`)
+
+Acceptance:
+- endpoint returns deterministic run-state summary and message payload
+- command surfaces concise run-state/posture/direction preview lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T233 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T232
+
+Deliverables:
+- state-guidance state guidance state run state history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state history limit 20`)
+- normalized run-state historical rollup (`stateCounts`, `directionCounts`, `postureCounts`) over run events
+
+Acceptance:
+- endpoint returns deterministic run-state-history summary and typed rows
+- command surfaces concise states line and run-state timeline lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T234 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T233
+
+Deliverables:
+- state-guidance state guidance state run state metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state metrics window 24h`)
+- windowed metrics over normalized run-state events (`count`, `applyCount`, `dryRunCount`, `avgActions`, state/posture/direction distributions, top commands)
+
+Acceptance:
+- endpoint returns deterministic run-state metrics summary for selected window
+- command surfaces concise count/apply-dry/avg-actions/state distribution lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T235 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T234
+
+Deliverables:
+- state-guidance state guidance state run state anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state anomalies window 24h limit 10`)
+- anomaly signals for run-state apply bursts, unstable/worse/high-action ratios, and apply+unstable outliers
+
+Acceptance:
+- endpoint returns deterministic anomaly summary and ordered anomaly items
+- command surfaces concise run-state anomaly count and ratio summary lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T236 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Summary Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T235
+
+Deliverables:
+- state-guidance state guidance state run state summary endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-summary?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state summary window 24h limit 8`)
+- deterministic composite summary over run-state, run-state-history, run-state-metrics, and run-state-anomalies surfaces
+
+Acceptance:
+- endpoint returns deterministic rollup summary with state/posture/direction, run/anomaly/action counts, and linked summaries
+- command surfaces concise run-state summary lines for count, state tuple, and anomaly/action/history totals
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T237 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Guidance Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T236
+
+Deliverables:
+- state-guidance state guidance state run state guidance endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance window 24h limit 8`)
+- deterministic guidance actions derived from run-state summary/anomaly/metrics/history posture
+
+Acceptance:
+- endpoint returns deterministic guidance summary (`state`, `posture`, `direction`, run/anomaly/action counts) and prioritized action commands
+- command surfaces concise state tuple, run/anomaly/action metrics, and guidance actions
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T238 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Guidance Run Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T237
+
+Deliverables:
+- state-guidance state guidance state run state guidance run endpoint (`POST /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run`)
+- intent command (`run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance dry run window 24h limit 8`)
+- deterministic run wrapper over run-state-guidance recommendations with `dry_run|apply` mode and command list emission
+
+Acceptance:
+- endpoint returns deterministic run summary (`mode`, state/posture/direction, action count, applied flag) and command list
+- command surfaces concise mode/state tuple plus actions/applied and command preview lines
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T239 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Guidance Run History Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T238
+
+Deliverables:
+- state-guidance state guidance state run state guidance run history endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-history?limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run history limit 20`)
+- deterministic history projection over run-state-guidance-run events with mode/state/posture/direction/action summaries
+
+Acceptance:
+- endpoint returns deterministic history summary (`count`, `applyCount`, `dryRunCount`, state/direction/posture distributions) and ordered items
+- command surfaces concise count/apply-dry/states lines plus recent run records
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T240 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Guidance Run Metrics Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T239
+
+Deliverables:
+- state-guidance state guidance state run state guidance run metrics endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-metrics?window_ms=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run metrics window 24h`)
+- deterministic windowed metrics for run-state-guidance-run events (`count`, `applyCount`, `dryRunCount`, `avgActions`, state/posture/direction distributions, top commands)
+
+Acceptance:
+- endpoint returns deterministic metrics summary for selected window
+- command surfaces concise count/apply-dry/avg-actions/state lines plus top command hints
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
+---
+
+## T241 - Graph Score Autopilot Policy Alignment Policy Trend Guidance Policy Guidance State Guidance State Guidance State Run State Guidance Run Anomalies Surface
+Status: done
+Track: A/B (runtime graph + planner/operator UX)
+Priority: P1
+Dependencies: T240
+
+Deliverables:
+- state-guidance state guidance state run state guidance run anomalies endpoint (`GET /api/session/{id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-anomalies?window_ms=&limit=`)
+- intent command (`show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run anomalies window 24h limit 10`)
+- deterministic anomaly signals over run-state-guidance-run events (apply burst, unstable/worse/high-action ratios, apply+unstable outliers)
+
+Acceptance:
+- endpoint returns deterministic anomaly summary and ordered anomaly items
+- command surfaces concise run-state-guidance-run anomaly lines with ratio summary
+- replay/UI tests validate endpoint + command behavior
+
+Notes:
+- backend implementation in `backend/main.py`
+- replay coverage in `scripts/replay_smoke.py`
+- UI coverage in `tests/ui/trace.spec.js`
+- docs update in `README.md`
+
 ## Suggested Execution Order
 1. T3
 2. T4

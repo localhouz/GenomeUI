@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "synapse-synapse": {
+      "command": "py",
+      "args": [
+        "-3.12",
+        "-m",
+        "synapse.mcp.server",
+        "--path",
+        "C:\\Users\\steve\\Documents\\GenomeUI",
+        "--no-agent"
+      ]
+    }
+  }
+}

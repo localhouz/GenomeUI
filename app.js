@@ -124,6 +124,7 @@ const UIEngine = {
             lastIntent: '',
             lastEnvelope: null,
             lastExecution: null,
+            lastPlan: null,
             lastKernelTrace: null,
             handoff: { activeDeviceId: null, pending: null, lastClaimAt: null },
             presence: { activeCount: 0, count: 0, items: [], timeoutMs: 120000, updatedAt: 0 },
@@ -131,6 +132,9 @@ const UIEngine = {
             sessionId: '',
             deviceId: '',
             revision: 0,
+            graphSnapshot: null,
+            graphSnapshotRevision: 0,
+            graphFetchInFlight: false,
             isApplyingLocalTurn: false,
             syncTransport: 'idle'
         },
@@ -465,6 +469,7 @@ const UIEngine = {
         this.state.session.presence = snapshot.presence || this.state.session.presence;
         if (snapshot.lastTurn?.envelope && snapshot.lastTurn?.plan) {
             const plan = UIPlanSchema.normalize(snapshot.lastTurn.plan);
+            this.state.session.lastExecution = snapshot.lastTurn.execution || this.state.session.lastExecution;
             this.state.session.lastKernelTrace = snapshot.lastTurn.kernelTrace || this.deriveKernelTrace(snapshot.lastTurn.execution, snapshot.lastTurn.route);
             this.render(plan, snapshot.lastTurn.envelope, this.state.session.lastKernelTrace);
             this.updateStatus(`SYNCED:${snapshot.lastTurn.planner || 'REMOTE'}`);
@@ -484,6 +489,7 @@ const UIEngine = {
         this.state.session.presence = payload.presence || this.state.session.presence;
         if (payload.lastTurn?.envelope && payload.lastTurn?.plan) {
             const plan = UIPlanSchema.normalize(payload.lastTurn.plan);
+            this.state.session.lastExecution = payload.lastTurn.execution || this.state.session.lastExecution;
             this.state.session.lastKernelTrace = payload.lastTurn.kernelTrace || this.deriveKernelTrace(payload.lastTurn.execution, payload.lastTurn.route);
             this.render(plan, payload.lastTurn.envelope, this.state.session.lastKernelTrace);
             this.updateStatus(`SYNCED:${payload.lastTurn.planner || 'REMOTE'}`);
@@ -797,29 +803,199 @@ const UIEngine = {
     },
 
     render(plan, envelope, kernelTrace = this.state.session.lastKernelTrace) {
+        this.teardownSceneGraphics();
+        this.state.session.lastPlan = plan;
+        this.applyPlanGraphSnapshot(plan);
         const hint = plan.suggestions?.[0] || 'add task Ship onboarding';
         this.input.placeholder = `Try: "${hint}"`;
         const blocks = this.composeFeedBlocks(plan, envelope, kernelTrace);
-        const intentText = (envelope?.raw || this.state.session.lastIntent || '').trim() || 'State intent to synthesize your workspace.';
+        const core = this.buildCoreSurface(plan, envelope, this.state.session.lastExecution);
+        const visual = this.buildPrimaryVisual(core, this.state.session.lastExecution, envelope, plan);
+        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files'].includes(core.kind);
+        const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
+        const railBlocks = this.buildImmersiveRailBlocks(blocks);
         this.container.innerHTML = `
-            <div class="workspace">
+            <div class="workspace immersive">
                 <section class="workspace-main">
-                    <div class="surface-core">
-                        <div class="surface-label">Workspace</div>
-                        <div class="core-intent">${escapeHtml(intentText)}</div>
-                        <div class="core-summary">${escapeHtml(plan.subtitle || 'Surface online.')}</div>
+                    <div class="surface-core immersive ${escapeAttr(core.kind || 'generic')} ${escapeAttr(core.theme || '')}">
+                        ${visual}
+                        ${showCoreCopy ? `
+                            <div class="surface-label">Workspace</div>
+                            <div class="core-intent ${escapeAttr(core.variant || '')}">${escapeHtml(core.headline)}</div>
+                            <div class="core-summary">${escapeHtml(core.summary)}</div>
+                        ` : ''}
                     </div>
                 </section>
-                <aside class="workspace-side">
-                    <div class="feed-head">Activity Feed</div>
-                    ${blocks.length ? blocks.map((block) => this.renderFeedBlock(block)).join('') : '<div class="feed-empty">No active signals.</div>'}
+                <aside class="workspace-side immersive-rail">
+                    <div class="feed-head">Context</div>
+                    <div class="immersive-hud">${hud}</div>
+                    ${railBlocks}
                 </aside>
             </div>
         `;
+        this.activateSceneGraphics();
+        this.maybePrefetchGraphSnapshot(core);
+    },
+
+    normalizeGraphSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== 'object') return null;
+        return {
+            entities: Array.isArray(snapshot.entities) ? snapshot.entities : [],
+            relations: Array.isArray(snapshot.relations) ? snapshot.relations : [],
+            events: Array.isArray(snapshot.events) ? snapshot.events : [],
+            counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
+            fetchedAt: Date.now(),
+        };
+    },
+
+    applyPlanGraphSnapshot(plan) {
+        const snapshot = this.normalizeGraphSnapshot(plan?.trace?.graphSnapshot);
+        if (!snapshot) return;
+        this.state.session.graphSnapshot = snapshot;
+        this.state.session.graphSnapshotRevision = Number(this.state.session.revision || 0);
+    },
+
+    maybePrefetchGraphSnapshot(core) {
+        if (String(core?.kind || '') !== 'graph') return;
+        const needsFetch = !this.state.session.graphSnapshot
+            || Number(this.state.session.graphSnapshotRevision || 0) < Number(this.state.session.revision || 0);
+        if (!needsFetch) return;
+        this.fetchGraphSnapshot().catch(() => { });
+    },
+
+    async fetchGraphSnapshot() {
+        if (this.state.session.graphFetchInFlight) return;
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return;
+        this.state.session.graphFetchInFlight = true;
+        try {
+            const resp = await fetch(`/api/session/${encodeURIComponent(sid)}/graph?limit=300`);
+            if (!resp.ok) return;
+            const payload = await resp.json();
+            const snapshot = {
+                entities: Array.isArray(payload?.entities) ? payload.entities : [],
+                relations: Array.isArray(payload?.relations) ? payload.relations : [],
+                events: Array.isArray(payload?.events) ? payload.events : [],
+                counts: payload?.counts && typeof payload.counts === 'object' ? payload.counts : {},
+                fetchedAt: Date.now(),
+            };
+            this.state.session.graphSnapshot = snapshot;
+            this.state.session.graphSnapshotRevision = Number(this.state.session.revision || 0);
+            if (this.state.session.lastPlan && this.state.session.lastEnvelope) {
+                this.render(this.state.session.lastPlan, this.state.session.lastEnvelope, this.state.session.lastKernelTrace);
+            }
+        } catch {
+            // Best-effort visual fetch.
+        } finally {
+            this.state.session.graphFetchInFlight = false;
+        }
+    },
+
+    buildImmersiveRailBlocks(blocks) {
+        const list = Array.isArray(blocks) ? blocks : [];
+        const preferredOrder = ['trace-result', 'trace-next', 'trace-system', 'trace-connectors'];
+        const sorted = [...list].sort((a, b) => preferredOrder.indexOf(a.id) - preferredOrder.indexOf(b.id));
+        return sorted.slice(0, 4).map((block) => this.renderFeedBlock(block)).join('');
+    },
+
+    buildImmersiveHud(core, plan, envelope, kernelTrace, execution) {
+        const latest = this.latestToolResult(execution) || {};
+        const route = kernelTrace?.route || {};
+        const perf = kernelTrace?.runtime || {};
+        const items = [];
+        items.push(`mode ${String(core.kind || 'generic')}`);
+        items.push(`route ${String(route.target || 'deterministic')} / ${String(route.reason || 'local')}`);
+        items.push(`latency ${Math.round(Number(perf.totalMs || this.state.metrics.latency || 0))}ms`);
+        if (latest?.op === 'shop_catalog_search') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const target = (data.sourceTarget && typeof data.sourceTarget === 'object') ? data.sourceTarget : null;
+            if (String(target?.mode || '').toLowerCase() === 'direct') {
+                items.push('route direct-source');
+                items.push(String(target?.label || 'open source'));
+                return items
+                    .filter(Boolean)
+                    .map((line) => `<div class="hud-line">${escapeHtml(String(line))}</div>`)
+                    .join('');
+            }
+        }
+        if (core.kind === 'webdeck') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const source = String(data.source || 'scaffold').trim();
+            const itemsCount = Array.isArray(data.items) ? data.items.length : 0;
+            const hasUrl = Boolean(String(data.url || '').trim());
+            items.push(`source ${source}`);
+            items.push(hasUrl ? 'mode page' : 'mode search');
+            if (itemsCount > 0) items.push(`results ${itemsCount}`);
+            return items
+                .filter(Boolean)
+                .map((line) => `<div class="hud-line">${escapeHtml(String(line))}</div>`)
+                .join('');
+        }
+        if (latest?.message) items.push(String(latest.message));
+        const preview = Array.isArray(latest?.previewLines) ? latest.previewLines.slice(0, 3) : [];
+        for (const line of preview) items.push(String(line));
+        return items
+            .filter(Boolean)
+            .map((line) => `<div class="hud-line">${escapeHtml(String(line))}</div>`)
+            .join('');
+    },
+
+    humanizeIntentLabel(rawIntent) {
+        const text = String(rawIntent || '').trim();
+        if (!text) return 'State intent to synthesize your workspace.';
+        const lower = text.toLowerCase();
+        const mappings = [
+            { pattern: /run state guidance run anomalies/, label: 'Run-state guidance anomalies' },
+            { pattern: /run state guidance run metrics/, label: 'Run-state guidance metrics' },
+            { pattern: /run state guidance run history/, label: 'Run-state guidance history' },
+            { pattern: /run state guidance dry run|run state guidance apply/, label: 'Execute run-state guidance' },
+            { pattern: /run state guidance$/, label: 'Run-state guidance' },
+            { pattern: /run state anomalies/, label: 'Run-state anomalies' },
+            { pattern: /run state metrics/, label: 'Run-state metrics' },
+            { pattern: /run state history/, label: 'Run-state history' },
+            { pattern: /run state summary/, label: 'Run-state summary' },
+            { pattern: /run state guidance/, label: 'Run-state guidance' },
+            { pattern: /^add task\b/, label: 'Add task' },
+            { pattern: /^complete task\b/, label: 'Complete task' },
+            { pattern: /^show graph summary\b/, label: 'Graph summary' }
+        ];
+        const mapped = mappings.find((item) => item.pattern.test(lower));
+        if (mapped) return mapped.label;
+
+        if (text.length > 72) {
+            const compact = text
+                .replace(/\s+window\s+\d+\s*(ms|s|m|h|d)\b/gi, '')
+                .replace(/\s+limit\s+\d+\b/gi, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            return `${compact.slice(0, 69)}...`;
+        }
+        return text;
+    },
+
+    hashText(value) {
+        const text = String(value || '');
+        let hash = 0;
+        for (let i = 0; i < text.length; i += 1) {
+            hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash);
+    },
+
+    graphNodeLabel(entity, idx) {
+        const title = String(entity?.title || '').trim();
+        const text = String(entity?.text || '').trim();
+        const category = String(entity?.category || '').trim();
+        const kind = String(entity?.kind || 'entity').trim().toLowerCase();
+        const primary = title || text || category || kind || `node-${idx + 1}`;
+        return primary.slice(0, 14);
     },
 
     composeFeedBlocks(plan, envelope, kernelTrace) {
         const trace = kernelTrace || this.deriveKernelTrace(this.state.session.lastExecution, null);
+        const execution = this.state.session.lastExecution || {};
+        const resultItems = this.buildExecutionResultItems(execution);
+        const latestOp = this.latestToolResult(execution);
         const policyCodes = Array.isArray(trace?.policy?.codes) && trace.policy.codes.length ? trace.policy.codes.join(', ') : 'none';
         const confirmCommand = this.extractConfirmationCommand(this.state.session.lastExecution?.message || '');
         const diff = trace?.diff || { tasks: 0, expenses: 0, notes: 0 };
@@ -835,14 +1011,35 @@ const UIEngine = {
             .reverse()
             .map((entry) => `${entry.ok ? 'ok' : 'denied'} ${entry.op} | dT ${entry.diff?.tasks ?? 0}, dE ${entry.diff?.expenses ?? 0}, dN ${entry.diff?.notes ?? 0}`);
         const systemItems = this.buildSystemItems(trace, policyCodes, diff, envelope);
+        const connectorAccessItems = this.buildConnectorAccessItems(this.state.session.lastExecution);
 
-        const extra = [
+        const primary = [
+            {
+                id: 'trace-result',
+                type: 'list',
+                label: 'Result',
+                items: resultItems
+            },
+            {
+                id: 'trace-next',
+                type: 'list',
+                label: 'Next Moves',
+                items: (plan?.suggestions || []).slice(0, 4).map((text) => ({ text, command: text }))
+            },
             {
                 id: 'trace-system',
                 type: 'list',
                 label: 'System',
                 items: systemItems
             },
+            {
+                id: 'trace-connectors',
+                type: 'list',
+                label: 'Connector Access',
+                items: connectorAccessItems
+            },
+        ];
+        const diagnostic = [
             {
                 id: 'trace-jobs',
                 type: 'list',
@@ -898,8 +1095,10 @@ const UIEngine = {
                 items: [{ text: confirmCommand, command: confirmCommand }]
             }] : [])
         ];
-
-        return [...extra].slice(0, 10);
+        if (latestOp?.ok && (latestOp.op === 'weather_forecast' || latestOp.op === 'location_status' || latestOp.op === 'shop_catalog_search' || latestOp.op === 'fetch_url' || latestOp.op === 'web_search' || latestOp.op === 'web_summarize')) {
+            return primary.slice(0, 4);
+        }
+        return [...primary, ...diagnostic].slice(0, 10);
     },
 
     buildSystemItems(trace, policyCodes, diff, envelope) {
@@ -916,6 +1115,2029 @@ const UIEngine = {
             `intent: ${String(envelope?.taskIntent?.operation || 'read').toUpperCase()} / ${(envelope?.stateIntent?.readDomains || ['tasks', 'expenses', 'notes']).join('+')}`,
             `link: ${String(this.state.session.syncTransport || 'idle').toUpperCase()} rev ${this.state.session.revision}`
         ];
+    },
+
+    buildConnectorAccessItems(execution) {
+        const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
+        const blocked = toolResults.find((item) => item && item.ok === false);
+        const blockedCode = String(blocked?.policy?.code || '');
+        const blockedReason = String(blocked?.policy?.reason || blocked?.message || '');
+        const tryCommand = this.extractTryCommand(blockedReason);
+        if (latest?.ok && latest?.op === 'weather_forecast') {
+            return [
+                'status: weather connector active',
+                { text: "what's the weather where i am", command: "what's the weather where i am" },
+                { text: 'weather in Seattle', command: 'weather in Seattle' },
+                { text: 'weather in New York', command: 'weather in New York' },
+                { text: 'where am i', command: 'where am i' }
+            ];
+        }
+        if (latest?.ok && latest?.op === 'location_status') {
+            return [
+                'status: location context active',
+                { text: "what's the weather where i am", command: "what's the weather where i am" },
+                { text: 'weather in Tulsa, Oklahoma', command: 'weather in Tulsa, Oklahoma' },
+                { text: 'weather in Seattle', command: 'weather in Seattle' },
+                { text: 'show connector grants', command: 'show connector grants' }
+            ];
+        }
+        if (latest?.ok && latest?.op === 'shop_catalog_search') {
+            return [
+                'status: shopping catalog active',
+                { text: 'show me new running shoes', command: 'show me new running shoes' },
+                { text: 'find me an office outfit', command: 'find me an office outfit' },
+                { text: 'show streetwear sneakers', command: 'show streetwear sneakers' },
+                { text: 'show me a casual outfit', command: 'show me a casual outfit' }
+            ];
+        }
+        if (blockedCode === 'connector_scope_required') {
+            const blockedOp = String(blocked?.op || '');
+            const byOp = {
+                weather_forecast: 'grant weather forecast',
+                telephony_call_start: 'grant connector scope telephony.call.start',
+                banking_balance_read: 'grant connector scope bank.account.balance.read',
+                banking_transactions_read: 'grant connector scope bank.transaction.read',
+                social_feed_read: 'grant connector scope social.feed.read',
+                social_message_send: 'grant connector scope social.message.send'
+            };
+            const grant = tryCommand || byOp[blockedOp] || 'show connector grants';
+            const ttlGrant = grant.startsWith('grant ') ? `${grant} for 10m` : '';
+            return [
+                'status: permission required for connector action',
+                { text: grant, command: grant },
+                ...(ttlGrant ? [{ text: ttlGrant, command: ttlGrant }] : []),
+                { text: 'show connector grants', command: 'show connector grants' },
+                { text: 'retry blocked intent', command: String(this.state.session.lastIntent || '').trim() || 'show connector grants' }
+            ].slice(0, 5);
+        }
+        if (blockedCode === 'confirmation_required') {
+            const confirm = tryCommand || this.extractConfirmationCommand(blockedReason);
+            return [
+                'status: confirmation required for write action',
+                ...(confirm ? [{ text: confirm, command: confirm }] : []),
+                { text: 'show connector grants', command: 'show connector grants' },
+                { text: 'retry blocked intent', command: String(this.state.session.lastIntent || '').trim() || 'show connector grants' }
+            ].slice(0, 5);
+        }
+        return [
+            { text: "what's the weather where i am", command: "what's the weather where i am" },
+            { text: 'weather in Tulsa, Oklahoma', command: 'weather in Tulsa, Oklahoma' },
+            { text: 'where am i', command: 'where am i' },
+            { text: 'show connector grants', command: 'show connector grants' },
+            { text: 'show me new shoes', command: 'show me new shoes' }
+        ];
+    },
+
+    buildExecutionResultItems(execution) {
+        const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
+        if (latest?.ok && latest?.op === 'shop_catalog_search') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const target = (data.sourceTarget && typeof data.sourceTarget === 'object') ? data.sourceTarget : null;
+            if (String(target?.mode || '').toLowerCase() === 'direct') {
+                const refs = Array.isArray(data.items) ? data.items.length : 0;
+                return [
+                    'route: direct source',
+                    String(target?.label || 'open source'),
+                    String(target?.url || ''),
+                    `visual refs: ${refs}`,
+                ].filter(Boolean);
+            }
+        }
+        if (latest && Array.isArray(latest.previewLines) && latest.previewLines.length) {
+            return latest.previewLines.slice(0, 5).map((line) => String(line));
+        }
+        if (latest && typeof latest.message === 'string' && latest.message.trim()) {
+            return [latest.message.trim()];
+        }
+        const message = String(execution?.message || '').trim();
+        return [message || 'No result yet.'];
+    },
+
+    latestToolResult(execution) {
+        const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        return toolResults.length ? toolResults[toolResults.length - 1] : null;
+    },
+
+    parsePreviewMap(previewLines) {
+        const out = {};
+        const items = Array.isArray(previewLines) ? previewLines : [];
+        for (const line of items) {
+            const value = String(line || '');
+            const idx = value.indexOf(':');
+            if (idx <= 0) continue;
+            const key = value.slice(0, idx).trim().toLowerCase();
+            const raw = value.slice(idx + 1).trim();
+            if (!key || !raw) continue;
+            out[key] = raw;
+        }
+        return out;
+    },
+
+    buildCoreSurface(plan, envelope, execution) {
+        const fallbackHeadline = this.humanizeIntentLabel((envelope?.raw || this.state.session.lastIntent || '').trim());
+        const fallbackSummary = plan.subtitle || 'Surface online.';
+        const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
+        if (!latest || !latest.ok) {
+            return { headline: fallbackHeadline, summary: fallbackSummary, variant: 'intent', kind: 'generic', theme: 'theme-neutral' };
+        }
+        if (latest.op === 'weather_forecast') {
+            const weatherData = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const info = this.parsePreviewMap(latest.previewLines);
+            const temp = String(weatherData.temperatureF || info.temperature || '').replace(/\s*f$/i, '').trim();
+            const condition = String(weatherData.condition || info.condition || '').trim();
+            const location = String(weatherData.location || info.location || '').trim();
+            const wind = String(weatherData.windMph || info.wind || '').trim();
+            const source = String(weatherData.source || info.source || '').trim();
+            const headline = temp && condition ? `${temp}F, ${condition}` : (latest.message || 'Weather');
+            const summaryParts = [location, wind, source ? `source: ${source}` : ''].filter(Boolean);
+            const lower = condition.toLowerCase();
+            const theme = lower.includes('rain') || lower.includes('storm')
+                ? 'theme-rain'
+                : lower.includes('snow')
+                    ? 'theme-snow'
+                    : lower.includes('sun') || lower.includes('clear')
+                        ? 'theme-sun'
+                        : 'theme-cloud';
+            const mergedInfo = { ...info, ...weatherData, forecast: Array.isArray(weatherData.forecast) ? weatherData.forecast : [] };
+            return { headline, summary: summaryParts.join(' | '), variant: 'result', kind: 'weather', theme, info: mergedInfo };
+        }
+        if (latest.op === 'location_status') {
+            const info = this.parsePreviewMap(latest.previewLines);
+            const location = String(info.location || '').trim();
+            const headline = location || latest.message || 'Location context';
+            return { headline, summary: 'Current location context for intent routing.', variant: 'result', kind: 'location', theme: 'theme-location', info };
+        }
+        if (latest.op === 'fetch_url' || latest.op === 'web_summarize') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const title = String(data.title || latest.message || 'Web page').trim();
+            const excerpt = String(data.excerpt || '').trim();
+            const url = String(data.url || '').trim();
+            const favicon = String(data.favicon || '').trim();
+            const thumbnail = String(data.thumbnail || '').trim();
+            const source = String(data.source || 'scaffold').trim();
+            return {
+                headline: title || url || 'Web Surface',
+                summary: excerpt.slice(0, 120) || url,
+                variant: 'result',
+                kind: 'webdeck',
+                theme: 'theme-webdeck',
+                info: { url, title, excerpt, favicon, thumbnail, source, op: latest.op },
+            };
+        }
+        if (latest.op === 'web_search') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const query = String(data.query || '').trim();
+            const source = String(data.source || 'scaffold').trim();
+            const siteTarget = (data.sourceTarget && typeof data.sourceTarget === 'object') ? data.sourceTarget : null;
+            return {
+                headline: query ? `"${query}"` : 'Web Search',
+                summary: `${items.length} results - ${source}`,
+                variant: 'result',
+                kind: 'webdeck',
+                theme: 'theme-webdeck',
+                info: { query, items, source, siteTarget, op: 'web_search' },
+            };
+        }
+        if (latest.op === 'shop_catalog_search') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const category = String(data.category || '').trim();
+            const label = category === 'shoes' ? 'shoes' : category === 'outfit' ? 'outfits' : 'products';
+            const headline = `${items.length} ${label}`;
+            const query = String(data.query || this.state.session.lastIntent || '').trim();
+            return {
+                headline,
+                summary: query || 'Shopping results',
+                variant: 'result',
+                kind: 'shopping',
+                theme: 'theme-shopping',
+                info: { ...data, items },
+            };
+        }
+        if (latest.op === 'list_files' || latest.op === 'read_file') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const path = String(data.path || '').trim();
+            const excerpt = String(data.excerpt || '').trim();
+            const lineCount = Number(data.lineCount || 0);
+            return {
+                headline: latest.op === 'list_files' ? `${items.length} entries` : `${lineCount || 0} lines`,
+                summary: path || String(latest.message || 'File surface'),
+                variant: 'result',
+                kind: 'files',
+                theme: 'theme-files',
+                info: { ...data, items, excerpt, path, lineCount, op: latest.op },
+            };
+        }
+        if (latest.op === 'social_feed_read' || latest.op === 'social_message_send') {
+            const info = this.parsePreviewMap(latest.previewLines);
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const source = String(data.source || info.source || 'scaffold').trim();
+            const items = Array.isArray(data.items) ? data.items : [];
+            const delivery = String(data.delivery || info.delivery || '').trim();
+            const message = String(data.message || info.message || '').trim();
+            if (latest.op === 'social_feed_read') {
+                return {
+                    headline: `${items.length} social cards`,
+                    summary: `source: ${source}`,
+                    variant: 'result',
+                    kind: 'social',
+                    theme: 'theme-social',
+                    info: { source, items, op: latest.op },
+                };
+            }
+            return {
+                headline: delivery ? `message ${delivery}` : 'message queued',
+                summary: message.slice(0, 120) || latest.message || 'Social update',
+                variant: 'result',
+                kind: 'social',
+                theme: 'theme-social',
+                info: { source, items, message, delivery, op: latest.op },
+            };
+        }
+        if (latest.op === 'banking_balance_read' || latest.op === 'banking_transactions_read') {
+            const info = this.parsePreviewMap(latest.previewLines);
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const source = String(data.source || info.source || 'scaffold').trim();
+            const items = Array.isArray(data.items) ? data.items : [];
+            const availableRaw = data.available ?? info.available ?? '0';
+            const ledgerRaw = data.ledger ?? info.ledger ?? '0';
+            const currency = String(data.currency || info.currency || 'USD').trim();
+            const available = Number(String(availableRaw).replace(/[^0-9.-]/g, '')) || 0;
+            const ledger = Number(String(ledgerRaw).replace(/[^0-9.-]/g, '')) || available;
+            const asOf = String(data.asOf || info['as of'] || '').trim();
+            return {
+                headline: `${formatCurrency(available)} available`,
+                summary: `${currency} | source: ${source}${asOf ? ` | ${asOf}` : ''}`,
+                variant: 'result',
+                kind: 'banking',
+                theme: 'theme-banking',
+                info: { source, items, available, ledger, currency, asOf, op: latest.op },
+            };
+        }
+        if (latest.op === 'contacts_lookup') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const source = String(data.source || 'scaffold').trim();
+            const query = String(data.query || '').trim();
+            return {
+                headline: `${items.length} contacts`,
+                summary: query ? `query: ${query}` : `source: ${source}`,
+                variant: 'result',
+                kind: 'contacts',
+                theme: 'theme-contacts',
+                info: { items, source, query, op: latest.op },
+            };
+        }
+        if (latest.op === 'telephony_status' || latest.op === 'telephony_call_start') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const target = String(data.target || '').trim();
+            const mode = String(data.mode || '').trim();
+            const contactName = String(data.contactName || '').trim();
+            return {
+                headline: target ? `call ${target}` : 'telephony status',
+                summary: [mode, contactName].filter(Boolean).join(' | ') || String(latest.message || 'Call handoff control'),
+                variant: 'result',
+                kind: 'telephony',
+                theme: 'theme-telephony',
+                info: { ...data, op: latest.op },
+            };
+        }
+        const summary = String(latest.message || fallbackSummary);
+        const domains = Array.isArray(envelope?.stateIntent?.readDomains) ? envelope.stateIntent.readDomains : [];
+        const domain = String(domains[0] || 'generic');
+        if (domain === 'tasks') {
+            return { headline: 'Task Flow', summary: 'Generated task workspace', variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
+        }
+        if (domain === 'expenses') {
+            return { headline: 'Spend Pulse', summary: 'Generated expense workspace', variant: 'result', kind: 'expenses', theme: 'theme-expenses' };
+        }
+        if (domain === 'notes') {
+            return { headline: 'Knowledge Stream', summary: 'Generated notes workspace', variant: 'result', kind: 'notes', theme: 'theme-notes' };
+        }
+        if (domain === 'graph') {
+            return { headline: 'System Graph', summary: 'Generated relation workspace', variant: 'result', kind: 'graph', theme: 'theme-graph' };
+        }
+        if (domain === 'files') {
+            return { headline: 'File Surface', summary: 'Generated file workspace', variant: 'result', kind: 'files', theme: 'theme-files' };
+        }
+        if (latest.op === 'mcp_tool_call') {
+            const serverName = String(latest.serverName || latest.data?.serverName || 'Connected App').trim();
+            const toolName   = String(latest.toolName   || latest.data?.toolName   || '').trim();
+            const content    = Array.isArray(latest.data?.content) ? latest.data.content : [];
+            const textItems  = content.filter(c => c.type === 'text').map(c => String(c.text || ''));
+            const imageItems = content.filter(c => c.type === 'image');
+            const headline   = serverName;
+            const summaryLine = toolName || 'tool response';
+            return {
+                kind: 'mcp',
+                headline,
+                summary: summaryLine,
+                variant: 'result',
+                theme: 'theme-mcp',
+                info: { serverName, toolName, content, textItems, imageItems, matchScore: latest.matchScore || 0 },
+            };
+        }
+        return { headline: summary, summary: fallbackSummary, variant: 'result', kind: 'generic', theme: 'theme-neutral' };
+    },
+
+    buildPrimaryVisual(core, execution, envelope, plan) {
+        if (core.kind === 'shopping') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items.slice(0, 24) : [];
+            const dominantBrand = items.length ? String(items[0].brand || '').trim() : '';
+            const sourceTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
+            const sourceHost = String(sourceTarget?.host || '').trim().toLowerCase();
+            const brandLink = String(sourceTarget?.url || '').trim() || `https://www.google.com/search?q=${encodeURIComponent(`${dominantBrand || 'shopping'} ${String(info.query || '')}`)}`;
+            const brandLabel = String(sourceTarget?.label || '').trim() || `open ${dominantBrand || 'brand'} site`;
+            const directMode = String(sourceTarget?.mode || '').toLowerCase() === 'direct';
+            if (directMode) {
+                const directItems = sourceHost
+                    ? items.filter((item) => String(item?.sourceHost || '').toLowerCase().includes(sourceHost))
+                    : items;
+                const sourceItems = directItems.length ? directItems : items;
+                const brandName    = String(sourceTarget?.brandName          || dominantBrand || '').trim();
+                const brandTheme   = String(sourceTarget?.brandTheme         || 'neutral').trim();
+                const brandPrimary = String(sourceTarget?.brandColors?.primary || '#1d1d1b').trim();
+                const brandAccent  = String(sourceTarget?.brandColors?.accent  || '#00a651').trim();
+                const fitSignal    = String(info.query || this.state.session.lastIntent || '').trim();
+                // Semantic activity detection — drives the canvas environment
+                const titleCorpus = sourceItems.map(i => String(i.title || '')).join(' ');
+                const activityStr = (fitSignal + ' ' + titleCorpus).toLowerCase();
+                const activity =
+                    /\brunning\b|marathon|foreverrun|deviate\s*nitro|velocity\s*nitro|magnify|jog|pace|race\b/.test(activityStr) ? 'running'
+                    : /basketball|\bmb\.\d|hoop|\bnba\b|court\s+shoe/.test(activityStr) ? 'basketball'
+                    : /soccer|cleat|firm\s*ground|artificial\s*ground|futsal|leadcat/.test(activityStr) ? 'soccer'
+                    : /hiking|trail\s+shoe|mountain|terrain/.test(activityStr) ? 'trail'
+                    : /training|cross.?train|\bgym\b|workout|fitness/.test(activityStr) ? 'training'
+                    : /casual|lifestyle|suede\b|palermo|caven|future\s*rider|retro|streetwear|classic\s*sneaker/.test(activityStr) ? 'lifestyle'
+                    : 'sport';
+                const hero         = sourceItems[0] || {};
+                // Swap Cloudinary white bg (fafafa) for brand dark primary so hero looks like a stage
+                const heroBgHex    = brandPrimary.replace('#', '').toLowerCase();
+                const heroImage    = String(hero.imageUrl || '').trim()
+                                       .replace(/b_rgb:[0-9a-fA-F]{3,6}/, `b_rgb:${heroBgHex}`)
+                                       .replace(/,w_\d+/, ',w_900');
+                const heroTitle    = String(hero.title || `${brandName} picks`).trim();
+                const heroPrice    = hero.priceUsd ? formatCurrency(Number(hero.priceUsd)) : '';
+                const heroUrl      = String(hero.url || brandLink).trim();
+                const railItems    = sourceItems.slice(1).map((item) => {
+                    const imgSrc  = String(item.imageUrl || '').trim()
+                                      .replace(/b_rgb:[0-9a-fA-F]{3,6}/, `b_rgb:${heroBgHex}`);
+                    const ttl     = String(item.title    || 'item').trim();
+                    const prc     = item.priceUsd ? formatCurrency(Number(item.priceUsd)) : '';
+                    const itemUrl = String(item.url      || brandLink).trim();
+                    const host    = String(item.sourceHost || '').trim();
+                    return `
+                        <a class="shop-stage-tile" href="${escapeAttr(itemUrl)}" target="_blank" rel="noopener noreferrer">
+                            ${imgSrc ? `<img src="${escapeAttr(imgSrc)}" alt="${escapeAttr(ttl)}" loading="lazy" />` : '<div class="shop-stage-tile-img-fallback"></div>'}
+                            <div class="shop-stage-tile-text">
+                                <span class="shop-stage-tile-label">${escapeHtml(ttl)}</span>
+                                <span class="shop-stage-tile-price">${escapeHtml([prc, host].filter(Boolean).join(' | '))}</span>
+                            </div>
+                        </a>
+                    `;
+                }).join('');
+                return `
+                    <div class="scene scene-shopping scene-shopping-stage interactive theme-${escapeAttr(brandTheme)}">
+                        <canvas class="scene-canvas shopping-canvas"
+                                data-scene="shopping"
+                                data-brand-theme="${escapeAttr(brandTheme)}"
+                                data-brand-primary="${escapeAttr(brandPrimary)}"
+                                data-brand-accent="${escapeAttr(brandAccent)}"
+                                data-fit-signal="${escapeAttr(fitSignal)}"
+                                data-activity="${escapeAttr(activity)}"></canvas>
+                        <div class="shop-brand-bar">
+                            <div class="shop-brand-name">${escapeHtml(brandName)}</div>
+                            ${fitSignal ? `<div class="shop-fit-signal">${escapeHtml(fitSignal)}</div>` : ''}
+                            <a class="scene-chip scene-chip-link shop-brand-cta" href="${escapeAttr(brandLink)}" target="_blank" rel="noopener noreferrer">
+                                ${escapeHtml(brandLabel)}
+                            </a>
+                        </div>
+                        <div class="shop-source-strip">
+                            <span>source ${escapeHtml(String(sourceHost || sourceTarget?.host || 'direct'))}</span>
+                            <span>${escapeHtml(String(sourceItems.length))} products</span>
+                            <span>intent matched</span>
+                        </div>
+                        <div class="shop-stage-body">
+                            <a class="shop-stage-hero" href="${escapeAttr(heroUrl)}" target="_blank" rel="noopener noreferrer">
+                                ${heroImage ? `<img src="${escapeAttr(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="eager" />` : '<div class="shop-stage-hero-fallback"></div>'}
+                                <div class="shop-stage-hero-tint"></div>
+                                <div class="shop-stage-hero-meta">
+                                    <div class="shop-stage-hero-title">${escapeHtml(heroTitle)}</div>
+                                    ${heroPrice ? `<div class="shop-stage-hero-price">${escapeHtml(heroPrice)}</div>` : ''}
+                                </div>
+                            </a>
+                            <div class="shop-stage-rail">
+                                ${railItems}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            const cards = items.map((item, idx) => {
+                const title    = String(item.title    || 'Product');
+                const brand    = String(item.brand    || '');
+                const price    = Number(item.priceUsd || 0);
+                const imageUrl = String(item.imageUrl || '').trim();
+                const url      = String(item.url      || '').trim() || '#';
+                const host     = String(item.sourceHost || '').trim();
+                const sizeMod  = idx === 0 ? ' shop-card-featured' : (idx % 5 === 2 ? ' shop-card-tall' : '');
+                return `
+                    <a class="shop-card${sizeMod}" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">
+                        <div class="shop-image-wrap">
+                            ${imageUrl ? `<img class="shop-image" src="${escapeAttr(imageUrl)}" alt="${escapeAttr(title)}" loading="${idx < 3 ? 'eager' : 'lazy'}" />` : '<div class="shop-image-placeholder"></div>'}
+                        </div>
+                        <div class="shop-meta">
+                            <div class="shop-title">${escapeHtml(title)}</div>
+                            <div class="shop-sub">${escapeHtml(brand)}${price ? ` · ${escapeHtml(formatCurrency(price))}` : ''}${host ? ` · ${escapeHtml(host)}` : ''}</div>
+                        </div>
+                    </a>
+                `;
+            }).join('');
+            return `
+                <div class="scene scene-shopping interactive">
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-orb orb-b"></div>
+                    <div class="scene-grid"></div>
+                    <div class="scene-chip-row immersive-scene-head">
+                        <div class="scene-chip">visual catalog</div>
+                        <a class="scene-chip scene-chip-link" href="${escapeAttr(brandLink)}" target="_blank" rel="noopener noreferrer">
+                            ${escapeHtml(brandLabel)}
+                        </a>
+                    </div>
+                    <div class="shop-gallery shop-gallery-masonry">${cards}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'social') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items.slice(0, 8) : [];
+            const source = String(info.source || 'scaffold').trim();
+            const message = String(info.message || '').trim();
+            const delivery = String(info.delivery || '').trim();
+            const cards = items.map((item, idx) => {
+                const author = String(item?.author || `user ${idx + 1}`).trim();
+                const summary = String(item?.summary || item?.text || '').trim();
+                const age = String(item?.age || item?.time || '').trim();
+                const initial = author ? author[0].toUpperCase() : 'U';
+                return `<article class="social-card">
+                    <div class="social-card-head">
+                        <div class="social-avatar">${escapeHtml(initial)}</div>
+                        <div class="social-author">${escapeHtml(author)}</div>
+                        <div class="social-age">${escapeHtml(age || 'now')}</div>
+                    </div>
+                    <div class="social-summary">${escapeHtml(summary || 'No summary')}</div>
+                </article>`;
+            }).join('');
+            const composer = message
+                ? `<div class="social-composer"><span>message</span><strong>${escapeHtml(message.slice(0, 180))}</strong><em>${escapeHtml(delivery || 'queued')}</em></div>`
+                : '<div class="social-composer"><span>feed mode</span><strong>Live social context cards</strong><em>read only</em></div>';
+            return `
+                <div class="scene scene-social interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="social-head">
+                        <div class="social-title">social intent stream</div>
+                        <div class="social-source">${escapeHtml(source)}</div>
+                    </div>
+                    ${composer}
+                    <div class="social-feed-grid">
+                        ${cards || '<article class="social-card"><div class="social-summary">No social cards yet.</div></article>'}
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'banking') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items.slice(0, 10) : [];
+            const available = Number(info.available || 0);
+            const ledger = Number(info.ledger || 0);
+            const source = String(info.source || 'scaffold').trim();
+            const currency = String(info.currency || 'USD').trim();
+            const asOf = String(info.asOf || '').trim();
+            const txRows = items.map((item) => {
+                const date = String(item?.date || '-').trim();
+                const merchant = String(item?.merchant || item?.name || '-').trim();
+                const amount = Number(item?.amount || 0);
+                const direction = amount < 0 ? 'debit' : 'credit';
+                return `<div class="bank-row ${direction}">
+                    <div class="bank-row-merchant">${escapeHtml(merchant)}</div>
+                    <div class="bank-row-date">${escapeHtml(date)}</div>
+                    <div class="bank-row-amount">${escapeHtml(formatCurrency(amount))}</div>
+                </div>`;
+            }).join('');
+            return `
+                <div class="scene scene-banking interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-b"></div>
+                    <div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="bank-head">
+                        <div class="bank-balance">${escapeHtml(formatCurrency(available))}</div>
+                        <div class="bank-meta">${escapeHtml(currency)} | ledger ${escapeHtml(formatCurrency(ledger))}${asOf ? ` | ${escapeHtml(asOf)}` : ''}</div>
+                    </div>
+                    <div class="bank-source">source ${escapeHtml(source)}</div>
+                    <div class="bank-transactions">
+                        ${txRows || '<div class="bank-row"><div class="bank-row-merchant">No transactions loaded</div><div class="bank-row-date">-</div><div class="bank-row-amount">$0.00</div></div>'}
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'contacts') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items.slice(0, 16) : [];
+            const source = String(info.source || 'scaffold').trim();
+            const cards = items.map((item) => {
+                const name = String(item?.name || 'Unknown').trim();
+                const phone = String(item?.phone || '').trim();
+                const label = String(item?.label || '').trim();
+                return `<article class="contacts-card">
+                    <div class="contacts-name">${escapeHtml(name)}</div>
+                    <div class="contacts-meta">${escapeHtml([label, phone].filter(Boolean).join(' | '))}</div>
+                    ${phone ? `<button class="contacts-call-btn" data-phone="${escapeAttr(phone)}" type="button">prepare call</button>` : ''}
+                </article>`;
+            }).join('');
+            return `
+                <div class="scene scene-contacts interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-grid"></div>
+                    <div class="contacts-head">
+                        <div class="contacts-title">contacts stream</div>
+                        <div class="contacts-source">source ${escapeHtml(source)}</div>
+                    </div>
+                    <div class="contacts-grid">
+                        ${cards || '<article class="contacts-card"><div class="contacts-name">No contacts</div><div class="contacts-meta">Try: show contacts</div></article>'}
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'telephony') {
+            const info = core.info || {};
+            const target = String(info.target || '').trim();
+            const mode = String(info.mode || 'bridge_prepare').trim();
+            const contactName = String(info.contactName || '').trim();
+            const lines = Array.isArray(info.steps) ? info.steps : [];
+            const safeLines = lines.length ? lines.slice(0, 6) : [
+                'grant connector scope telephony.call.start',
+                'confirm call <target>',
+                'open mobile and claim handoff token',
+            ];
+            const items = safeLines.map((line) => `<li>${escapeHtml(String(line))}</li>`).join('');
+            return `
+                <div class="scene scene-telephony interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-b"></div>
+                    <div class="scene-grid"></div>
+                    <div class="telephony-head">
+                        <div class="telephony-title">${escapeHtml(target || 'telephony control')}</div>
+                        <div class="telephony-meta">${escapeHtml([mode, contactName].filter(Boolean).join(' | ') || 'handoff mode')}</div>
+                    </div>
+                    <div class="telephony-panel">
+                        <div class="telephony-label">next actions</div>
+                        <ol class="telephony-steps">${items}</ol>
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'weather') {
+            const info = core.info || {};
+            const condition = String(info.condition || '').toLowerCase();
+            const icon = condition.includes('rain')
+                ? 'rain'
+                : condition.includes('snow')
+                    ? 'snow'
+                    : condition.includes('sun') || condition.includes('clear')
+                        ? 'sun'
+                        : 'cloud';
+            const location = String(info.location || '').trim() || String(this.state.session.lastIntent || '').trim();
+            const heroImage = this.weatherHeroImageUrl(condition);
+            const forecastItems = this.buildWeatherForecastPoints(info).slice(0, 5);
+            const forecastStrip = forecastItems.map((p) => {
+                const precip = Number(p.precip || 0);
+                const wet = precip >= 45 ? 'wet' : precip >= 20 ? 'mixed' : 'dry';
+                return `
+                    <div class="weather-forecast-card ${wet}">
+                        <div class="wfc-time">${escapeHtml(String(p.hour || ''))}</div>
+                        <div class="wfc-temp">${escapeHtml(String(Math.round(Number(p.temp || 0))))}F</div>
+                        <div class="wfc-precip">${escapeHtml(String(precip))}% rain</div>
+                    </div>
+                `;
+            }).join('');
+            const temperature = Number(String(info.temperature || '').replace(/[^0-9.-]/g, '')) || 60;
+            const weatherTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
+            const weatherTargetUrl = String(weatherTarget?.url || '').trim();
+            const weatherTargetLabel = String(weatherTarget?.label || 'open weather source').trim();
+            return `
+                <div class="scene scene-weather ${escapeAttr(core.theme || '')}">
+                    <img class="weather-hero-image" src="${escapeAttr(heroImage)}" alt="Weather visual" loading="lazy" />
+                    <div class="weather-hero-tint"></div>
+                    <canvas
+                        class="scene-canvas weather-canvas"
+                        data-scene="weather"
+                        data-condition="${escapeAttr(condition)}"
+                        data-temp="${escapeAttr(String(temperature))}"
+                    ></canvas>
+                    <div class="weather-radar" aria-hidden="true">
+                        <div class="radar-ring ring-1"></div>
+                        <div class="radar-ring ring-2"></div>
+                        <div class="radar-ring ring-3"></div>
+                        <div class="radar-sweep"></div>
+                    </div>
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-orb orb-b"></div>
+                    <div class="scene-grid"></div>
+                    <div class="weather-glyph glyph-${escapeAttr(icon)}"></div>
+                    <div class="scene-chip-row">
+                        <div class="scene-chip">live intent render</div>
+                        <div class="scene-chip">${escapeHtml(location)}</div>
+                        ${weatherTargetUrl ? `<a class="scene-chip scene-chip-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                    </div>
+                    <div class="weather-forecast-strip">${forecastStrip}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'location') {
+            const location = String((core.info || {}).location || core.headline || '').trim();
+            return `
+                <div class="scene scene-location">
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="scene-pin"></div>
+                    <div class="scene-chip-row">
+                        <div class="scene-chip">location context</div>
+                        <div class="scene-chip">${escapeHtml(location)}</div>
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'tasks') {
+            const tasks = (this.state.memory?.tasks || []).slice(0, 6);
+            const openCount = tasks.filter((t) => !t.done).length;
+            const doneCount = tasks.filter((t) => t.done).length;
+            const progress = tasks.length ? Math.round((doneCount / Math.max(1, tasks.length)) * 100) : 0;
+            const topOpen = tasks.filter((t) => !t.done).slice(0, 5);
+            const topDone = tasks.filter((t) => t.done).slice(0, 3);
+            const relationItems = (() => {
+                const snapshot = this.state.session.graphSnapshot || {};
+                const relations = Array.isArray(snapshot.relations) ? snapshot.relations : [];
+                return relations
+                    .filter((r) => String(r?.relation || r?.kind || '').toLowerCase() === 'depends_on')
+                    .slice(-5)
+                    .map((r) => `${String(r?.sourceId || '').slice(0, 8)} -> ${String(r?.targetId || '').slice(0, 8)}`);
+            })();
+            const openHtml = (topOpen.length ? topOpen : [{ title: 'No open tasks' }]).map((item, idx) => `
+                <div class="tasks-row">
+                    <span class="tasks-row-index">${escapeHtml(String(idx + 1))}</span>
+                    <span class="tasks-row-title">${escapeHtml(String(item.title || 'Task'))}</span>
+                </div>
+            `).join('');
+            const doneHtml = (topDone.length ? topDone : [{ title: 'No completed tasks' }]).map((item) => `
+                <div class="tasks-done-pill">${escapeHtml(String(item.title || 'Task'))}</div>
+            `).join('');
+            const relHtml = (relationItems.length ? relationItems : ['No dependencies yet']).map((line) => `
+                <div class="tasks-rel-row">${escapeHtml(line)}</div>
+            `).join('');
+            return `<div class="scene scene-domain scene-tasks interactive">
+                <canvas class="scene-canvas domain-canvas" data-scene="tasks" data-open="${escapeAttr(String(openCount))}" data-done="${escapeAttr(String(doneCount))}"></canvas>
+                <div class="tasks-shell">
+                    <div class="tasks-kpi">
+                        <div class="tasks-kpi-label">completion</div>
+                        <div class="tasks-kpi-value">${escapeHtml(String(progress))}%</div>
+                        <div class="tasks-kpi-sub">${escapeHtml(String(doneCount))} done / ${escapeHtml(String(openCount))} open</div>
+                    </div>
+                    <div class="tasks-open-list">${openHtml}</div>
+                    <div class="tasks-done-list">${doneHtml}</div>
+                    <div class="tasks-rel-list">${relHtml}</div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'files') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items.slice(0, 28) : [];
+            const op = String(info.op || '').trim();
+            const path = String(info.path || '').trim();
+            const excerpt = String(info.excerpt || '').trim();
+            const lineCount = Number(info.lineCount || 0);
+            const treeHtml = items.map((item) => {
+                const name = String(item?.name || item || '').trim();
+                const type = String(item?.type || (name.endsWith('/') ? 'dir' : 'file')).trim();
+                return `<div class="files-node ${escapeAttr(type)}">${escapeHtml(name || '(item)')}</div>`;
+            }).join('');
+            return `<div class="scene scene-files interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="scene-grid"></div>
+                <div class="files-head">
+                    <div class="files-title">${escapeHtml(path || 'workspace')}</div>
+                    <div class="files-meta">${escapeHtml(op || 'files')} | ${escapeHtml(String(items.length || lineCount))}</div>
+                </div>
+                <div class="files-body">
+                    <div class="files-tree">${treeHtml || '<div class="files-node">No entries</div>'}</div>
+                    <pre class="files-preview">${escapeHtml(excerpt || 'No file preview loaded.')}</pre>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'expenses') {
+            const expenses = (this.state.memory?.expenses || []).slice(0, 6);
+            const total = expenses.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+            const bars = expenses.map((e) => {
+                const amount = Number(e.amount || 0);
+                const pct = Math.max(8, Math.min(100, (amount / Math.max(1, total)) * 100));
+                return `<div class="expense-row"><div class="expense-label">${escapeHtml(String(e.category || 'misc'))}</div><div class="expense-bar"><span style="width:${pct}%"></span></div><div class="expense-amt">${escapeHtml(formatCurrency(amount))}</div></div>`;
+            }).join('');
+            return `<div class="scene scene-domain scene-expenses">
+                <canvas class="scene-canvas domain-canvas" data-scene="expenses" data-total="${escapeAttr(String(total.toFixed(2)))}" data-items="${escapeAttr(String(expenses.length))}"></canvas>
+                <div class="expense-panel">${bars || '<div class="expense-row"><div class="expense-label">no spend</div><div class="expense-bar"><span style="width:12%"></span></div><div class="expense-amt">$0.00</div></div>'}</div>
+            </div>`;
+        }
+        if (core.kind === 'notes') {
+            const notes = (this.state.memory?.notes || []).slice(0, 6);
+            const tiles = notes.map((n) => `<div class="note-tile">${escapeHtml(String(n.text || '').slice(0, 90) || 'note')}</div>`).join('');
+            return `<div class="scene scene-domain scene-notes">
+                <canvas class="scene-canvas domain-canvas" data-scene="notes" data-count="${escapeAttr(String(notes.length))}"></canvas>
+                <div class="notes-masonry">${tiles || '<div class="note-tile">No notes yet.</div>'}</div>
+            </div>`;
+        }
+        if (core.kind === 'graph') {
+            const snapshot = this.state.session.graphSnapshot || {};
+            const entitiesRaw = Array.isArray(snapshot.entities) ? snapshot.entities : [];
+            const relationsRaw = Array.isArray(snapshot.relations) ? snapshot.relations : [];
+            const nodes = entitiesRaw
+                .slice(-30)
+                .map((entity, idx) => ({
+                    id: String(entity?.id || `node-${idx}`),
+                    kind: String(entity?.kind || 'entity'),
+                    label: this.graphNodeLabel(entity, idx),
+                }));
+            const nodeById = new Map(nodes.map((n) => [n.id, n]));
+            const links = relationsRaw
+                .slice(-70)
+                .map((rel) => ({
+                    sourceId: String(rel?.sourceId || ''),
+                    targetId: String(rel?.targetId || ''),
+                    relation: String(rel?.relation || 'link'),
+                }))
+                .filter((rel) => rel.sourceId && rel.targetId && nodeById.has(rel.sourceId) && nodeById.has(rel.targetId));
+            const nodeCount = nodes.length;
+            const centerX = 400;
+            const centerY = 180;
+            const radiusX = 282;
+            const radiusY = 124;
+            const pos = {};
+            nodes.forEach((node, idx) => {
+                const theta = (Math.PI * 2 * idx) / Math.max(1, nodeCount);
+                const jitter = ((this.hashText(node.id) % 13) - 6) * 1.2;
+                pos[node.id] = {
+                    x: Math.round(centerX + Math.cos(theta) * (radiusX + jitter)),
+                    y: Math.round(centerY + Math.sin(theta) * (radiusY + jitter * 0.5)),
+                };
+            });
+            const linkSvg = links.map((link) => {
+                const a = pos[link.sourceId];
+                const b = pos[link.targetId];
+                if (!a || !b) return '';
+                return `<line class="graph-link" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"></line>`;
+            }).join('');
+            const nodeSvg = nodes.map((node) => {
+                const p = pos[node.id];
+                const r = node.kind === 'task' ? 13 : node.kind === 'note' ? 10 : 11;
+                const cls = `graph-node graph-node-${escapeAttr(node.kind.toLowerCase())}`;
+                return `<g class="${cls}">
+                    <circle cx="${p.x}" cy="${p.y}" r="${r}"></circle>
+                    <text x="${p.x}" y="${p.y + r + 12}" text-anchor="middle">${escapeHtml(node.label)}</text>
+                </g>`;
+            }).join('');
+            const summary = snapshot.counts || {};
+            const hasGraph = nodeCount > 0;
+            return `
+                <div class="scene scene-domain scene-graph">
+                    <canvas class="scene-canvas graph-canvas" data-scene="graph"></canvas>
+                    <div class="graph-summary-strip">
+                        <div class="graph-summary-chip">entities ${escapeHtml(String(summary.entities || nodeCount || 0))}</div>
+                        <div class="graph-summary-chip">relations ${escapeHtml(String(summary.relations || links.length || 0))}</div>
+                        <div class="graph-summary-chip">events ${escapeHtml(String(summary.events || 0))}</div>
+                    </div>
+                    ${hasGraph ? `<svg class="graph-svg graph-live" viewBox="0 0 800 360" preserveAspectRatio="none" aria-label="Graph relations">${linkSvg}${nodeSvg}</svg>` : '<div class="graph-empty">No graph entities yet. Try: add task ship onboarding</div>'}
+                </div>
+            `;
+        }
+        if (core.kind === 'mcp') {
+            const info = core.info || {};
+            const serverName = String(info.serverName || 'Connected App').trim();
+            const toolName   = String(info.toolName || '').trim();
+            const textItems  = Array.isArray(info.textItems) ? info.textItems : [];
+            const imageItems = Array.isArray(info.imageItems) ? info.imageItems : [];
+            const matchPct   = Math.round((Number(info.matchScore || 0)) * 100);
+
+            const textHtml = textItems.length
+                ? textItems.map(t => `<p class="mcp-text-block">${escapeHtml(t)}</p>`).join('')
+                : '<p class="mcp-text-block mcp-empty">No text response from tool.</p>';
+
+            const imgHtml = imageItems.map(img =>
+                `<img class="mcp-image" src="${escapeAttr(String(img.url || ''))}" alt="MCP image" loading="lazy" />`
+            ).join('');
+
+            return `
+                <div class="scene scene-mcp">
+                    <canvas class="scene-canvas mcp-canvas" data-scene="mcp"></canvas>
+                    <div class="mcp-scene-body">
+                        <div class="mcp-header">
+                            <span class="mcp-server-chip">${escapeHtml(serverName)}</span>
+                            ${toolName ? `<span class="mcp-tool-chip">${escapeHtml(toolName)}</span>` : ''}
+                            ${matchPct ? `<span class="mcp-match-chip">${matchPct}% match</span>` : ''}
+                        </div>
+                        <div class="mcp-content">
+                            ${imgHtml}
+                            ${textHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        if (core.kind === 'webdeck') {
+            const info = core.info || {};
+            const op = String(info.op || 'fetch_url');
+            const isSearch = op === 'web_search';
+            const isMobile = typeof window !== 'undefined' && window.innerWidth <= 600;
+            const url = String(info.url || '').trim();
+            const title = String(info.title || (isSearch ? `Search: ${String(info.query || '').trim()}` : url)).trim();
+            const excerpt = String(info.excerpt || '').trim();
+            const favicon = String(info.favicon || '').trim();
+            const thumbnail = String(info.thumbnail || '').trim();
+            const source = String(info.source || 'scaffold').trim();
+            const items = Array.isArray(info.items) ? info.items.slice(0, 8) : [];
+            const siteTarget = (info.siteTarget && typeof info.siteTarget === 'object') ? info.siteTarget : null;
+
+            const safeHostname = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return String(u || '').slice(0, 40); } };
+            const displayUrl = url ? safeHostname(url) : (isSearch ? 'web search' : '');
+            const barText = isSearch ? `Search: ${String(info.query || '')}` : (title.slice(0, 80) || displayUrl);
+            const faviconHtml = favicon
+                ? `<img class="webdeck-favicon" src="${escapeAttr(favicon)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+                : '<div class="webdeck-favicon-fallback"></div>';
+            const resultsHtml = isSearch
+                ? items.map((item) => {
+                    const itemTitle = String(item.title || '').trim().slice(0, 90);
+                    const itemUrl = String(item.url || '').trim();
+                    const itemSnippet = String(item.snippet || '').trim().slice(0, 160);
+                    const itemHost = String(item.host || '').trim() || (itemUrl ? safeHostname(itemUrl) : '');
+                    const itemThumb = String(item.thumbnail || '').trim();
+                    const itemFav = String(item.favicon || '').trim();
+                    return `<a class="webdeck-result-card" href="${escapeAttr(itemUrl)}" target="_blank" rel="noopener noreferrer">
+                        <div class="webdeck-result-media">
+                            ${itemThumb ? `<img class="webdeck-result-thumb" src="${escapeAttr(itemThumb)}" alt="${escapeAttr(itemTitle)}" loading="lazy" onerror="this.style.display='none'">` : `<div class="webdeck-result-thumb-fallback">${itemFav ? `<img class="webdeck-result-favicon" src="${escapeAttr(itemFav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}</div>`}
+                        </div>
+                        <div class="webdeck-result-title">${escapeHtml(itemTitle)}</div>
+                        <div class="webdeck-result-host">${escapeHtml(itemHost)}</div>
+                        ${itemSnippet ? `<div class="webdeck-result-snippet">${escapeHtml(itemSnippet)}</div>` : ''}
+                    </a>`;
+                }).join('')
+                : (excerpt
+                    ? `<div class="webdeck-page-preview">
+                        ${thumbnail ? `<img class="webdeck-page-hero" src="${escapeAttr(thumbnail)}" alt="${escapeAttr(title || 'Page preview')}" loading="lazy" onerror="this.style.display='none'">` : ''}
+                        <div class="webdeck-page-text">${escapeHtml(excerpt.slice(0, 400))}</div>
+                    </div>`
+                    : '');
+            const directBtn = siteTarget
+                ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(String(siteTarget.url || ''))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(siteTarget.label || 'Open source'))}</a>`
+                : (url ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open page</a>` : '');
+            const mobileClass = isMobile ? ' webdeck-mobile' : '';
+            const sourceUrl = String(siteTarget?.url || url || '').trim();
+            const sourceHost = String(siteTarget?.host || '').trim() || (sourceUrl ? safeHostname(sourceUrl) : '');
+            const hostCounts = (() => {
+                const counts = new Map();
+                for (const item of items) {
+                    const host = String(item?.host || '').trim() || (String(item?.url || '').trim() ? safeHostname(String(item.url)) : '');
+                    if (!host) continue;
+                    counts.set(host, (counts.get(host) || 0) + 1);
+                }
+                return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 4);
+            })();
+            const hostListHtml = hostCounts.length
+                ? hostCounts.map(([host, count]) => `<div class="webdeck-host-row"><span>${escapeHtml(String(host))}</span><span>${escapeHtml(String(count))}</span></div>`).join('')
+                : '<div class="webdeck-host-empty">No host breakdown</div>';
+            return `<div class="scene scene-webdeck interactive">
+                <canvas class="scene-canvas webdeck-canvas" data-scene="webdeck"></canvas>
+                <div class="webdeck${mobileClass}">
+                    <div class="webdeck-chrome">
+                        <div class="webdeck-nav-dots"><span></span><span></span><span></span></div>
+                        ${faviconHtml}
+                        <div class="webdeck-bar">${escapeHtml(barText)}</div>
+                        <div class="webdeck-source-chip">${escapeHtml(source)}</div>
+                        ${directBtn}
+                    </div>
+                    <div class="webdeck-body">
+                        <div class="webdeck-results">
+                            ${resultsHtml || '<div class="webdeck-empty">No content preview.</div>'}
+                        </div>
+                        <aside class="webdeck-inspector">
+                            <div class="webdeck-inspector-card">
+                                <div class="webdeck-inspector-label">Route</div>
+                                <div class="webdeck-inspector-value">${escapeHtml(String(siteTarget?.mode || (isSearch ? 'search' : 'page')))}</div>
+                            </div>
+                            <div class="webdeck-inspector-card">
+                                <div class="webdeck-inspector-label">Source</div>
+                                <div class="webdeck-inspector-value">${escapeHtml(sourceHost || source || 'unknown')}</div>
+                                ${sourceUrl ? `<a class="webdeck-inspector-link" href="${escapeAttr(sourceUrl)}" target="_blank" rel="noopener noreferrer">open source</a>` : ''}
+                            </div>
+                            <div class="webdeck-inspector-card">
+                                <div class="webdeck-inspector-label">Hosts</div>
+                                <div class="webdeck-host-list">${hostListHtml}</div>
+                            </div>
+                        </aside>
+                    </div>
+                </div>
+            </div>`;
+        }
+        const intent = this.humanizeIntentLabel((envelope?.raw || this.state.session.lastIntent || '').trim());
+        return `
+            <div class="scene scene-generic">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="scene-orb orb-a"></div>
+                <div class="scene-orb orb-b"></div>
+                <div class="scene-grid"></div>
+                <div class="scene-chip-row">
+                    <div class="scene-chip">intent canvas</div>
+                    <div class="scene-chip">${escapeHtml(intent.slice(0, 40))}</div>
+                </div>
+            </div>
+        `;
+    },
+
+    buildExperienceLayer(core, envelope, execution) {
+        const latest = this.latestToolResult(execution) || {};
+        const cards = this.buildExperienceCards(core, envelope, latest);
+        const tone = String(core.kind || 'generic');
+        const cardHtml = cards.map((card) => `
+            <div class="exp-card ${escapeAttr(String(card.tone || 'neutral'))}">
+                <div class="exp-label">${escapeHtml(String(card.label || 'signal'))}</div>
+                <div class="exp-value">${escapeHtml(String(card.value || '-'))}</div>
+            </div>
+        `).join('');
+        return `
+            <div class="experience-layer ${escapeAttr(tone)}">
+                <div class="experience-title">${escapeHtml(this.buildExperienceTitle(core, envelope, latest))}</div>
+                <div class="experience-grid">${cardHtml}</div>
+            </div>
+        `;
+    },
+
+    buildExperienceTitle(core, envelope, latest) {
+        if (core.kind === 'weather') return 'Atmosphere + Forecast';
+        if (core.kind === 'shopping') return 'Visual Catalog + Fit Signal';
+        if (core.kind === 'webdeck') return 'Web Surface + Source Route';
+        if (core.kind === 'social') return 'Signal + Social Stream';
+        if (core.kind === 'banking') return 'Balance + Transaction Flow';
+        if (core.kind === 'contacts') return 'Contact Graph + Reachability';
+        if (core.kind === 'telephony') return 'Call Handoff + Device Bridge';
+        if (core.kind === 'files') return 'Workspace Tree + Live Preview';
+        if (core.kind === 'tasks') return 'Flow + Completion State';
+        if (core.kind === 'expenses') return 'Spend Dynamics + Distribution';
+        if (core.kind === 'notes') return 'Knowledge Fragments + Context';
+        if (core.kind === 'graph') return 'Relationship Topology + Guidance';
+        const intent = String(envelope?.surfaceIntent?.raw || '').trim();
+        return intent ? `Intent Lens: ${intent.slice(0, 48)}` : (latest.message || 'Intent + State');
+    },
+
+    buildExperienceCards(core, envelope, latest) {
+        const memory = this.state.memory || { tasks: [], expenses: [], notes: [] };
+        if (core.kind === 'weather') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const forecast = Array.isArray(data.forecast) ? data.forecast : [];
+            const precipMax = forecast.length ? Math.max(...forecast.map((x) => Number(x.precipChance || 0))) : 0;
+            const windMax = forecast.length ? Math.max(...forecast.map((x) => Number(x.windMph || 0))) : Number(data.windMph || 0);
+            return [
+                { label: 'Condition', value: String(data.condition || core.headline || 'unknown'), tone: 'cool' },
+                { label: 'Temperature', value: `${Math.round(Number(data.temperatureF || 0))}F`, tone: 'warm' },
+                { label: 'Precip Peak', value: `${Math.round(precipMax)}%`, tone: 'rain' },
+                { label: 'Wind Max', value: `${Math.round(windMax)} mph`, tone: 'wind' },
+            ];
+        }
+        if (core.kind === 'shopping') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const avg = items.length
+                ? items.reduce((sum, item) => sum + Number(item.priceUsd || 0), 0) / items.length
+                : 0;
+            const topBrand = items.length ? String(items[0].brand || 'mixed') : 'mixed';
+            return [
+                { label: 'Results', value: String(items.length), tone: 'accent' },
+                { label: 'Category', value: String(data.category || 'products'), tone: 'neutral' },
+                { label: 'Avg Price', value: formatCurrency(avg), tone: 'warm' },
+                { label: 'Top Brand', value: topBrand, tone: 'cool' },
+            ];
+        }
+        if (core.kind === 'webdeck') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const source = String(data.source || 'scaffold');
+            const query = String(data.query || '').trim();
+            const hasUrl = Boolean(String(data.url || '').trim());
+            const items = Array.isArray(data.items) ? data.items : [];
+            const host = (() => {
+                const raw = String(data.url || '');
+                if (!raw) return query ? 'search' : '-';
+                try {
+                    return new URL(raw).hostname.replace(/^www\./, '');
+                } catch {
+                    return raw.slice(0, 24);
+                }
+            })();
+            return [
+                { label: 'Source', value: source, tone: 'accent' },
+                { label: 'Mode', value: hasUrl ? 'page' : 'search', tone: 'neutral' },
+                { label: 'Target', value: host, tone: 'cool' },
+                { label: 'Results', value: String(items.length || (hasUrl ? 1 : 0)), tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'social') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            return [
+                { label: 'Source', value: String(data.source || 'scaffold'), tone: 'accent' },
+                { label: 'Mode', value: latest.op === 'social_message_send' ? 'send' : 'feed', tone: 'neutral' },
+                { label: 'Items', value: String(items.length), tone: 'cool' },
+                { label: 'Delivery', value: String(data.delivery || (latest.op === 'social_message_send' ? 'queued' : 'n/a')), tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'banking') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const available = Number(data.available || 0);
+            const ledger = Number(data.ledger || 0);
+            return [
+                { label: 'Available', value: formatCurrency(available), tone: 'accent' },
+                { label: 'Ledger', value: formatCurrency(ledger || available), tone: 'cool' },
+                { label: 'Source', value: String(data.source || 'scaffold'), tone: 'neutral' },
+                { label: 'Rows', value: String(items.length || (latest.op === 'banking_balance_read' ? 1 : 0)), tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'contacts') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            return [
+                { label: 'Source', value: String(data.source || 'scaffold'), tone: 'accent' },
+                { label: 'Contacts', value: String(items.length), tone: 'cool' },
+                { label: 'Query', value: String(data.query || 'all'), tone: 'neutral' },
+                { label: 'Mode', value: 'lookup', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'telephony') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            return [
+                { label: 'Mode', value: String(data.mode || 'status'), tone: 'accent' },
+                { label: 'Target', value: String(data.target || '-'), tone: 'cool' },
+                { label: 'Contact', value: String(data.contactName || '-'), tone: 'neutral' },
+                { label: 'Bridge', value: 'mobile handoff', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'files') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            return [
+                { label: 'Path', value: String(data.path || '.'), tone: 'accent' },
+                { label: 'Entries', value: String(items.length), tone: 'cool' },
+                { label: 'Lines', value: String(Number(data.lineCount || 0)), tone: 'neutral' },
+                { label: 'Mode', value: latest.op === 'read_file' ? 'file' : 'list', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'tasks') {
+            const tasks = Array.isArray(memory.tasks) ? memory.tasks : [];
+            const open = tasks.filter((x) => !x.done).length;
+            const done = tasks.filter((x) => x.done).length;
+            return [
+                { label: 'Open', value: String(open), tone: 'accent' },
+                { label: 'Done', value: String(done), tone: 'cool' },
+                { label: 'Total', value: String(tasks.length), tone: 'neutral' },
+                { label: 'Focus', value: open > 0 ? 'execution' : 'planning', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'expenses') {
+            const expenses = Array.isArray(memory.expenses) ? memory.expenses : [];
+            const total = expenses.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+            const categories = new Set(expenses.map((item) => String(item.category || 'misc'))).size;
+            const avg = expenses.length ? total / expenses.length : 0;
+            return [
+                { label: 'Total', value: formatCurrency(total), tone: 'warm' },
+                { label: 'Entries', value: String(expenses.length), tone: 'neutral' },
+                { label: 'Categories', value: String(categories), tone: 'accent' },
+                { label: 'Average', value: formatCurrency(avg), tone: 'cool' },
+            ];
+        }
+        if (core.kind === 'notes') {
+            const notes = Array.isArray(memory.notes) ? memory.notes : [];
+            const latestText = notes.length ? String(notes[notes.length - 1].text || '') : '';
+            return [
+                { label: 'Notes', value: String(notes.length), tone: 'accent' },
+                { label: 'Latest', value: latestText.slice(0, 16) || 'none', tone: 'neutral' },
+                { label: 'Mode', value: 'synthesis', tone: 'cool' },
+                { label: 'Context', value: 'active', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'graph') {
+            return [
+                { label: 'Topology', value: 'connected', tone: 'accent' },
+                { label: 'Drift', value: 'stable', tone: 'cool' },
+                { label: 'Edges', value: 'live', tone: 'neutral' },
+                { label: 'State', value: 'mapped', tone: 'warm' },
+            ];
+        }
+        return [
+            { label: 'Intent', value: String(envelope?.taskIntent?.operation || 'read'), tone: 'accent' },
+            { label: 'Session', value: String(this.state.session.sessionId || '-').slice(0, 8), tone: 'neutral' },
+            { label: 'Sync', value: String(this.state.session.syncTransport || 'idle'), tone: 'cool' },
+            { label: 'Status', value: latest.ok === false ? 'needs input' : 'ready', tone: 'warm' },
+        ];
+    },
+
+    teardownSceneGraphics() {
+        if (this._sceneAnimFrame) {
+            cancelAnimationFrame(this._sceneAnimFrame);
+            this._sceneAnimFrame = null;
+        }
+        this._sceneRenderer = null;
+    },
+
+    activateSceneGraphics() {
+        const canvas = this.container.querySelector('.scene-canvas');
+        if (!canvas) return;
+        const scene = String(canvas.dataset.scene || '').trim();
+        if (scene === 'weather') {
+            this._sceneRenderer = this.makeWeatherRenderer(canvas);
+        } else if (scene === 'shopping') {
+            this._sceneRenderer = this.makeShoppingRenderer(canvas);
+        } else if (scene === 'tasks') {
+            this._sceneRenderer = this.makeTasksRenderer(canvas);
+        } else if (scene === 'expenses') {
+            this._sceneRenderer = this.makeExpensesRenderer(canvas);
+        } else if (scene === 'notes') {
+            this._sceneRenderer = this.makeNotesRenderer(canvas);
+        } else if (scene === 'graph') {
+            this._sceneRenderer = this.makeGraphRenderer(canvas);
+        } else if (scene === 'webdeck') {
+            this._sceneRenderer = this.makeWebdeckRenderer(canvas);
+        } else if (scene === 'mcp') {
+            this._sceneRenderer = this.makeMcpRenderer(canvas);
+        } else {
+            this._sceneRenderer = this.makeGenericRenderer(canvas);
+        }
+        const loop = () => {
+            if (typeof this._sceneRenderer === 'function') {
+                this._sceneRenderer();
+                this._sceneAnimFrame = requestAnimationFrame(loop);
+            }
+        };
+        loop();
+    },
+
+    fitCanvas(canvas) {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        const rect = canvas.getBoundingClientRect();
+        const w = Math.max(1, Math.round(rect.width));
+        const h = Math.max(1, Math.round(rect.height));
+        const rw = Math.round(w * dpr);
+        const rh = Math.round(h * dpr);
+        if (canvas.width !== rw || canvas.height !== rh) {
+            canvas.width = rw;
+            canvas.height = rh;
+        }
+        return { dpr, w, h };
+    },
+
+    makeGenericRenderer(canvas) {
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            const grad = ctx.createLinearGradient(0, 0, 0, h);
+            grad.addColorStop(0, 'rgba(24, 118, 100, 0.12)');
+            grad.addColorStop(1, 'rgba(44, 91, 170, 0.04)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, w, h);
+            ctx.strokeStyle = 'rgba(13, 26, 42, 0.1)';
+            ctx.lineWidth = 1;
+            for (let x = 0; x <= w; x += 32) {
+                const yOffset = Math.sin(t + x * 0.01) * 3;
+                ctx.beginPath();
+                ctx.moveTo(x, 0 + yOffset);
+                ctx.lineTo(x, h + yOffset);
+                ctx.stroke();
+            }
+        };
+    },
+
+    makeMcpRenderer(canvas) {
+        // Ambient canvas for MCP surfaces — deep teal/indigo field with
+        // floating connection nodes and pulse rings suggesting network/API integration.
+        let t = 0;
+        const nodes = Array.from({ length: 18 }, (_, i) => ({
+            x: (i * 0.618033) % 1,
+            y: (i * 0.381966) % 1,
+            r: 2 + (i % 4),
+            phase: i * 0.42,
+            speed: 0.003 + (i % 5) * 0.0008,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.012;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // Deep background
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#060d1a');
+            bg.addColorStop(0.5, '#0a1628');
+            bg.addColorStop(1, '#04111f');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Pulse rings from center-left (suggesting an origin point)
+            const ox = w * 0.18, oy = h * 0.5;
+            for (let ring = 0; ring < 4; ring++) {
+                const prog = ((t * 0.4 + ring * 0.25) % 1);
+                const radius = prog * Math.min(w, h) * 0.55;
+                const alpha = (1 - prog) * 0.18;
+                ctx.beginPath();
+                ctx.arc(ox, oy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(56, 189, 248, ${alpha})`;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+            // Connection lines between nodes
+            ctx.lineWidth = 0.6;
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    const nx = nodes[i].x * w, ny = nodes[i].y * h;
+                    const mx = nodes[j].x * w, my = nodes[j].y * h;
+                    const dist = Math.hypot(nx - mx, ny - my);
+                    if (dist < w * 0.22) {
+                        const alpha = (1 - dist / (w * 0.22)) * 0.12;
+                        ctx.strokeStyle = `rgba(99, 179, 237, ${alpha})`;
+                        ctx.beginPath();
+                        ctx.moveTo(nx, ny);
+                        ctx.lineTo(mx, my);
+                        ctx.stroke();
+                    }
+                }
+            }
+            // Nodes with subtle pulse
+            nodes.forEach((n, i) => {
+                const nx = n.x * w, ny = n.y * h;
+                const pulse = 0.7 + 0.3 * Math.sin(t * n.speed * 100 + n.phase);
+                const grd = ctx.createRadialGradient(nx, ny, 0, nx, ny, n.r * 3 * pulse);
+                grd.addColorStop(0, 'rgba(56, 189, 248, 0.55)');
+                grd.addColorStop(1, 'rgba(56, 189, 248, 0)');
+                ctx.fillStyle = grd;
+                ctx.beginPath();
+                ctx.arc(nx, ny, n.r * 3 * pulse, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = i % 3 === 0 ? 'rgba(186, 230, 253, 0.9)' : 'rgba(56, 189, 248, 0.7)';
+                ctx.beginPath();
+                ctx.arc(nx, ny, n.r * pulse, 0, Math.PI * 2);
+                ctx.fill();
+            });
+            // Subtle scan line
+            const scanY = (t * 0.12 % 1) * h;
+            const scanGrad = ctx.createLinearGradient(0, scanY - 2, 0, scanY + 2);
+            scanGrad.addColorStop(0, 'rgba(56, 189, 248, 0)');
+            scanGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.06)');
+            scanGrad.addColorStop(1, 'rgba(56, 189, 248, 0)');
+            ctx.fillStyle = scanGrad;
+            ctx.fillRect(0, scanY - 2, w, 4);
+        };
+    },
+
+    makeWeatherRenderer(canvas) {
+        const condition = String(canvas.dataset.condition || '').toLowerCase();
+        const temp = Number(canvas.dataset.temp || 60);
+        const isRain = condition.includes('rain') || condition.includes('storm');
+        const isSnow = condition.includes('snow');
+        const isSun = condition.includes('sun') || condition.includes('clear');
+        const droplets = Array.from({ length: 90 }, (_, i) => ({
+            x: (i * 37) % 997 / 997,
+            y: (i * 83) % 991 / 991,
+            v: 0.5 + ((i * 17) % 100) / 100
+        }));
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.016;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+
+            const sky = ctx.createLinearGradient(0, 0, 0, h);
+            if (isRain) {
+                sky.addColorStop(0, 'rgba(79, 113, 156, 0.32)');
+                sky.addColorStop(1, 'rgba(50, 70, 98, 0.08)');
+            } else if (isSnow) {
+                sky.addColorStop(0, 'rgba(180, 204, 231, 0.28)');
+                sky.addColorStop(1, 'rgba(129, 162, 196, 0.08)');
+            } else if (isSun) {
+                sky.addColorStop(0, 'rgba(255, 192, 95, 0.32)');
+                sky.addColorStop(1, 'rgba(255, 152, 86, 0.08)');
+            } else {
+                sky.addColorStop(0, 'rgba(138, 155, 170, 0.24)');
+                sky.addColorStop(1, 'rgba(90, 109, 126, 0.08)');
+            }
+            ctx.fillStyle = sky;
+            ctx.fillRect(0, 0, w, h);
+
+            const sunX = w * 0.78;
+            const sunY = h * 0.22;
+            const sunR = Math.max(24, Math.min(44, (w + h) * 0.03));
+            if (isSun || !isRain) {
+                const halo = ctx.createRadialGradient(sunX, sunY, 8, sunX, sunY, sunR * 2.4);
+                halo.addColorStop(0, 'rgba(255, 232, 170, 0.62)');
+                halo.addColorStop(1, 'rgba(255, 232, 170, 0)');
+                ctx.fillStyle = halo;
+                ctx.beginPath();
+                ctx.arc(sunX, sunY, sunR * 2.4, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.strokeStyle = 'rgba(16, 29, 48, 0.08)';
+            ctx.lineWidth = 1;
+            const horizon = h * 0.63;
+            for (let i = 0; i < 4; i += 1) {
+                ctx.beginPath();
+                for (let x = 0; x <= w; x += 8) {
+                    const y = horizon + i * 12 + Math.sin((x * 0.02) + (t * (0.8 + i * 0.1))) * (4 + i);
+                    if (x === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            }
+
+            if (isRain || isSnow) {
+                ctx.strokeStyle = isSnow ? 'rgba(232, 244, 255, 0.46)' : 'rgba(178, 214, 255, 0.46)';
+                ctx.lineWidth = isSnow ? 1.2 : 1;
+                droplets.forEach((d) => {
+                    d.y += (isSnow ? 0.0014 : 0.0034) * d.v;
+                    if (d.y > 1.04) d.y = -0.06;
+                    const x = d.x * w + (isSnow ? Math.sin(t * 2 + d.x * 9) * 5 : -10);
+                    const y = d.y * h;
+                    ctx.beginPath();
+                    ctx.moveTo(x, y);
+                    ctx.lineTo(x + (isSnow ? 1 : 3), y + (isSnow ? 2 : 10));
+                    ctx.stroke();
+                });
+            }
+
+            const label = `${Math.round(temp)}F`;
+            ctx.fillStyle = 'rgba(18, 26, 38, 0.72)';
+            ctx.font = "600 12px 'IBM Plex Mono', monospace";
+            ctx.fillText(label, 16, 24);
+        };
+    },
+
+    makeShoppingRenderer(canvas) {
+        const brandPrimary = String(canvas.dataset.brandPrimary || '#1d1d1b');
+        const brandAccent  = String(canvas.dataset.brandAccent  || '#00a651');
+        const activity     = String(canvas.dataset.activity     || 'sport').trim();
+        const fitSignal    = String(canvas.dataset.fitSignal    || '').trim();
+
+        const hex = (h) => {
+            const r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);
+            return r ? { r: parseInt(r[1], 16), g: parseInt(r[2], 16), b: parseInt(r[3], 16) } : { r: 29, g: 29, b: 27 };
+        };
+        const pc = hex(brandPrimary);
+        const ac = hex(brandAccent);
+        const rgb  = (c, a = 1) => `rgba(${c.r},${c.g},${c.b},${a})`;
+        const lerp = (a, b, t) => a + (b - a) * t;
+
+        let t = 0;
+        let draw;
+
+        // ── RUNNING — stadium night / speed ──────────────────────────────────
+        if (activity === 'running') {
+            const streaks = Array.from({ length: 48 }, (_, i) => ({
+                x:   (i * 0.618) % 1,
+                y:   i / 48,
+                len: 0.18 + ((i * 0.11) % 0.28),
+                spd: 0.006 + ((i * 0.0021) % 0.009),
+                w:   0.6 + ((i * 0.29) % 2.2),
+                a:   0.35 + ((i * 0.13) % 0.5),
+                hot: i % 6 === 0,
+            }));
+            const lanes = 9;
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.018;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                // Deep dark base
+                ctx.fillStyle = `rgb(${pc.r},${pc.g},${pc.b})`; ctx.fillRect(0, 0, w, h);
+
+                // Stadium floodlight — upper-right, hard and bright
+                const fl = ctx.createRadialGradient(w * 0.9, 0, 0, w * 0.9, 0, Math.min(w, h) * 1.3);
+                fl.addColorStop(0,   rgb(ac, 0.55));
+                fl.addColorStop(0.3, rgb(ac, 0.20));
+                fl.addColorStop(0.7, rgb(ac, 0.06));
+                fl.addColorStop(1,   rgb(ac, 0));
+                ctx.fillStyle = fl; ctx.fillRect(0, 0, w, h);
+
+                // Opposing cooler fill — lower-left
+                const fl2 = ctx.createRadialGradient(w * 0.05, h, 0, w * 0.05, h, Math.min(w, h) * 0.9);
+                fl2.addColorStop(0,   `rgba(${lerp(pc.r,255,0.06)|0},${lerp(pc.g,255,0.06)|0},${lerp(pc.b,255,0.12)|0},0.28)`);
+                fl2.addColorStop(1,   rgb(pc, 0));
+                ctx.fillStyle = fl2; ctx.fillRect(0, 0, w, h);
+
+                // Track lane perspective lines (converge at right-center vanishing point)
+                ctx.strokeStyle = 'rgba(255,255,255,0.055)'; ctx.lineWidth = 1;
+                for (let i = 0; i <= lanes; i++) {
+                    const startY = h * 0.08 + (h * 0.84) * (i / lanes);
+                    ctx.beginPath(); ctx.moveTo(0, startY); ctx.lineTo(w, h * 0.5); ctx.stroke();
+                }
+
+                // Speed streaks — sweep right across full canvas
+                streaks.forEach((s) => {
+                    s.x += s.spd; if (s.x > 1.15) s.x = -s.len - 0.02;
+                    const sx = s.x * w, ex = sx + s.len * w;
+                    const sy = s.y * h + Math.sin(t * 1.4 + s.y * 8) * (h * 0.008);
+                    const c  = s.hot ? ac : { r: 255, g: 255, b: 255 };
+                    const g  = ctx.createLinearGradient(sx, 0, ex, 0);
+                    g.addColorStop(0,   rgb(c, 0));
+                    g.addColorStop(0.25, rgb(c, s.a));
+                    g.addColorStop(0.8, rgb(c, s.a * 0.6));
+                    g.addColorStop(1,   rgb(c, 0));
+                    ctx.strokeStyle = g; ctx.lineWidth = s.w;
+                    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, sy); ctx.stroke();
+                });
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.55); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+
+        // ── BASKETBALL — arena court under lights ─────────────────────────────
+        } else if (activity === 'basketball') {
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.013;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = `rgb(${Math.min(pc.r+4,32)},${Math.min(pc.g+2,18)},${Math.min(pc.b+2,14)})`; ctx.fillRect(0, 0, w, h);
+
+                // Arena overhead cluster — 3 spotlights
+                [0.25, 0.5, 0.75].forEach((xf, i) => {
+                    const pulse = 0.88 + Math.sin(t * 0.28 + i * 2.1) * 0.12;
+                    const sp = ctx.createRadialGradient(w * xf, h * 0.05, 0, w * xf, h * 0.05, Math.min(w, h) * 0.72 * pulse);
+                    sp.addColorStop(0,   rgb(ac, 0.38));
+                    sp.addColorStop(0.4, rgb(ac, 0.10));
+                    sp.addColorStop(1,   rgb(ac, 0));
+                    ctx.fillStyle = sp; ctx.fillRect(0, 0, w, h);
+                });
+
+                // Floor — wood parquet gradient
+                const floorY = h * 0.58;
+                const floor = ctx.createLinearGradient(0, floorY, 0, h);
+                floor.addColorStop(0, `rgba(${lerp(pc.r,80,0.3)|0},${lerp(pc.g,52,0.3)|0},${lerp(pc.b,20,0.3)|0},0.55)`);
+                floor.addColorStop(1, `rgba(${lerp(pc.r,40,0.2)|0},${lerp(pc.g,26,0.2)|0},${lerp(pc.b,10,0.2)|0},0.70)`);
+                ctx.fillStyle = floor; ctx.fillRect(0, floorY, w, h - floorY);
+
+                // Parquet lines (horizontal + vertical planks in perspective)
+                ctx.strokeStyle = rgb(ac, 0.09); ctx.lineWidth = 1;
+                for (let i = 0; i < 14; i++) {
+                    const prog = i / 14;
+                    const y = floorY + (h - floorY) * prog;
+                    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+                }
+                for (let i = 0; i < 28; i++) {
+                    ctx.beginPath(); ctx.moveTo((i / 28) * w, floorY); ctx.lineTo((i / 28) * w, h); ctx.stroke();
+                }
+
+                // Three-point arc glowing in accent
+                const arcCx = w * 0.46, arcCy = floorY + 4;
+                const arcR  = Math.min(w, h) * 0.44;
+                ctx.strokeStyle = rgb(ac, 0.30); ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.arc(arcCx, arcCy, arcR, 0, Math.PI); ctx.stroke();
+
+                // Key (paint)
+                const kw = w * 0.20, kh = (h - floorY) * 0.36;
+                ctx.strokeStyle = rgb(ac, 0.22); ctx.lineWidth = 2;
+                ctx.strokeRect(arcCx - kw / 2, arcCy, kw, kh);
+                // Free-throw circle
+                ctx.beginPath(); ctx.arc(arcCx, arcCy + kh, kw * 0.5, 0, Math.PI); ctx.stroke();
+
+                // Baseline
+                ctx.strokeStyle = rgb(ac, 0.18); ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(w * 0.05, floorY); ctx.lineTo(w * 0.95, floorY); ctx.stroke();
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.55); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+
+        // ── SOCCER — night pitch under floodlights ────────────────────────────
+        } else if (activity === 'soccer') {
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.012;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = `rgb(${pc.r},${pc.g},${pc.b})`; ctx.fillRect(0, 0, w, h);
+
+                // Pitch surface gradient (dark grass)
+                const pitchY = h * 0.45;
+                const pitch = ctx.createLinearGradient(0, pitchY, 0, h);
+                pitch.addColorStop(0, `rgba(${lerp(pc.r,12,0.4)|0},${lerp(pc.g,42,0.4)|0},${lerp(pc.b,18,0.4)|0},0.65)`);
+                pitch.addColorStop(1, `rgba(${lerp(pc.r,6,0.3)|0},${lerp(pc.g,28,0.3)|0},${lerp(pc.b,10,0.3)|0},0.80)`);
+                ctx.fillStyle = pitch; ctx.fillRect(0, pitchY, w, h - pitchY);
+
+                // Corner floodlights — all 4 corners of sky
+                [[0.02, -0.08], [0.98, -0.08]].forEach(([xf, yf]) => {
+                    const fl = ctx.createRadialGradient(w * xf, h * yf, 0, w * xf, h * yf, Math.min(w, h) * 1.4);
+                    fl.addColorStop(0,   'rgba(255,252,220,0.30)');
+                    fl.addColorStop(0.3, rgb(ac, 0.08));
+                    fl.addColorStop(1,   rgb(ac, 0));
+                    ctx.fillStyle = fl; ctx.fillRect(0, 0, w, h);
+                });
+
+                // Pitch stripe alternating bands
+                ctx.strokeStyle = 'rgba(255,255,255,0.03)'; ctx.lineWidth = w * 0.072;
+                for (let i = 0; i < 8; i += 2) {
+                    ctx.beginPath(); ctx.moveTo((i / 8) * w, pitchY); ctx.lineTo((i / 8) * w, h); ctx.stroke();
+                }
+
+                // Pitch markings
+                const pY = pitchY;
+                ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.lineWidth = 1.8;
+                // Halfway line
+                ctx.beginPath(); ctx.moveTo(0, pY); ctx.lineTo(w, pY); ctx.stroke();
+                // Centre circle (perspective ellipse)
+                ctx.beginPath(); ctx.ellipse(w * 0.5, pY + (h - pY) * 0.18, w * 0.16, (h - pY) * 0.12, 0, 0, Math.PI * 2); ctx.stroke();
+                // Penalty box
+                ctx.strokeRect(w * 0.3, pY, w * 0.4, (h - pY) * 0.42);
+                // Goal box
+                ctx.strokeRect(w * 0.4, pY, w * 0.2, (h - pY) * 0.18);
+                // Corner arcs
+                ['left', 'right'].forEach((side) => {
+                    const cx = side === 'left' ? w * 0.01 : w * 0.99;
+                    ctx.beginPath(); ctx.arc(cx, pY, w * 0.04, 0, Math.PI / 2 * (side === 'left' ? 1 : -1) + Math.PI / 2); ctx.stroke();
+                });
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.55); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+
+        // ── LIFESTYLE — warm editorial, slow colour fields ────────────────────
+        } else if (activity === 'lifestyle') {
+            const orbs = Array.from({ length: 10 }, (_, i) => ({
+                x: (i * 0.618) % 1, y: (i * 0.382) % 1,
+                r: 0.22 + ((i * 0.071) % 0.20),
+                spd: 0.00006 + ((i * 0.000033) % 0.00009),
+                phi: i * 2.399,
+                warm: i % 3 !== 0,
+            }));
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.007;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                // Warm dark base (slightly lighter than sport)
+                const base = ctx.createLinearGradient(0, 0, w, h);
+                base.addColorStop(0, `rgb(${Math.min(pc.r+22,72)},${Math.min(pc.g+14,48)},${Math.min(pc.b+8,38)})`);
+                base.addColorStop(1, `rgb(${pc.r},${pc.g},${pc.b})`);
+                ctx.fillStyle = base; ctx.fillRect(0, 0, w, h);
+
+                // Large slow bokeh fields
+                orbs.forEach((o) => {
+                    const cx = (o.x + Math.sin(t * o.spd * 180 + o.phi) * 0.13) * w;
+                    const cy = (o.y + Math.cos(t * o.spd * 160 + o.phi) * 0.11) * h;
+                    const r  = o.r * Math.max(w, h) * (0.9 + Math.sin(t * 0.3 + o.phi) * 0.1);
+                    const warm = o.warm
+                        ? { r: Math.min(255, pc.r + 55), g: Math.min(255, pc.g + 38), b: Math.min(255, pc.b + 22) }
+                        : ac;
+                    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+                    g.addColorStop(0,   rgb(warm, 0.20));
+                    g.addColorStop(0.55,rgb(warm, 0.07));
+                    g.addColorStop(1,   rgb(warm, 0));
+                    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+                });
+
+                // Wandering accent sweep
+                const swX = (Math.sin(t * 0.11) * 0.4 + 0.5) * w;
+                const swY = (Math.cos(t * 0.09) * 0.3 + 0.5) * h;
+                const sw = ctx.createRadialGradient(swX, swY, 0, swX, swY, Math.min(w, h) * 0.65);
+                sw.addColorStop(0,   rgb(ac, 0.22));
+                sw.addColorStop(0.5, rgb(ac, 0.07));
+                sw.addColorStop(1,   rgb(ac, 0));
+                ctx.fillStyle = sw; ctx.fillRect(0, 0, w, h);
+
+                // Faint horizontal grain lines (editorial)
+                ctx.strokeStyle = 'rgba(255,255,255,0.025)'; ctx.lineWidth = 1;
+                for (let y = 0; y < h; y += 6) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.55); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+
+        // ── TRAIL — topographic contour / mountain atmosphere ─────────────────
+        } else if (activity === 'trail') {
+            const contours = Array.from({ length: 24 }, (_, i) => ({
+                yBase: i / 24,
+                amp:   0.055 + ((i * 0.031) % 0.065),
+                freq:  0.0032 + ((i * 0.0011) % 0.0024),
+                phi:   i * 1.618,
+                a:     0.10 + ((i * 0.019) % 0.14),
+            }));
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.005;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = `rgb(${pc.r},${pc.g},${pc.b})`; ctx.fillRect(0, 0, w, h);
+
+                // Earthy sky glow — top
+                const sky = ctx.createLinearGradient(0, 0, 0, h * 0.55);
+                sky.addColorStop(0, rgb(ac, 0.14));
+                sky.addColorStop(1, rgb(ac, 0));
+                ctx.fillStyle = sky; ctx.fillRect(0, 0, w, h);
+
+                // Ground warmth — bottom
+                const ground = ctx.createLinearGradient(0, h * 0.6, 0, h);
+                ground.addColorStop(0, rgb(ac, 0));
+                ground.addColorStop(1, rgb(ac, 0.18));
+                ctx.fillStyle = ground; ctx.fillRect(0, 0, w, h);
+
+                // Topographic contour lines
+                contours.forEach((c_) => {
+                    const baseY = c_.yBase * h;
+                    ctx.strokeStyle = rgb(ac, c_.a); ctx.lineWidth = 0.9;
+                    ctx.beginPath();
+                    for (let x = 0; x <= w; x += 4) {
+                        const y = baseY
+                            + Math.sin(x * c_.freq + t * 0.35 + c_.phi) * (c_.amp * h)
+                            + Math.cos(x * c_.freq * 0.55 + c_.phi * 1.4) * (c_.amp * h * 0.44);
+                        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+                    }
+                    ctx.stroke();
+                });
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.55); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+
+        // ── SPORT / DEFAULT — cinematic diagonal beams + particles ────────────
+        } else {
+            const particles = Array.from({ length: 60 }, (_, i) => ({
+                x: (i * 0.618) % 1, y: (i * 0.382) % 1,
+                sz: 0.7 + ((i * 0.37) % 1) * 1.8,
+                spd: 0.00016 + ((i * 0.000068) % 0.00021),
+                phi: i * 2.399,
+            }));
+            // Diagonal beam definitions
+            const beams = Array.from({ length: 5 }, (_, i) => ({
+                angle: -0.48 + i * 0.12,
+                x: 0.15 + i * 0.18,
+                w: 0.04 + ((i * 0.023) % 0.05),
+                spd: 0.003 + ((i * 0.0017) % 0.004),
+                phi: i * 1.4,
+            }));
+            draw = () => {
+                const ctx = canvas.getContext('2d'); if (!ctx) return;
+                const { dpr, w, h } = this.fitCanvas(canvas); t += 0.013;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = `rgb(${pc.r},${pc.g},${pc.b})`; ctx.fillRect(0, 0, w, h);
+
+                // Main accent spotlight — lower-right
+                const sX = w * 0.80, sY = h * 0.85;
+                const sR = Math.min(w, h) * (0.95 + Math.sin(t * 0.22) * 0.05);
+                const spot = ctx.createRadialGradient(sX, sY, 0, sX, sY, sR);
+                spot.addColorStop(0,   rgb(ac, 0.42));
+                spot.addColorStop(0.35,rgb(ac, 0.16));
+                spot.addColorStop(1,   rgb(ac, 0));
+                ctx.fillStyle = spot; ctx.fillRect(0, 0, w, h);
+
+                // Upper-left fill
+                const ul = ctx.createRadialGradient(w * 0.06, h * 0.10, 0, w * 0.06, h * 0.10, Math.min(w, h) * 0.68);
+                ul.addColorStop(0, `rgba(${Math.min(255,pc.r+28)},${Math.min(255,pc.g+28)},${Math.min(255,pc.b+28)},0.24)`);
+                ul.addColorStop(1, rgb(pc, 0));
+                ctx.fillStyle = ul; ctx.fillRect(0, 0, w, h);
+
+                // Diagonal light beams
+                ctx.save();
+                beams.forEach((b) => {
+                    const cx = (b.x + Math.sin(t * b.spd * 60 + b.phi) * 0.07) * w;
+                    const alpha = 0.12 + 0.10 * Math.sin(t * 0.6 + b.phi);
+                    ctx.save();
+                    ctx.translate(cx, 0);
+                    ctx.rotate(b.angle);
+                    const bw = b.w * w;
+                    const bg = ctx.createLinearGradient(-bw, 0, bw, 0);
+                    bg.addColorStop(0, rgb(ac, 0));
+                    bg.addColorStop(0.5, rgb(ac, alpha));
+                    bg.addColorStop(1, rgb(ac, 0));
+                    ctx.fillStyle = bg;
+                    ctx.fillRect(-bw, -h * 0.1, bw * 2, h * 1.4);
+                    ctx.restore();
+                });
+                ctx.restore();
+
+                // Rising particles
+                particles.forEach((p) => {
+                    p.y -= p.spd; if (p.y < -0.02) { p.y = 1.02; p.x = Math.random(); }
+                    const px = p.x * w + Math.sin(t * 0.5 + p.phi) * 14;
+                    const alpha = 0.20 + 0.26 * Math.sin(t * 1.1 + p.phi);
+                    ctx.beginPath(); ctx.arc(px, p.y * h, p.sz, 0, Math.PI * 2);
+                    ctx.fillStyle = rgb(ac, alpha); ctx.fill();
+                });
+
+                // Scan line
+                const scy = ((t * 26) % (h + 36)) - 18;
+                const scg = ctx.createLinearGradient(0, scy - 12, 0, scy + 12);
+                scg.addColorStop(0, rgb(ac, 0)); scg.addColorStop(0.5, rgb(ac, 0.13)); scg.addColorStop(1, rgb(ac, 0));
+                ctx.fillStyle = scg; ctx.fillRect(0, scy - 12, w, 24);
+
+                if (fitSignal) {
+                    ctx.fillStyle = rgb(ac, 0.60); ctx.font = "600 11px 'IBM Plex Mono', monospace";
+                    ctx.fillText(fitSignal.toLowerCase(), 18, h - 18);
+                }
+            };
+        }
+
+        return () => draw();
+    },
+
+    makeTasksRenderer(canvas) {
+        const open = Math.max(0, Number(canvas.dataset.open || 0));
+        const done = Math.max(0, Number(canvas.dataset.done || 0));
+        const total = Math.max(1, open + done);
+        const lanes = 10;
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.013;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, 'rgba(24, 55, 87, 0.22)');
+            bg.addColorStop(1, 'rgba(24, 55, 87, 0.03)');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            ctx.strokeStyle = 'rgba(24, 55, 87, 0.12)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= lanes; i += 1) {
+                const y = Math.round((i / lanes) * h);
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+            const completion = done / total;
+            const sweep = Math.max(0.08, completion) * w;
+            const pulse = 0.2 + Math.sin(t * 2) * 0.08;
+            const grad = ctx.createLinearGradient(0, 0, sweep, 0);
+            grad.addColorStop(0, `rgba(20, 184, 166, ${0.18 + pulse})`);
+            grad.addColorStop(1, 'rgba(20, 184, 166, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, sweep, h);
+        };
+    },
+
+    makeExpensesRenderer(canvas) {
+        const total = Math.max(0, Number(canvas.dataset.total || 0));
+        const entries = Math.max(1, Number(canvas.dataset.items || 1));
+        const bars = Math.max(8, Math.min(22, entries * 2));
+        const amplitude = Math.min(1, total / 1500);
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.02;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, 'rgba(9, 94, 76, 0.18)');
+            bg.addColorStop(1, 'rgba(9, 94, 76, 0.03)');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            const bw = w / (bars * 1.4);
+            for (let i = 0; i < bars; i += 1) {
+                const x = i * bw * 1.4 + 8;
+                const signal = (Math.sin(t + i * 0.38) + 1) / 2;
+                const hPct = 0.16 + signal * (0.42 + amplitude * 0.3);
+                const bh = Math.max(10, h * hPct);
+                const y = h - bh;
+                const alpha = 0.22 + signal * 0.3;
+                ctx.fillStyle = `rgba(16, 158, 129, ${alpha})`;
+                ctx.fillRect(x, y, bw, bh);
+            }
+        };
+    },
+
+    makeNotesRenderer(canvas) {
+        const count = Math.max(1, Number(canvas.dataset.count || 1));
+        const particles = Array.from({ length: Math.min(36, 10 + count * 3) }, (_, i) => ({
+            x: ((i * 37) % 997) / 997,
+            y: ((i * 71) % 991) / 991,
+            s: 0.4 + ((i * 13) % 10) / 10,
+            p: i * 0.27,
+        }));
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, 'rgba(64, 82, 181, 0.16)');
+            bg.addColorStop(1, 'rgba(64, 82, 181, 0.02)');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            particles.forEach((p, idx) => {
+                const x = (p.x * w + Math.sin(t + p.p) * 16) % (w + 20);
+                const y = (p.y * h + Math.cos(t * 1.1 + p.p) * 12) % (h + 20);
+                const alpha = 0.12 + ((Math.sin(t * 1.7 + idx) + 1) / 2) * 0.2;
+                ctx.fillStyle = `rgba(84, 106, 223, ${alpha})`;
+                ctx.beginPath();
+                ctx.arc(x, y, 2 + p.s * 3, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        };
+    },
+
+    makeGraphRenderer(canvas) {
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.009;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, 'rgba(13, 94, 123, 0.17)');
+            bg.addColorStop(1, 'rgba(13, 94, 123, 0.02)');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            ctx.strokeStyle = 'rgba(13, 94, 123, 0.12)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 16; i += 1) {
+                const x = (i / 16) * w;
+                const yOff = Math.sin(t + i * 0.45) * 4;
+                ctx.beginPath();
+                ctx.moveTo(x, 0 + yOff);
+                ctx.lineTo(x, h + yOff);
+                ctx.stroke();
+            }
+        };
+    },
+
+    makeWebdeckRenderer(canvas) {
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, 'rgba(21, 36, 60, 0.28)');
+            bg.addColorStop(1, 'rgba(21, 36, 60, 0.06)');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+
+            const glowA = ctx.createRadialGradient(w * 0.2, h * 0.25, 0, w * 0.2, h * 0.25, Math.min(w, h) * 0.55);
+            glowA.addColorStop(0, 'rgba(92, 160, 255, 0.22)');
+            glowA.addColorStop(1, 'rgba(92, 160, 255, 0)');
+            ctx.fillStyle = glowA;
+            ctx.fillRect(0, 0, w, h);
+
+            const glowB = ctx.createRadialGradient(w * 0.82, h * 0.7, 0, w * 0.82, h * 0.7, Math.min(w, h) * 0.5);
+            glowB.addColorStop(0, 'rgba(53, 209, 184, 0.16)');
+            glowB.addColorStop(1, 'rgba(53, 209, 184, 0)');
+            ctx.fillStyle = glowB;
+            ctx.fillRect(0, 0, w, h);
+
+            ctx.strokeStyle = 'rgba(173, 207, 255, 0.12)';
+            ctx.lineWidth = 1;
+            const gap = 26;
+            for (let x = -gap; x <= w + gap; x += gap) {
+                const yDrift = Math.sin(t + x * 0.014) * 4;
+                ctx.beginPath();
+                ctx.moveTo(x, 0 + yDrift);
+                ctx.lineTo(x, h + yDrift);
+                ctx.stroke();
+            }
+        };
+    },
+
+    weatherSeed(text) {
+        const value = String(text || '').toLowerCase();
+        let hash = 2166136261;
+        for (let i = 0; i < value.length; i += 1) {
+            hash ^= value.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return Math.abs(hash >>> 0);
+    },
+
+    buildWeatherForecastPoints(info) {
+        const live = Array.isArray(info?.forecast) ? info.forecast : [];
+        if (live.length >= 4) {
+            return live.slice(0, 8).map((item, idx) => ({
+                hour: String(item.hourLabel || `+${idx}h`),
+                temp: Number(item.tempF || 0),
+                precip: Number(item.precipChance || 0),
+                wind: Number(item.windMph || 0),
+            }));
+        }
+        const location = String(info.location || 'weather').trim();
+        const condition = String(info.condition || '').trim().toLowerCase();
+        const baseTemp = Number(String(info.temperature || '').replace(/[^0-9.-]/g, '')) || 60;
+        const seed = this.weatherSeed(`${location}|${condition}|${baseTemp}`);
+        const conditionBias = condition.includes('rain') ? -3 : condition.includes('snow') ? -6 : condition.includes('sun') || condition.includes('clear') ? 4 : 0;
+        const points = [];
+        for (let i = 0; i < 8; i += 1) {
+            const jitter = ((seed >> (i * 4)) & 0xf) - 7;
+            const wave = Math.sin((i / 5) * Math.PI) * 3;
+            const temp = Math.round(baseTemp + conditionBias + wave + jitter * 0.35);
+            const precip = Math.max(0, Math.min(100, (condition.includes('rain') ? 40 : 16) + jitter * 3 + i * 2));
+            const wind = Math.max(0, 4 + (jitter * 0.4) + (i * 0.2));
+            points.push({ hour: `${i * 2}h`, temp, precip, wind });
+        }
+        return points;
+    },
+
+    buildWeatherForecastVisual(info) {
+        const points = this.buildWeatherForecastPoints(info);
+        if (!points.length) return '';
+        const min = Math.min(...points.map((p) => p.temp));
+        const max = Math.max(...points.map((p) => p.temp));
+        const span = Math.max(1, max - min);
+        const maxWind = Math.max(1, ...points.map((p) => Number(p.wind || 0)));
+        const width = 560;
+        const height = 176;
+        const padX = 12;
+        const padY = 16;
+        const step = (width - padX * 2) / (points.length - 1);
+        const toY = (temp) => {
+            const norm = (temp - min) / span;
+            return Math.round(height - padY - norm * (height - padY * 2));
+        };
+        const toWindY = (wind) => {
+            const norm = Number(wind || 0) / maxWind;
+            return Math.round(height - padY - norm * (height - padY * 2));
+        };
+        const path = points
+            .map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${Math.round(padX + idx * step)} ${toY(p.temp)}`)
+            .join(' ');
+        const windPath = points
+            .map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${Math.round(padX + idx * step)} ${toWindY(p.wind)}`)
+            .join(' ');
+        const area = `${path} L ${Math.round(width - padX)} ${height - padY} L ${padX} ${height - padY} Z`;
+        const bars = points.map((p, idx) => {
+            const x = Math.round(padX + idx * step - 9);
+            const h = Math.max(2, Math.round((Math.max(0, Number(p.precip || 0)) / 100) * (height - padY * 2)));
+            const y = Math.round(height - padY - h);
+            return `<rect class="forecast-bar" x="${x}" y="${y}" width="18" height="${h}" rx="4"></rect>`;
+        }).join('');
+        const labels = points.map((p) => `<div class="forecast-tick">${escapeHtml(p.hour)}</div>`).join('');
+        const chips = points
+            .map((p) => `<div class="forecast-chip">${escapeHtml(String(p.temp))}F</div>`)
+            .join('');
+        return `
+            <div class="forecast-panel">
+                <div class="forecast-head">12h forecast</div>
+                <svg class="forecast-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="Forecast trend">
+                    ${bars}
+                    <path class="forecast-area" d="${area}"></path>
+                    <path class="forecast-line" d="${path}"></path>
+                    <path class="forecast-wind" d="${windPath}"></path>
+                </svg>
+                <div class="forecast-labels">${labels}</div>
+                <div class="forecast-chips">${chips}</div>
+                <div class="forecast-range">low ${min}F | high ${max}F | wind max ${Math.round(maxWind)} mph</div>
+            </div>
+        `;
     },
 
     buildHandoffItems(runtimeTrace) {
@@ -1049,6 +3271,13 @@ const UIEngine = {
         const match = text.match(/Try:\s*([a-z0-9 _-]+)/i);
         if (!match) return '';
         return match[1].trim();
+    },
+
+    extractTryCommand(message) {
+        const text = String(message || '');
+        const match = text.match(/Try:\s*([^\n\r]+)/i);
+        if (!match) return '';
+        return String(match[1] || '').trim();
     },
 
     deriveKernelTrace(execution, route) {
@@ -1409,7 +3638,21 @@ const UIEngine = {
         const sid = this.state.session.sessionId ? this.state.session.sessionId.slice(0, 8) : '-';
         const sync = this.state.session.syncTransport.toUpperCase();
         this.status.innerText = `MODE: ${mode} | SYNC: ${sync} | SESSION: ${sid} | OBJECTS: ${objectCount} | LATENCY: ${this.state.metrics.latency}ms | ENTROPY: ${this.state.metrics.entropy.toFixed(3)}`;
-    }
+    },
+
+    weatherHeroImageUrl(condition) {
+        const lower = String(condition || '').toLowerCase();
+        if (lower.includes('rain') || lower.includes('storm')) {
+            return 'https://images.unsplash.com/photo-1519692933481-e162a57d6721?auto=format&fit=crop&w=1800&q=80';
+        }
+        if (lower.includes('snow')) {
+            return 'https://images.unsplash.com/photo-1483664852095-d6cc6870702d?auto=format&fit=crop&w=1800&q=80';
+        }
+        if (lower.includes('sun') || lower.includes('clear')) {
+            return 'https://images.unsplash.com/photo-1502303756762-a0f4a7f5f0a0?auto=format&fit=crop&w=1800&q=80';
+        }
+        return 'https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?auto=format&fit=crop&w=1800&q=80';
+    },
 };
 
 const IntentLayerCompiler = {
@@ -1701,6 +3944,7 @@ const UIPlanSchema = {
 
         if (!plan || typeof plan !== 'object') return fallback;
 
+        const trace = plan?.trace && typeof plan.trace === 'object' ? { ...plan.trace } : {};
         const safe = {
             version: typeof plan.version === 'string' ? plan.version : fallback.version,
             title: typeof plan.title === 'string' ? plan.title : fallback.title,
@@ -1714,9 +3958,10 @@ const UIPlanSchema = {
                 : fallback.suggestions,
             blocks: Array.isArray(plan.blocks) ? plan.blocks.filter((b) => isValidBlock(b)).slice(0, 12) : fallback.blocks,
             trace: {
-                planVersion: typeof plan?.trace?.planVersion === 'string' ? plan.trace.planVersion : 'unknown',
-                focusDomains: Array.isArray(plan?.trace?.focusDomains) ? plan.trace.focusDomains : [],
-                mode: typeof plan?.trace?.mode === 'string' ? plan.trace.mode : 'default'
+                ...trace,
+                planVersion: typeof trace.planVersion === 'string' ? trace.planVersion : 'unknown',
+                focusDomains: Array.isArray(trace.focusDomains) ? trace.focusDomains : [],
+                mode: typeof trace.mode === 'string' ? trace.mode : 'default'
             }
         };
 

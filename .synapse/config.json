@@ -1,0 +1,17 @@
+{
+  "embedding_provider": "ollama",
+  "embedding_model": "nomic-embed-text",
+  "dimension": 768,
+  "index_backend": "chromadb",
+  "watch_paths": [
+    "C:\\Users\\steve\\Documents\\GenomeUI"
+  ],
+  "min_chunk_chars": 500,
+  "max_chunk_chars": 3500,
+  "overlap_percentage": 0.15,
+  "agent_enabled": false,
+  "agent_model": "llama3",
+  "agent_auto_store": true,
+  "agent_auto_retrieve": true,
+  "agent_store_threshold": 0.6
+}

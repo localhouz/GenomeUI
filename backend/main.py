@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import html
+import hashlib
+import hmac
 import ipaddress
 import json
+import math
 import os
 import pathlib
 import re
+import secrets
+import time as _time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
@@ -31,6 +38,13 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL_SMALL = os.getenv("OLLAMA_MODEL_SMALL", "")
 OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
 STORE_PATH = pathlib.Path(os.getenv("GENOMEUI_STORE_PATH", "backend/data/sessions.json"))
+CONNECTOR_VAULT_PATH = pathlib.Path(os.getenv("GENOMEUI_CONNECTOR_VAULT_PATH", "backend/data/connector_vault.json"))
+MCP_CONFIG_PATH = pathlib.Path(os.getenv("GENOMEUI_MCP_CONFIG_PATH", ".mcp.json"))
+CONNECTOR_VAULT_KEY = os.getenv("GENOMEUI_CONNECTOR_VAULT_KEY", "genomeui-local-dev-key")
+CONNECTOR_PROVIDER_MODE = str(os.getenv("GENOMEUI_CONNECTOR_PROVIDER_MODE", "auto")).strip().lower()
+BANKING_PROVIDER_MODE = str(os.getenv("GENOMEUI_BANKING_PROVIDER_MODE", "scaffold")).strip().lower()
+SOCIAL_PROVIDER_MODE = str(os.getenv("GENOMEUI_SOCIAL_PROVIDER_MODE", "scaffold")).strip().lower()
+WEB_PROVIDER_MODE = str(os.getenv("GENOMEUI_WEB_PROVIDER_MODE", "scaffold")).strip().lower()
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TURN_LATENCY_BUDGET_MS = int(os.getenv("TURN_LATENCY_BUDGET_MS", "800"))
 SLO_BREACH_STREAK_FOR_THROTTLE = int(os.getenv("SLO_BREACH_STREAK_FOR_THROTTLE", "3"))
@@ -41,6 +55,189 @@ JOURNAL_MAX_ENTRIES = int(os.getenv("JOURNAL_MAX_ENTRIES", "500"))
 INTENT_CLARIFICATION_THRESHOLD = float(os.getenv("INTENT_CLARIFICATION_THRESHOLD", "0.65"))
 GRAPH_ENTITY_KINDS = {"task", "expense", "note"}
 GRAPH_RELATION_KINDS = {"depends_on", "references"}
+# MCP connector registry — populated at startup from .mcp.json, never from user input
+MCP_SERVER_REGISTRY: dict[str, dict[str, Any]] = {}
+MCP_REGISTRY_LOCK = asyncio.Lock()
+MCP_TOOL_MATCH_THRESHOLD = 0.35
+_WEB_SEARCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_WEB_SEARCH_CACHE_TTL_S = 300.0
+_WEB_PREVIEW_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+_WEB_PREVIEW_CACHE_TTL_S = 600.0
+_SHOP_LIVE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SHOP_LIVE_CACHE_TTL_S = 240.0
+# Running stdio subprocesses keyed by server_id
+MCP_STDIO_PROCESSES: dict[str, dict[str, Any]] = {}
+CONNECTOR_MANIFESTS: list[dict[str, Any]] = [
+    {
+        "id": "weather.core",
+        "version": "1.0.0",
+        "domain": "weather",
+        "provider": "api",
+        "scopes": ["weather.forecast.read"],
+        "riskMap": {"weather.forecast.read": "low"},
+        "deviceProfiles": {
+            "weather.forecast.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    {
+        "id": "web.fetch",
+        "version": "1.0.0",
+        "domain": "web",
+        "provider": "http",
+        "scopes": ["web.page.read"],
+        "riskMap": {"web.page.read": "low"},
+        "deviceProfiles": {
+            "web.page.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    {
+        "id": "contacts.local",
+        "version": "0.1.0",
+        "domain": "contacts",
+        "provider": "local_index",
+        "scopes": ["contacts.read"],
+        "riskMap": {"contacts.read": "low"},
+        "deviceProfiles": {
+            "contacts.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    {
+        "id": "telephony.bridge",
+        "version": "0.1.0",
+        "domain": "telephony",
+        "provider": "native_dialer",
+        "scopes": ["telephony.call.start"],
+        "riskMap": {"telephony.call.start": "high"},
+        "deviceProfiles": {
+            "telephony.call.start": {"desktop": "partial", "mobile": "full", "fallback": "handoff_to_mobile"},
+        },
+    },
+    {
+        "id": "banking.read",
+        "version": "0.1.0",
+        "domain": "bank",
+        "provider": "oauth",
+        "scopes": ["bank.account.balance.read", "bank.transaction.read"],
+        "riskMap": {
+            "bank.account.balance.read": "low",
+            "bank.transaction.read": "low",
+        },
+        "deviceProfiles": {
+            "bank.account.balance.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "bank.transaction.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    {
+        "id": "social.web_session",
+        "version": "0.1.0",
+        "domain": "social",
+        "provider": "session",
+        "scopes": ["social.feed.read", "social.message.send"],
+        "riskMap": {
+            "social.feed.read": "low",
+            "social.message.send": "medium",
+        },
+        "deviceProfiles": {
+            "social.feed.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.message.send": {"desktop": "partial", "mobile": "partial", "fallback": "confirm_in_provider"},
+        },
+    },
+]
+CONNECTOR_ADAPTER_CONTRACTS: dict[str, Any] = {
+    "version": "1.0.0",
+    "providers": {
+        "weather": {
+            "operations": {
+                "weather_forecast": {
+                    "request": {"location": "string"},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "mock|open-meteo|fallback|live",
+                        "location": "string",
+                        "temperatureF": "number",
+                        "windMph": "number",
+                        "condition": "string",
+                        "error": "string?",
+                    },
+                }
+            }
+        },
+        "banking": {
+            "operations": {
+                "banking_balance_read": {
+                    "request": {},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "scaffold|mock|live",
+                        "currency": "string",
+                        "available": "number",
+                        "ledger": "number",
+                        "asOf": "string",
+                        "error": "string?",
+                    },
+                },
+                "banking_transactions_read": {
+                    "request": {"limit": "int(1..20)"},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "scaffold|mock|live",
+                        "items": "array<object{date,merchant,amount,...}>",
+                        "error": "string?",
+                    },
+                },
+            }
+        },
+        "social": {
+            "operations": {
+                "social_feed_read": {
+                    "request": {},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "scaffold|mock|live",
+                        "items": "array<object{author,summary,age,...}>",
+                        "error": "string?",
+                    },
+                },
+                "social_message_send": {
+                    "request": {"text": "string(max 280)"},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "scaffold|mock|live",
+                        "delivery": "queued|sent",
+                        "message": "string",
+                        "error": "string?",
+                    },
+                },
+            }
+        },
+        "contacts": {
+            "operations": {
+                "contacts_lookup": {
+                    "request": {"query": "string?"},
+                    "response": {
+                        "ok": "boolean",
+                        "source": "scaffold|mock|live",
+                        "items": "array<object{name,phone,label}>",
+                        "error": "string?",
+                    },
+                }
+            }
+        },
+        "telephony": {
+            "operations": {
+                "telephony_call_start": {
+                    "request": {"target": "string", "confirmed": "boolean", "forceHandoff": "boolean?"},
+                    "response": {
+                        "ok": "boolean",
+                        "mode": "bridge_prepare|handoff_to_mobile",
+                        "next": "array<string>",
+                        "error": "string?",
+                    },
+                }
+            }
+        },
+    },
+}
 TURN_HISTORY_MAX_ENTRIES = int(os.getenv("TURN_HISTORY_MAX_ENTRIES", "300"))
 TURN_IDEMPOTENCY_MAX_ENTRIES = int(os.getenv("TURN_IDEMPOTENCY_MAX_ENTRIES", "120"))
 HANDOFF_LATENCY_BUDGET_MS = int(os.getenv("HANDOFF_LATENCY_BUDGET_MS", "500"))
@@ -123,6 +320,17 @@ class IntentPreviewBody(BaseModel):
     intent: str
 
 
+class ConnectorGrantBody(BaseModel):
+    scope: str
+    enabled: bool = True
+    ttlMs: int = 0
+
+
+class ConnectorSecretBody(BaseModel):
+    key: str
+    value: str
+
+
 @dataclass
 class SessionState:
     memory: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {"tasks": [], "expenses": [], "notes": []})
@@ -155,6 +363,259 @@ SESSIONS: dict[str, SessionState] = {}
 SCHEDULER_TASK: asyncio.Task | None = None
 STORE_LOCK = asyncio.Lock()
 SIMULATE_PERSIST_FAILURE = False
+CONNECTOR_VAULT_LOCK = asyncio.Lock()
+
+
+def default_connector_vault_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "grants": {},
+        "secrets": {},
+        "updatedAt": 0,
+    }
+
+
+CONNECTOR_VAULT: dict[str, Any] = default_connector_vault_state()
+MOCK_WEATHER_DATA: dict[str, dict[str, Any]] = {
+    "austin": {
+        "location": "Austin, US",
+        "temperatureF": 72.0,
+        "windMph": 7.0,
+        "condition": "partly cloudy",
+    },
+    "seattle": {
+        "location": "Seattle, US",
+        "temperatureF": 58.0,
+        "windMph": 11.0,
+        "condition": "light rain",
+    },
+    "new york": {
+        "location": "New York, US",
+        "temperatureF": 64.0,
+        "windMph": 9.0,
+        "condition": "overcast",
+    },
+}
+MOCK_BANK_BALANCE: dict[str, Any] = {
+    "currency": "USD",
+    "available": 2450.37,
+    "ledger": 2501.12,
+    "asOf": "2026-02-20T12:00:00Z",
+}
+MOCK_BANK_TRANSACTIONS: list[dict[str, Any]] = [
+    {"id": "tx_1001", "amount": -24.21, "merchant": "Coffee Cart", "category": "food", "date": "2026-02-20"},
+    {"id": "tx_1002", "amount": -68.00, "merchant": "Grocery Mart", "category": "groceries", "date": "2026-02-19"},
+    {"id": "tx_1003", "amount": 1800.00, "merchant": "Payroll", "category": "income", "date": "2026-02-18"},
+    {"id": "tx_1004", "amount": -12.99, "merchant": "Stream Music", "category": "subscription", "date": "2026-02-18"},
+    {"id": "tx_1005", "amount": -42.50, "merchant": "Fuel Stop", "category": "transport", "date": "2026-02-17"},
+]
+MOCK_SOCIAL_FEED: list[dict[str, Any]] = [
+    {"id": "post_201", "author": "Alex", "summary": "Shared a sprint update", "age": "12m"},
+    {"id": "post_202", "author": "Sam", "summary": "Posted a design concept", "age": "35m"},
+    {"id": "post_203", "author": "Jordan", "summary": "Asked for feedback on roadmap", "age": "1h"},
+]
+MOCK_CONTACTS: list[dict[str, str]] = [
+    {"name": "Mike Carter", "phone": "+1-555-0100", "label": "mobile"},
+    {"name": "Nina Patel", "phone": "+1-555-0144", "label": "work"},
+    {"name": "Sam Rivera", "phone": "+1-555-0199", "label": "home"},
+]
+MOCK_WEB_PAGES: dict[str, str] = {
+    "https://example.com": "Example Domain\nThis domain is for use in documentation and testing.",
+    "https://example.org": "Example Organization\nReference site for deterministic fetch tests.",
+    "https://example.net": "Example Network\nReserved by IANA for examples.",
+}
+MOCK_SHOP_ITEMS: list[dict[str, Any]] = [
+    {
+        "id": "shoe-001",
+        "title": "Cloud Runner Low",
+        "category": "shoes",
+        "brand": "Northline",
+        "priceUsd": 118.0,
+        "imageUrl": "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/cloud-runner-low",
+        "tags": ["running", "daily", "men", "women"],
+    },
+    {
+        "id": "shoe-002",
+        "title": "Street Motion High",
+        "category": "shoes",
+        "brand": "Arc Mode",
+        "priceUsd": 142.0,
+        "imageUrl": "https://images.unsplash.com/photo-1460353581641-37baddab0fa2?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/street-motion-high",
+        "tags": ["sneakers", "streetwear", "high-top"],
+    },
+    {
+        "id": "shoe-003",
+        "title": "Minimal Leather Court",
+        "category": "shoes",
+        "brand": "Forma",
+        "priceUsd": 165.0,
+        "imageUrl": "https://images.unsplash.com/photo-1525966222134-fcfa99b8ae77?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/minimal-leather-court",
+        "tags": ["white", "casual", "leather"],
+    },
+    {
+        "id": "shoe-004",
+        "title": "Puma Velocity Nitro 2",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 135.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/376262/01/sv01/fnd/EEA/fmt/png/Velocity-NITRO%E2%84%A2-2-Men's-Running-Shoes",
+        "url": "https://us.puma.com/us/en/pd/velocity-nitro-2-mens-running-shoes/376262-01",
+        "tags": ["puma", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-005",
+        "title": "Puma Suede Classic XXI",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 90.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/374915/01/sv01/fnd/EEA/fmt/png/Suede-Classic-XXI-Sneakers",
+        "url": "https://us.puma.com/us/en/pd/suede-classic-xxi-sneakers/374915-01",
+        "tags": ["puma", "lifestyle", "casual", "men"],
+    },
+    {
+        "id": "shoe-006",
+        "title": "Puma RS-X Efekt",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 110.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/390776/01/sv01/fnd/EEA/fmt/png/RS-X-Efekt-Sneakers",
+        "url": "https://us.puma.com/us/en/pd/rs-x-efekt-sneakers/390776-01",
+        "tags": ["puma", "streetwear", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-007",
+        "title": "Puma Deviate Nitro 2",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 160.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/376858/01/sv01/fnd/EEA/fmt/png/Deviate-NITRO%E2%84%A2-2-Men's-Running-Shoes",
+        "url": "https://us.puma.com/us/en/pd/deviate-nitro-2-mens-running-shoes/376858-01",
+        "tags": ["puma", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-008",
+        "title": "Puma Future Rider Play On",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 85.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/381856/01/sv01/fnd/EEA/fmt/png/Future-Rider-Play-On-Sneakers",
+        "url": "https://us.puma.com/us/en/pd/future-rider-play-on-sneakers/381856-01",
+        "tags": ["puma", "retro", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-009",
+        "title": "Puma Clyde OG",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 100.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/391984/01/sv01/fnd/EEA/fmt/png/Clyde-OG-Sneakers",
+        "url": "https://us.puma.com/us/en/pd/clyde-og-sneakers/391984-01",
+        "tags": ["puma", "classic", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-010",
+        "title": "Puma Softride Enzo Evo",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 75.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/376540/01/sv01/fnd/EEA/fmt/png/Softride-Enzo-Evo-Men's-Running-Shoes",
+        "url": "https://us.puma.com/us/en/pd/softride-enzo-evo-mens-running-shoes/376540-01",
+        "tags": ["puma", "running", "casual", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-011",
+        "title": "Puma Magnify Nitro 2",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 150.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/376833/01/sv01/fnd/EEA/fmt/png/Magnify-NITRO%E2%84%A2-2-Men's-Running-Shoes",
+        "url": "https://us.puma.com/us/en/pd/magnify-nitro-2-mens-running-shoes/376833-01",
+        "tags": ["puma", "performance", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-012",
+        "title": "Puma Palermo",
+        "category": "shoes",
+        "brand": "Puma",
+        "priceUsd": 90.0,
+        "imageUrl": "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_750,h_750/global/396463/01/sv01/fnd/EEA/fmt/png/Palermo-Sneakers",
+        "url": "https://us.puma.com/us/en/pd/palermo-sneakers/396463-01",
+        "tags": ["puma", "court", "lifestyle", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-013",
+        "title": "Nike Pegasus 41",
+        "category": "shoes",
+        "brand": "Nike",
+        "priceUsd": 140.0,
+        "imageUrl": "https://images.unsplash.com/photo-1543508282-6319a3e2621f?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/t/pegasus-41-mens-road-running-shoes",
+        "tags": ["nike", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-014",
+        "title": "Adidas Ultraboost Light",
+        "category": "shoes",
+        "brand": "Adidas",
+        "priceUsd": 190.0,
+        "imageUrl": "https://images.unsplash.com/photo-1597045566677-8cf032ed6634?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.adidas.com/us/ultraboost-light-shoes",
+        "tags": ["adidas", "running", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-015",
+        "title": "New Balance 574 Core",
+        "category": "shoes",
+        "brand": "New Balance",
+        "priceUsd": 90.0,
+        "imageUrl": "https://images.unsplash.com/photo-1560769629-975ec94e6a86?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.newbalance.com/pd/574-core",
+        "tags": ["newbalance", "new-balance", "nb", "casual", "men", "size-8-5"],
+    },
+    {
+        "id": "shoe-016",
+        "title": "Jordan Max Aura 5",
+        "category": "shoes",
+        "brand": "Jordan",
+        "priceUsd": 135.0,
+        "imageUrl": "https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?auto=format&fit=crop&w=900&q=80",
+        "url": "https://www.nike.com/w/jordan-shoes-37eefzy7ok",
+        "tags": ["jordan", "basketball", "men", "size-8-5"],
+    },
+    {
+        "id": "outfit-001",
+        "title": "Neutral Capsule Set",
+        "category": "outfit",
+        "brand": "Fieldhouse",
+        "priceUsd": 210.0,
+        "imageUrl": "https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/neutral-capsule-set",
+        "tags": ["outfit", "minimal", "capsule"],
+    },
+    {
+        "id": "outfit-002",
+        "title": "Urban Layered Fit",
+        "category": "outfit",
+        "brand": "Shift",
+        "priceUsd": 186.0,
+        "imageUrl": "https://images.unsplash.com/photo-1490481651871-ab68de25d43d?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/urban-layered-fit",
+        "tags": ["streetwear", "layered", "outfit"],
+    },
+    {
+        "id": "outfit-003",
+        "title": "Classic Office Pairing",
+        "category": "outfit",
+        "brand": "Monroe",
+        "priceUsd": 234.0,
+        "imageUrl": "https://images.unsplash.com/photo-1483985988355-763728e1935b?auto=format&fit=crop&w=900&q=80",
+        "url": "https://example.com/shop/classic-office-pairing",
+        "tags": ["formal", "office", "smart"],
+    },
+]
 
 
 def normalize_session_id(value: str) -> str:
@@ -167,6 +628,1609 @@ def normalize_device_id(value: str) -> str:
 
 def generate_session_id() -> str:
     return str(uuid.uuid4())[:8]
+
+
+def list_connector_manifests() -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    for item in CONNECTOR_MANIFESTS:
+        if not isinstance(item, dict):
+            continue
+        scopes = [str(scope) for scope in (item.get("scopes", []) if isinstance(item.get("scopes"), list) else [])]
+        risk_map = item.get("riskMap", {}) if isinstance(item.get("riskMap"), dict) else {}
+        device_profiles = item.get("deviceProfiles", {}) if isinstance(item.get("deviceProfiles"), dict) else {}
+        manifests.append(
+            {
+                "id": str(item.get("id", "")),
+                "version": str(item.get("version", "")),
+                "domain": str(item.get("domain", "")),
+                "provider": str(item.get("provider", "")),
+                "scopes": scopes,
+                "riskMap": {str(k): str(v) for k, v in risk_map.items()},
+                "deviceProfiles": device_profiles,
+            }
+        )
+    return manifests
+
+
+def connector_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
+    domains: dict[str, int] = {}
+    total_scopes = 0
+    mobile_full = 0
+    mobile_partial = 0
+    mobile_unsupported = 0
+    for item in manifests:
+        domain = str(item.get("domain", "unknown"))
+        domains[domain] = int(domains.get(domain, 0) or 0) + 1
+        scopes = item.get("scopes", []) if isinstance(item.get("scopes"), list) else []
+        profiles = item.get("deviceProfiles", {}) if isinstance(item.get("deviceProfiles"), dict) else {}
+        for scope in scopes:
+            total_scopes += 1
+            profile = profiles.get(str(scope), {}) if isinstance(profiles.get(str(scope)), dict) else {}
+            mobile = str(profile.get("mobile", "unsupported")).strip().lower()
+            if mobile == "full":
+                mobile_full += 1
+            elif mobile == "partial":
+                mobile_partial += 1
+            else:
+                mobile_unsupported += 1
+    return {
+        "count": len(manifests),
+        "domains": len(domains),
+        "domainCounts": domains,
+        "scopes": total_scopes,
+        "scopeCount": total_scopes,
+        "mobileFull": mobile_full,
+        "mobilePartial": mobile_partial,
+        "mobileUnsupported": mobile_unsupported,
+        "mobile": {
+            "full": mobile_full,
+            "partial": mobile_partial,
+            "unsupported": mobile_unsupported,
+        },
+    }
+
+
+def normalize_connector_device(value: str) -> str | None:
+    target = str(value or "").strip().lower()
+    if target in {"desktop", "mobile"}:
+        return target
+    return None
+
+
+def connector_device_counts(manifests: list[dict[str, Any]], device: str) -> dict[str, int]:
+    full = 0
+    partial = 0
+    unsupported = 0
+    key = normalize_connector_device(device)
+    if key is None:
+        return {"full": 0, "partial": 0, "unsupported": 0}
+    for item in manifests:
+        scopes = item.get("scopes", []) if isinstance(item.get("scopes"), list) else []
+        profiles = item.get("deviceProfiles", {}) if isinstance(item.get("deviceProfiles"), dict) else {}
+        for scope in scopes:
+            profile = profiles.get(str(scope), {}) if isinstance(profiles.get(str(scope)), dict) else {}
+            support = str(profile.get(key, "unsupported")).strip().lower()
+            if support == "full":
+                full += 1
+            elif support == "partial":
+                partial += 1
+            else:
+                unsupported += 1
+    return {"full": full, "partial": partial, "unsupported": unsupported}
+
+
+def connector_scope_catalog() -> set[str]:
+    scopes: set[str] = set()
+    for item in CONNECTOR_MANIFESTS:
+        if not isinstance(item, dict):
+            continue
+        for scope in (item.get("scopes", []) if isinstance(item.get("scopes"), list) else []):
+            scope_norm = str(scope).strip().lower()
+            if scope_norm:
+                scopes.add(scope_norm)
+    return scopes
+
+
+def normalize_connector_scope(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def connector_vault_key_bytes() -> bytes:
+    return hashlib.sha256(CONNECTOR_VAULT_KEY.encode("utf-8")).digest()
+
+
+def xor_stream_cipher(data: bytes, key: bytes, nonce: bytes) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < len(data):
+        block = hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(a ^ b for a, b in zip(data, out[: len(data)]))
+
+
+def encrypt_connector_vault(payload: dict[str, Any]) -> dict[str, Any]:
+    plain = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    key = connector_vault_key_bytes()
+    nonce = secrets.token_bytes(16)
+    cipher = xor_stream_cipher(plain, key, nonce)
+    mac = hmac.new(key, nonce + cipher, digestmod=hashlib.sha256).digest()
+    return {
+        "version": 1,
+        "alg": "xor-sha256-hmac-v1",
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ct": base64.b64encode(cipher).decode("ascii"),
+        "mac": base64.b64encode(mac).decode("ascii"),
+    }
+
+
+def decrypt_connector_vault(blob: dict[str, Any]) -> dict[str, Any]:
+    nonce = base64.b64decode(str(blob.get("nonce", "")).encode("ascii"))
+    cipher = base64.b64decode(str(blob.get("ct", "")).encode("ascii"))
+    mac = base64.b64decode(str(blob.get("mac", "")).encode("ascii"))
+    key = connector_vault_key_bytes()
+    expected = hmac.new(key, nonce + cipher, digestmod=hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("connector vault integrity check failed")
+    plain = xor_stream_cipher(cipher, key, nonce)
+    data = json.loads(plain.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("connector vault payload invalid")
+    return data
+
+
+def ensure_connector_vault_shape(payload: dict[str, Any] | None) -> dict[str, Any]:
+    state = payload if isinstance(payload, dict) else {}
+    grants = state.get("grants", {}) if isinstance(state.get("grants"), dict) else {}
+    secrets_map = state.get("secrets", {}) if isinstance(state.get("secrets"), dict) else {}
+    clean_grants: dict[str, Any] = {}
+    for scope, item in grants.items():
+        scope_norm = normalize_connector_scope(str(scope))
+        if not scope_norm or not isinstance(item, dict):
+            continue
+        clean_grants[scope_norm] = {
+            "granted": bool(item.get("granted", False)),
+            "grantedAt": int(item.get("grantedAt", 0) or 0),
+            "expiresAt": int(item.get("expiresAt", 0) or 0),
+        }
+    clean_secrets: dict[str, str] = {}
+    for key, value in secrets_map.items():
+        k = str(key).strip().lower()
+        if not k:
+            continue
+        clean_secrets[k] = str(value)
+    return {
+        "version": 1,
+        "grants": clean_grants,
+        "secrets": clean_secrets,
+        "updatedAt": int(state.get("updatedAt", 0) or 0),
+    }
+
+
+def load_connector_vault_from_disk_sync() -> None:
+    global CONNECTOR_VAULT
+    if not CONNECTOR_VAULT_PATH.exists():
+        CONNECTOR_VAULT = default_connector_vault_state()
+        return
+    try:
+        raw = json.loads(CONNECTOR_VAULT_PATH.read_text(encoding="utf-8"))
+        payload = decrypt_connector_vault(raw) if isinstance(raw, dict) and raw.get("ct") else raw
+        CONNECTOR_VAULT = ensure_connector_vault_shape(payload if isinstance(payload, dict) else {})
+    except Exception:
+        CONNECTOR_VAULT = default_connector_vault_state()
+
+
+def persist_connector_vault_to_disk_sync() -> bool:
+    try:
+        CONNECTOR_VAULT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        state = ensure_connector_vault_shape(CONNECTOR_VAULT)
+        state["updatedAt"] = now_ms()
+        CONNECTOR_VAULT.update(state)
+        blob = encrypt_connector_vault(state)
+        CONNECTOR_VAULT_PATH.write_text(json.dumps(blob, separators=(",", ":")), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+# ── MCP Server Registry ────────────────────────────────────────────────────────
+
+def is_safe_mcp_url(url: str) -> tuple[bool, str]:
+    """Validate that a URL is safe to use as an MCP server endpoint.
+    Returns (ok, reason). Enforces HTTPS, blocks private/internal networks."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "invalid URL"
+    if parsed.scheme != "https":
+        return False, "only HTTPS URLs are allowed"
+    host = str(parsed.hostname or "").strip().lower()
+    if not host:
+        return False, "missing host"
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return False, "loopback/localhost addresses not allowed"
+    # Block AWS/GCP/Azure metadata endpoints
+    if host in {"169.254.169.254", "metadata.google.internal", "169.254.170.2"}:
+        return False, "metadata endpoints not allowed"
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return False, "private/internal IP addresses not allowed"
+    except ValueError:
+        pass  # hostname, not IP — that's fine
+    # Only allow standard HTTPS port or explicit 443/8443
+    port = parsed.port
+    if port is not None and port not in {443, 8443}:
+        return False, f"port {port} not allowed (use 443 or 8443)"
+    return True, ""
+
+
+def _sanitize_tool_text(text: str) -> str:
+    """Strip prompt-injection patterns from tool names/descriptions before scoring."""
+    text = re.sub(r"[<>`]", "", text)
+    text = re.sub(r"(?i)(ignore|disregard|system\s+prompt|you\s+are\s+now|act\s+as)", "", text)
+    return text.strip()[:512]
+
+
+def _normalize_mcp_content(content_raw: list) -> list[dict[str, Any]]:
+    """Normalize MCP content array — only text and validated-HTTPS image types allowed."""
+    content: list[dict[str, Any]] = []
+    for item in content_raw[:20]:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "text"))
+        if item_type == "text":
+            content.append({"type": "text", "text": html.escape(str(item.get("text", "")))[:8192]})
+        elif item_type == "image":
+            img_url = str(item.get("url", ""))
+            safe, _ = is_safe_mcp_url(img_url) if img_url.startswith("https://") else (False, "")
+            if safe:
+                content.append({"type": "image", "url": img_url})
+    return content
+
+
+# ── MCP stdio transport ───────────────────────────────────────────────────────
+
+async def _mcp_stdio_rpc(proc_info: dict[str, Any], method: str, params: dict, req_id: int | None, timeout: float = 10.0) -> dict[str, Any]:
+    """Send a JSON-RPC message to a stdio subprocess and wait for the matching response."""
+    msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+    if req_id is not None:
+        msg["id"] = req_id
+    line = (json.dumps(msg) + "\n").encode()
+    proc = proc_info["proc"]
+    proc.stdin.write(line)
+    await proc.stdin.drain()
+    if req_id is None:
+        return {}  # notification — no response expected
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(f"MCP stdio timeout waiting for id={req_id}")
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"MCP stdio timeout waiting for id={req_id}")
+        if not raw:
+            raise RuntimeError("MCP stdio process closed stdout unexpectedly")
+        raw_str = raw.decode("utf-8", errors="replace").strip()
+        if not raw_str:
+            continue
+        try:
+            resp = json.loads(raw_str)
+        except json.JSONDecodeError:
+            continue  # skip non-JSON lines (startup logs, etc.)
+        if isinstance(resp, dict) and resp.get("id") == req_id:
+            return resp
+
+
+async def _spawn_mcp_stdio_server(server_id: str, name: str, command: str, args: list[str], env_extra: dict[str, str]) -> list[dict[str, Any]]:
+    """Spawn an MCP stdio server subprocess, run the init handshake, return its tools."""
+    import os as _os
+    env = dict(_os.environ)
+    env.update(env_extra)
+    proc = await asyncio.create_subprocess_exec(
+        command, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+    )
+    proc_info: dict[str, Any] = {"proc": proc, "lock": asyncio.Lock(), "_id": 1}
+    # MCP handshake: initialize → initialized notification → tools/list
+    await _mcp_stdio_rpc(proc_info, "initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "GenomeUI", "version": "1.0"},
+    }, req_id=1, timeout=8.0)
+    await _mcp_stdio_rpc(proc_info, "notifications/initialized", {}, req_id=None, timeout=5.0)
+    tools_resp = await _mcp_stdio_rpc(proc_info, "tools/list", {}, req_id=2, timeout=8.0)
+    tools_raw = tools_resp.get("result", {}).get("tools", []) if isinstance(tools_resp.get("result"), dict) else []
+    tools: list[dict[str, Any]] = []
+    for t in tools_raw[:50]:
+        if not isinstance(t, dict):
+            continue
+        tools.append({
+            "name": _sanitize_tool_text(str(t.get("name", ""))),
+            "description": _sanitize_tool_text(str(t.get("description", ""))),
+            "inputSchema": t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {},
+        })
+    MCP_STDIO_PROCESSES[server_id] = proc_info
+    return tools
+
+
+async def _call_mcp_stdio_tool(server_id: str, tool_name: str, arguments: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+    """Invoke a tool on a running stdio MCP server subprocess."""
+    proc_info = MCP_STDIO_PROCESSES.get(server_id)
+    if not proc_info or proc_info["proc"].returncode is not None:
+        raise RuntimeError(f"MCP stdio server '{server_id}' is not running")
+    async with proc_info["lock"]:
+        proc_info["_id"] += 1
+        req_id = proc_info["_id"]
+        resp = await _mcp_stdio_rpc(proc_info, "tools/call", {
+            "name": str(tool_name)[:128],
+            "arguments": arguments,
+        }, req_id=req_id, timeout=timeout)
+    result = resp.get("result", {}) if isinstance(resp.get("result"), dict) else {}
+    content_raw = result.get("content", []) if isinstance(result.get("content"), list) else []
+    return {"content": _normalize_mcp_content(content_raw), "isError": bool(result.get("isError", False))}
+
+
+# ── MCP HTTP transport ────────────────────────────────────────────────────────
+
+async def _call_mcp_http_tool(server_url: str, tool_name: str, arguments: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+    """Invoke a tool on an HTTP MCP server via JSON-RPC."""
+    ok, reason = is_safe_mcp_url(server_url)
+    if not ok:
+        raise ValueError(f"Unsafe MCP server URL: {reason}")
+    payload = {"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": str(tool_name)[:128], "arguments": arguments}, "id": 1}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(server_url, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        if len(resp.content) > 131072:
+            raise ValueError("MCP HTTP response exceeds 128 KB limit")
+        if "json" not in resp.headers.get("content-type", ""):
+            raise ValueError("MCP HTTP server returned non-JSON content-type")
+        data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"MCP HTTP error: {data['error'].get('message', 'unknown')}")
+    result = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
+    content_raw = result.get("content", []) if isinstance(result.get("content"), list) else []
+    return {"content": _normalize_mcp_content(content_raw), "isError": bool(result.get("isError", False))}
+
+
+# ── MCP unified dispatcher ────────────────────────────────────────────────────
+
+async def call_mcp_server_tool(server_id: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Call an MCP tool on any registered server, dispatching by transport."""
+    server = MCP_SERVER_REGISTRY.get(server_id, {})
+    transport = str(server.get("transport", "stdio"))
+    if transport == "stdio":
+        return await _call_mcp_stdio_tool(server_id, tool_name, arguments)
+    else:
+        return await _call_mcp_http_tool(str(server.get("url", "")), tool_name, arguments)
+
+
+# ── MCP config loading (from .mcp.json) ──────────────────────────────────────
+
+async def load_mcp_servers_from_config() -> None:
+    """Read .mcp.json and connect to all defined MCP servers automatically."""
+    config_path = MCP_CONFIG_PATH
+    if not config_path.exists():
+        return
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    servers = raw.get("mcpServers", {}) if isinstance(raw, dict) else {}
+    if not isinstance(servers, dict):
+        return
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            continue
+        server_id = re.sub(r"[^a-z0-9_-]", "_", str(name).lower())[:32]
+        now = now_ms()
+        try:
+            if "command" in cfg:
+                # stdio transport
+                command = str(cfg["command"])
+                args = [str(a) for a in (cfg.get("args") or [])]
+                env_extra = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
+                tools = await _spawn_mcp_stdio_server(server_id, name, command, args, env_extra)
+                transport = "stdio"
+                url = ""
+            elif "url" in cfg:
+                # HTTP transport — validate URL before connecting
+                url = str(cfg["url"])
+                safe, reason = is_safe_mcp_url(url)
+                if not safe:
+                    continue
+                payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                    resp.raise_for_status()
+                    data = resp.json()
+                tools_raw = data.get("result", {}).get("tools", []) if isinstance(data.get("result"), dict) else []
+                tools = [{"name": _sanitize_tool_text(str(t.get("name", ""))),
+                          "description": _sanitize_tool_text(str(t.get("description", ""))),
+                          "inputSchema": t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}}
+                         for t in tools_raw[:50] if isinstance(t, dict)]
+                transport = "http"
+            else:
+                continue
+            async with MCP_REGISTRY_LOCK:
+                MCP_SERVER_REGISTRY[server_id] = {
+                    "id": server_id,
+                    "name": name,
+                    "url": url,
+                    "transport": transport,
+                    "tools": tools,
+                    "status": "active",
+                    "registeredAt": now,
+                    "error": None,
+                }
+        except Exception as exc:
+            async with MCP_REGISTRY_LOCK:
+                MCP_SERVER_REGISTRY[server_id] = {
+                    "id": server_id,
+                    "name": name,
+                    "url": "",
+                    "transport": cfg.get("command", "") and "stdio" or "http",
+                    "tools": [],
+                    "status": "error",
+                    "registeredAt": now,
+                    "error": str(exc)[:256],
+                }
+
+
+async def shutdown_mcp_stdio_servers() -> None:
+    """Terminate all running MCP stdio subprocess handles."""
+    for server_id, proc_info in list(MCP_STDIO_PROCESSES.items()):
+        try:
+            proc = proc_info["proc"]
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+        except Exception:
+            pass
+    MCP_STDIO_PROCESSES.clear()
+
+
+# ── MCP intent matching ───────────────────────────────────────────────────────
+
+_MCP_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "it", "to", "of", "in", "for", "and", "or",
+    "my", "me", "i", "show", "get", "find", "check", "what", "how", "can",
+    "please", "with", "from", "on", "at", "by", "be", "do", "does", "did",
+})
+
+
+def score_mcp_tool_match(intent_text: str, tool_name: str, tool_description: str) -> float:
+    """Keyword overlap score (0.0–1.0) between user intent and a tool's name+description."""
+    intent_words = set(re.findall(r"\b\w+\b", intent_text.lower())) - _MCP_STOPWORDS
+    tool_words = set(re.findall(r"\b\w+\b", (tool_name + " " + tool_description).lower())) - _MCP_STOPWORDS
+    if not intent_words or not tool_words:
+        return 0.0
+    return len(intent_words & tool_words) / len(intent_words)
+
+
+def find_best_mcp_tool(intent_text: str) -> tuple[str | None, str | None, float]:
+    """Find the best matching MCP tool for a user intent across all active servers.
+    Returns (server_id, tool_name, score) or (None, None, 0.0)."""
+    best: tuple[str | None, str | None, float] = (None, None, 0.0)
+    for server_id, server in MCP_SERVER_REGISTRY.items():
+        if server.get("status") != "active":
+            continue
+        for tool in server.get("tools", []):
+            score = score_mcp_tool_match(
+                intent_text,
+                str(tool.get("name", "")),
+                str(tool.get("description", "")),
+            )
+            if score > best[2]:
+                best = (server_id, str(tool.get("name", "")), score)
+    return best
+
+
+# ── End MCP Server Registry ───────────────────────────────────────────────────
+
+
+def connector_scope_granted(scope: str) -> bool:
+    scope_norm = normalize_connector_scope(scope)
+    grant = CONNECTOR_VAULT.get("grants", {}).get(scope_norm) if isinstance(CONNECTOR_VAULT.get("grants"), dict) else None
+    if not isinstance(grant, dict):
+        return False
+    if not bool(grant.get("granted", False)):
+        return False
+    expires_at = int(grant.get("expiresAt", 0) or 0)
+    if expires_at > 0 and now_ms() > expires_at:
+        return False
+    return True
+
+
+def connector_grant_scope(scope: str, ttl_ms: int = 0) -> dict[str, Any]:
+    scope_norm = normalize_connector_scope(scope)
+    grants = CONNECTOR_VAULT.setdefault("grants", {})
+    now = now_ms()
+    expires_at = now + int(ttl_ms) if int(ttl_ms) > 0 else 0
+    grants[scope_norm] = {"granted": True, "grantedAt": now, "expiresAt": expires_at}
+    CONNECTOR_VAULT["updatedAt"] = now
+    ok = persist_connector_vault_to_disk_sync()
+    return {"scope": scope_norm, "granted": True, "expiresAt": expires_at, "persisted": ok}
+
+
+def connector_revoke_scope(scope: str) -> dict[str, Any]:
+    scope_norm = normalize_connector_scope(scope)
+    grants = CONNECTOR_VAULT.setdefault("grants", {})
+    existed = scope_norm in grants
+    if existed:
+        grants.pop(scope_norm, None)
+    CONNECTOR_VAULT["updatedAt"] = now_ms()
+    ok = persist_connector_vault_to_disk_sync()
+    return {"scope": scope_norm, "revoked": bool(existed), "persisted": ok}
+
+
+def connector_grants_report() -> dict[str, Any]:
+    catalog = sorted(connector_scope_catalog())
+    grants = CONNECTOR_VAULT.get("grants", {}) if isinstance(CONNECTOR_VAULT.get("grants"), dict) else {}
+    items: list[dict[str, Any]] = []
+    for scope in catalog:
+        grant = grants.get(scope, {}) if isinstance(grants.get(scope), dict) else {}
+        granted = connector_scope_granted(scope)
+        items.append(
+            {
+                "scope": scope,
+                "granted": granted,
+                "grantedAt": int(grant.get("grantedAt", 0) or 0),
+                "expiresAt": int(grant.get("expiresAt", 0) or 0),
+            }
+        )
+    granted_count = sum(1 for item in items if bool(item.get("granted", False)))
+    return {"count": len(items), "granted": granted_count, "items": items}
+
+
+def connector_secret_get(key: str) -> str:
+    k = str(key or "").strip().lower()
+    if not k:
+        return ""
+    secrets_map = CONNECTOR_VAULT.get("secrets", {}) if isinstance(CONNECTOR_VAULT.get("secrets"), dict) else {}
+    return str(secrets_map.get(k, "") or "")
+
+
+def connector_secret_set(key: str, value: str) -> dict[str, Any]:
+    k = str(key or "").strip().lower()
+    if not k:
+        return {"ok": False, "key": "", "persisted": False}
+    secrets_map = CONNECTOR_VAULT.setdefault("secrets", {})
+    secrets_map[k] = str(value or "")
+    CONNECTOR_VAULT["updatedAt"] = now_ms()
+    ok = persist_connector_vault_to_disk_sync()
+    return {"ok": True, "key": k, "persisted": ok}
+
+
+def connector_secret_remove(key: str) -> dict[str, Any]:
+    k = str(key or "").strip().lower()
+    if not k:
+        return {"ok": False, "key": "", "removed": False, "persisted": False}
+    secrets_map = CONNECTOR_VAULT.setdefault("secrets", {})
+    removed = k in secrets_map
+    if removed:
+        secrets_map.pop(k, None)
+    CONNECTOR_VAULT["updatedAt"] = now_ms()
+    ok = persist_connector_vault_to_disk_sync()
+    return {"ok": True, "key": k, "removed": bool(removed), "persisted": ok}
+
+
+def connector_secret_provider_value(env_key: str, vault_key: str) -> str:
+    env_val = str(os.getenv(env_key, "") or "").strip()
+    if env_val:
+        return env_val
+    return connector_secret_get(vault_key)
+
+
+def connector_secret_status(keys: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for key in keys:
+        val = connector_secret_get(key)
+        out.append({"key": key, "configured": bool(val)})
+    return out
+
+
+def weather_fallback_snapshot(location: str) -> dict[str, Any]:
+    seed = int(hashlib.sha256(location.lower().encode("utf-8")).hexdigest()[:8], 16)
+    temp_f = 45 + (seed % 45)
+    wind_mph = 2 + (seed % 18)
+    states = ["clear", "partly cloudy", "light rain", "overcast", "windy"]
+    condition = states[seed % len(states)]
+    hourly = weather_fallback_hourly(location, float(temp_f), condition, float(wind_mph))
+    return {
+        "ok": True,
+        "source": "fallback",
+        "location": location,
+        "temperatureF": int(temp_f),
+        "windMph": int(wind_mph),
+        "condition": condition,
+        "hourly": hourly,
+    }
+
+
+def weather_fallback_hourly(location: str, base_temp_f: float, condition: str, base_wind_mph: float, hours: int = 12) -> list[dict[str, Any]]:
+    seed = int(hashlib.sha256(f"{location.lower()}|{condition.lower()}".encode("utf-8")).hexdigest()[:8], 16)
+    cond = str(condition or "").lower()
+    precip_base = 45 if "rain" in cond else 28 if "overcast" in cond else 8 if "clear" in cond else 18
+    out: list[dict[str, Any]] = []
+    for idx in range(max(1, min(int(hours), 24))):
+        wobble = ((seed >> (idx % 8)) & 7) - 3
+        swing = math.sin((idx / 6.0) * math.pi) * 5.0
+        temp = float(base_temp_f) + swing + float(wobble)
+        wind = max(0.0, float(base_wind_mph) + ((seed >> (idx % 6)) & 3) - 1)
+        precip = int(max(0, min(100, precip_base + wobble * 4 + (12 if idx >= 6 else 0))))
+        out.append(
+            {
+                "hourOffset": int(idx),
+                "hourLabel": f"+{idx}h",
+                "tempF": round(temp, 1),
+                "windMph": round(wind, 1),
+                "precipChance": int(precip),
+                "condition": condition,
+            }
+        )
+    return out
+
+
+def weather_mock_snapshot(location: str) -> dict[str, Any]:
+    query = str(location or "").strip()
+    if not query:
+        query = "New York"
+    key = query.lower()
+    hit = MOCK_WEATHER_DATA.get(key)
+    if hit is None:
+        hit = weather_fallback_snapshot(query)
+        return {
+            "ok": True,
+            "source": "mock-fallback",
+            "location": str(hit.get("location", query)),
+            "temperatureF": float(hit.get("temperatureF", 0.0) or 0.0),
+            "windMph": float(hit.get("windMph", 0.0) or 0.0),
+            "condition": str(hit.get("condition", "unknown")),
+            "hourly": weather_fallback_hourly(
+                str(hit.get("location", query)),
+                float(hit.get("temperatureF", 0.0) or 0.0),
+                str(hit.get("condition", "unknown")),
+                float(hit.get("windMph", 0.0) or 0.0),
+            ),
+        }
+    location_name = str(hit.get("location", query))
+    temperature = float(hit.get("temperatureF", 0.0) or 0.0)
+    wind = float(hit.get("windMph", 0.0) or 0.0)
+    condition = str(hit.get("condition", "unknown"))
+    return {
+        "ok": True,
+        "source": "mock",
+        "location": location_name,
+        "temperatureF": temperature,
+        "windMph": wind,
+        "condition": condition,
+        "hourly": weather_fallback_hourly(location_name, temperature, condition, wind),
+    }
+
+
+def normalize_connector_provider_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"auto", "live", "mock"} else "auto"
+
+
+def normalize_connector_service_mode(value: str, default: str = "scaffold") -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"scaffold", "mock", "live"} else default
+
+
+def provider_adapter_settings(base_url_env: str, token_env: str, token_vault_key: str) -> tuple[str, str]:
+    base_url = str(os.getenv(base_url_env, "") or "").strip().rstrip("/")
+    token = connector_secret_provider_value(token_env, token_vault_key)
+    return base_url, token
+
+
+def provider_client_json_request(
+    method: str,
+    base_url: str,
+    path: str,
+    token: str,
+    params: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any], str]:
+    if not base_url or not token:
+        return False, {}, "not_configured"
+    try:
+        url = f"{base_url}{path}"
+        headers: dict[str, str] = {"authorization": f"Bearer {token}"}
+        if payload is not None:
+            headers["content-type"] = "application/json"
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.request(
+                method.upper(),
+                url,
+                params=params,
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data = body if isinstance(body, dict) else {}
+        return True, data, ""
+    except Exception:
+        return False, {}, "request_failed"
+
+
+def banking_balance_snapshot(provider_mode: str | None = None) -> dict[str, Any]:
+    mode = normalize_connector_service_mode(provider_mode or BANKING_PROVIDER_MODE, default="scaffold")
+    if mode == "live":
+        base_url, token = provider_adapter_settings("BANKING_API_BASE_URL", "BANKING_API_TOKEN", "banking.api.token")
+        ok, payload, error_code = provider_client_json_request("GET", base_url, "/balance", token)
+        if not ok and error_code == "not_configured":
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "banking provider adapter not configured",
+            }
+        if not ok:
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "banking provider request failed",
+            }
+        return {
+            "ok": True,
+            "source": "live",
+            "currency": str(payload.get("currency", "USD")),
+            "available": float(payload.get("available", 0.0) or 0.0),
+            "ledger": float(payload.get("ledger", 0.0) or 0.0),
+            "asOf": str(payload.get("asOf", "")),
+        }
+    bal = MOCK_BANK_BALANCE
+    source = "mock" if mode == "mock" else "scaffold"
+    return {
+        "ok": True,
+        "source": source,
+        "currency": str(bal.get("currency", "USD")),
+        "available": float(bal.get("available", 0.0) or 0.0),
+        "ledger": float(bal.get("ledger", 0.0) or 0.0),
+        "asOf": str(bal.get("asOf", "")),
+    }
+
+
+def banking_transactions_snapshot(limit: int = 5, provider_mode: str | None = None) -> dict[str, Any]:
+    mode = normalize_connector_service_mode(provider_mode or BANKING_PROVIDER_MODE, default="scaffold")
+    capped = max(1, min(int(limit or 5), 20))
+    if mode == "live":
+        base_url, token = provider_adapter_settings("BANKING_API_BASE_URL", "BANKING_API_TOKEN", "banking.api.token")
+        ok, payload, error_code = provider_client_json_request(
+            "GET",
+            base_url,
+            "/transactions",
+            token,
+            params={"limit": capped},
+        )
+        if not ok and error_code == "not_configured":
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "banking provider adapter not configured",
+                "items": [],
+            }
+        if not ok:
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "banking provider request failed",
+                "items": [],
+            }
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+        return {
+            "ok": True,
+            "source": "live",
+            "items": [item for item in items if isinstance(item, dict)][:capped],
+        }
+    source = "mock" if mode == "mock" else "scaffold"
+    return {
+        "ok": True,
+        "source": source,
+        "items": copy.deepcopy(MOCK_BANK_TRANSACTIONS[:capped]),
+    }
+
+
+def social_feed_snapshot(provider_mode: str | None = None) -> dict[str, Any]:
+    mode = normalize_connector_service_mode(provider_mode or SOCIAL_PROVIDER_MODE, default="scaffold")
+    if mode == "live":
+        base_url, token = provider_adapter_settings("SOCIAL_API_BASE_URL", "SOCIAL_API_TOKEN", "social.api.token")
+        ok, payload, error_code = provider_client_json_request("GET", base_url, "/feed", token)
+        if not ok and error_code == "not_configured":
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "social provider adapter not configured",
+                "items": [],
+            }
+        if not ok:
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "social provider request failed",
+                "items": [],
+            }
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+        return {
+            "ok": True,
+            "source": "live",
+            "items": [item for item in items if isinstance(item, dict)][:20],
+        }
+    source = "mock" if mode == "mock" else "scaffold"
+    return {
+        "ok": True,
+        "source": source,
+        "items": copy.deepcopy(MOCK_SOCIAL_FEED),
+    }
+
+
+def social_send_snapshot(text: str, provider_mode: str | None = None) -> dict[str, Any]:
+    mode = normalize_connector_service_mode(provider_mode or SOCIAL_PROVIDER_MODE, default="scaffold")
+    trimmed = str(text or "")[:280]
+    if mode == "live":
+        base_url, token = provider_adapter_settings("SOCIAL_API_BASE_URL", "SOCIAL_API_TOKEN", "social.api.token")
+        ok, _, error_code = provider_client_json_request("POST", base_url, "/messages", token, payload={"text": trimmed})
+        if not ok and error_code == "not_configured":
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "social provider adapter not configured",
+            }
+        if not ok:
+            return {
+                "ok": False,
+                "source": "live",
+                "error": "social provider request failed",
+            }
+        return {
+            "ok": True,
+            "source": "live",
+            "delivery": "queued",
+            "message": trimmed,
+        }
+    source = "mock" if mode == "mock" else "scaffold"
+    return {
+        "ok": True,
+        "source": source,
+        "delivery": "queued",
+        "message": trimmed,
+    }
+
+
+def web_fetch_snapshot(url: str, provider_mode: str | None = None) -> dict[str, Any]:
+    mode = normalize_connector_service_mode(provider_mode or WEB_PROVIDER_MODE, default="scaffold")
+    target = str(url or "").strip()
+    if mode == "live":
+        try:
+            with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+                resp = client.get(target)
+            content_type = str(resp.headers.get("content-type", "")).lower()
+            body = resp.text if "text" in content_type or "json" in content_type or not content_type else ""
+            title = ""
+            excerpt = ""
+            favicon = ""
+            thumbnail = ""
+            if body:
+                title_m = re.search(r"<title[^>]*>([^<]{1,220})</title>", body, re.IGNORECASE)
+                if title_m:
+                    title = html.unescape(title_m.group(1).strip())
+                desc_m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{1,300})', body, re.IGNORECASE)
+                if not desc_m:
+                    desc_m = re.search(r'content=["\']([^"\']{20,300})["\'][^>]+name=["\']description["\']', body, re.IGNORECASE)
+                if desc_m:
+                    excerpt = html.unescape(desc_m.group(1).strip())
+                else:
+                    stripped = re.sub(r"<[^>]+>", " ", body[:2000])
+                    excerpt = re.sub(r"\s+", " ", stripped).strip()[:240]
+                fav_m = re.search(r'<link[^>]+rel=["\'](?:shortcut )?icon["\'][^>]+href=["\']([^"\']+)', body, re.IGNORECASE)
+                thumb_m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', body, re.IGNORECASE)
+                if not thumb_m:
+                    thumb_m = re.search(r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)', body, re.IGNORECASE)
+                if thumb_m:
+                    raw_thumb = html.unescape(thumb_m.group(1).strip())
+                    if raw_thumb.startswith("http"):
+                        thumbnail = raw_thumb
+                    else:
+                        pu = urlparse(target)
+                        thumbnail = f"{pu.scheme}://{pu.netloc}{raw_thumb if raw_thumb.startswith('/') else '/' + raw_thumb}"
+                if fav_m:
+                    raw_fav = fav_m.group(1).strip()
+                    if raw_fav.startswith("http"):
+                        favicon = raw_fav
+                    else:
+                        pu = urlparse(target)
+                        favicon = f"{pu.scheme}://{pu.netloc}{raw_fav if raw_fav.startswith('/') else '/' + raw_fav}"
+                else:
+                    pu = urlparse(target)
+                    favicon = f"{pu.scheme}://{pu.netloc}/favicon.ico"
+            return {
+                "ok": True,
+                "source": "live",
+                "url": target,
+                "statusCode": int(resp.status_code),
+                "body": body,
+                "title": title,
+                "excerpt": excerpt,
+                "favicon": favicon,
+                "thumbnail": thumbnail,
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "source": "live",
+                "url": target,
+                "statusCode": 0,
+                "body": "",
+                "error": "web provider request failed",
+            }
+    key = target.lower().rstrip("/")
+    body = MOCK_WEB_PAGES.get(key)
+    if body is None:
+        body = f"Web preview unavailable for {target}.\nTry: fetch url https://example.com"
+    source = "mock" if mode == "mock" else "scaffold"
+    return {
+        "ok": True,
+        "source": source,
+        "url": target,
+        "statusCode": 200,
+        "body": body,
+        "title": "",
+        "excerpt": body[:160] if body else "",
+        "favicon": "",
+        "thumbnail": "",
+    }
+
+
+def summarize_web_text(body: str) -> list[str]:
+    text = str(body or "").strip()
+    if not text:
+        return ["summary: no readable content"]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(line)
+        if len(unique) >= 5:
+            break
+    if not unique:
+        return ["summary: no readable content"]
+    out = [f"summary: {unique[0][:140]}"]
+    for line in unique[1:4]:
+        out.append(f"- {line[:140]}")
+    return out[:4]
+
+
+def web_result_preview(url: str) -> dict[str, str]:
+    raw = str(url or "").strip()
+    if not raw:
+        return {"host": "", "favicon": "", "thumbnail": ""}
+    try:
+        parsed = urlparse(raw)
+        host = str(parsed.netloc or "").lower().removeprefix("www.")
+        if not host:
+            return {"host": "", "favicon": "", "thumbnail": ""}
+    except Exception:
+        return {"host": "", "favicon": "", "thumbnail": ""}
+
+    cache_key = raw.lower().strip()
+    now = _time.monotonic()
+    cached = _WEB_PREVIEW_CACHE.get(cache_key)
+    if cached and (now - float(cached[0])) < _WEB_PREVIEW_CACHE_TTL_S:
+        return dict(cached[1])
+
+    favicon = f"{parsed.scheme or 'https'}://{parsed.netloc}/favicon.ico"
+    thumbnail = ""
+    try:
+        with httpx.Client(timeout=2.2, follow_redirects=True) as client:
+            resp = client.get(raw, headers={"User-Agent": "GenomeUI/1.0 (webdeck preview)"})
+        if int(resp.status_code) == 200:
+            body = str(resp.text or "")[:22000]
+            og_image = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', body, re.IGNORECASE)
+            tw_image = re.search(r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)', body, re.IGNORECASE)
+            icon = re.search(r'<link[^>]+rel=["\'](?:shortcut )?icon["\'][^>]+href=["\']([^"\']+)', body, re.IGNORECASE)
+            raw_image = html.unescape(str((og_image or tw_image).group(1) if (og_image or tw_image) else "")).strip()
+            raw_icon = html.unescape(str(icon.group(1) if icon else "")).strip()
+            if raw_image:
+                thumbnail = raw_image if raw_image.startswith("http") else f"{parsed.scheme or 'https'}://{parsed.netloc}{raw_image if raw_image.startswith('/') else '/' + raw_image}"
+            if raw_icon:
+                favicon = raw_icon if raw_icon.startswith("http") else f"{parsed.scheme or 'https'}://{parsed.netloc}{raw_icon if raw_icon.startswith('/') else '/' + raw_icon}"
+    except Exception:
+        pass
+
+    result = {"host": host, "favicon": favicon, "thumbnail": thumbnail}
+    _WEB_PREVIEW_CACHE[cache_key] = (now, result)
+    return result
+
+
+def web_search_snapshot(query: str) -> dict[str, Any]:
+    q = str(query or "").strip()
+    if not q:
+        return {"ok": False, "source": "scaffold", "error": "query required", "items": []}
+    now = _time.monotonic()
+    cache_key = q.lower().strip()
+    if cache_key in _WEB_SEARCH_CACHE:
+        cached_at, cached_result = _WEB_SEARCH_CACHE[cache_key]
+        if now - cached_at < _WEB_SEARCH_CACHE_TTL_S:
+            return cached_result
+    try:
+        with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+            resp = client.get(
+                "https://api.duckduckgo.com/",
+                params={"q": q, "format": "json", "no_redirect": "1", "no_html": "1", "skip_disambig": "1"},
+                headers={"User-Agent": "GenomeUI/1.0 (search interface)"},
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                items: list[dict[str, str]] = []
+                abstract_text = str(data.get("AbstractText") or "").strip()
+                abstract_url = str(data.get("AbstractURL") or "").strip()
+                abstract_title = str(data.get("Heading") or q).strip()
+                if abstract_text and abstract_url:
+                    items.append({"title": abstract_title, "url": abstract_url, "snippet": abstract_text[:220]})
+                for topic in (data.get("RelatedTopics") or [])[:10]:
+                    if not isinstance(topic, dict):
+                        continue
+                    if "Topics" in topic:
+                        for sub in topic.get("Topics", [])[:3]:
+                            if not isinstance(sub, dict):
+                                continue
+                            text = str(sub.get("Text") or "").strip()
+                            url = str(sub.get("FirstURL") or "").strip()
+                            if text and url:
+                                items.append({"title": text[:80], "url": url, "snippet": text[:220]})
+                        continue
+                    text = str(topic.get("Text") or "").strip()
+                    url = str(topic.get("FirstURL") or "").strip()
+                    if text and url:
+                        items.append({"title": text[:80], "url": url, "snippet": text[:220]})
+                    if len(items) >= 8:
+                        break
+                if items:
+                    enriched: list[dict[str, str]] = []
+                    for item in items[:8]:
+                        if not isinstance(item, dict):
+                            continue
+                        preview = web_result_preview(str(item.get("url", "")))
+                        enriched.append(
+                            {
+                                "title": str(item.get("title", "")),
+                                "url": str(item.get("url", "")),
+                                "snippet": str(item.get("snippet", "")),
+                                "host": str(preview.get("host", "")),
+                                "favicon": str(preview.get("favicon", "")),
+                                "thumbnail": str(preview.get("thumbnail", "")),
+                            }
+                        )
+                    result = {"ok": True, "source": "duckduckgo", "query": q, "items": enriched}
+                    _WEB_SEARCH_CACHE[cache_key] = (now, result)
+                    return result
+    except Exception:
+        pass
+    key = q.lower()
+    seeds = [("Overview", "General reference"), ("Guide", "Step-by-step walkthrough"), ("Examples", "Practical examples")]
+    fallback_items = []
+    for idx, (suffix, snippet_prefix) in enumerate(seeds, start=1):
+        slug = re.sub(r"[^a-z0-9]+", "-", key).strip("-") or "query"
+        host = ["example.com", "example.org", "example.net"][idx - 1]
+        fallback_url = f"https://{host}/{slug}"
+        preview = web_result_preview(fallback_url)
+        fallback_items.append(
+            {
+                "title": f"{q} {suffix}",
+                "url": fallback_url,
+                "snippet": f"{snippet_prefix} for '{q}'.",
+                "host": str(preview.get("host", host)),
+                "favicon": str(preview.get("favicon", f"https://{host}/favicon.ico")),
+                "thumbnail": str(preview.get("thumbnail", "")),
+            }
+        )
+    return {"ok": True, "source": "scaffold", "query": q, "items": fallback_items}
+
+
+def contacts_lookup_snapshot(query: str = "") -> dict[str, Any]:
+    q = str(query or "").strip().lower()
+    if not q:
+        items = copy.deepcopy(MOCK_CONTACTS[:8])
+        return {"ok": True, "source": "scaffold", "items": items}
+    out: list[dict[str, str]] = []
+    for item in MOCK_CONTACTS:
+        name = str(item.get("name", "")).strip()
+        phone = str(item.get("phone", "")).strip()
+        label = str(item.get("label", "")).strip()
+        haystack = f"{name} {phone} {label}".lower()
+        if q in haystack:
+            out.append({"name": name, "phone": phone, "label": label})
+    return {"ok": True, "source": "scaffold", "items": out[:8]}
+
+
+def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, Any]:
+    q = str(query or "").strip().lower()
+    c = str(category or "").strip().lower()
+    if c in {"sneaker", "sneakers"}:
+        c = "shoes"
+    if c in {"clothes", "clothing", "fit"}:
+        c = "outfit"
+
+    def url_host(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            return str(urlparse(raw).netloc or "").lower().removeprefix("www.")
+        except Exception:
+            return ""
+
+    def normalize_token(value: str) -> str:
+        token = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+        if len(token) >= 4 and token.endswith("s"):
+            token = token[:-1]
+        aliases = {
+            "mens": "men",
+            "man": "men",
+            "male": "men",
+            "womens": "women",
+            "woman": "women",
+            "female": "women",
+            "sneaker": "shoe",
+            "sneakers": "shoe",
+            "pumas": "puma",
+            "nikes": "nike",
+            "adidases": "adidas",
+            "jordans": "jordan",
+            "newbalance": "newbalance",
+            "newbalances": "newbalance",
+            "new-balance": "newbalance",
+            "nb": "newbalance",
+        }
+        return aliases.get(token, token)
+
+    def collect_query_tokens(text: str) -> set[str]:
+        parts = [normalize_token(part) for part in re.split(r"\s+", text)]
+        stopwords = {"show", "me", "for", "in", "the", "a", "an", "please", "find", "look", "new", "size"}
+        return {token for token in parts if token and token not in stopwords and len(token) >= 2}
+
+    def collect_size_signals(text: str) -> set[str]:
+        out: set[str] = set()
+        raw = str(text or "").lower()
+        size_match = re.search(r"\bsize\s*(\d{1,2})(?:\s*(?:1/2|\.5|½))?\b", raw)
+        if size_match:
+            whole = int(size_match.group(1))
+            has_half = bool(re.search(r"(1/2|\.5|½)", size_match.group(0)))
+            out.add(f"size-{whole}-5" if has_half else f"size-{whole}")
+        half_match = re.search(r"\b(\d{1,2})\s*(?:1/2|\.5|½)\b", raw)
+        if half_match:
+            out.add(f"size-{int(half_match.group(1))}-5")
+        return out
+
+    query_tokens = collect_query_tokens(q)
+    size_tokens = collect_size_signals(q)
+    wants_men = bool(re.search(r"\b(men|mens|male|man)\b", q))
+    wants_women = bool(re.search(r"\b(women|womens|female|woman|ladies)\b", q))
+    normalized_query = " ".join(sorted(query_tokens))
+
+    known_brands = {
+        normalize_token(str(item.get("brand", "")))
+        for item in MOCK_SHOP_ITEMS
+        if isinstance(item, dict) and str(item.get("brand", "")).strip()
+    }
+    requested_brands = {brand for brand in known_brands if brand and brand in query_tokens}
+    # (label, url, brandTheme, brandPrimary, brandAccent)
+    brand_site_map: dict[str, tuple[str, str, str, str, str]] = {
+        "puma":       ("Puma",      "https://us.puma.com/us/en/men/shoes",                               "puma",      "#1d1d1b", "#00a651"),
+        "nike":       ("Nike",      "https://www.nike.com/w/mens-shoes-nik1zy7ok",                       "nike",      "#111111", "#f8941d"),
+        "adidas":     ("Adidas",    "https://www.adidas.com/us/men-shoes",                               "adidas",    "#000000", "#3d85c8"),
+        "reebok":     ("Reebok",    "https://www.reebok.com/c/100000068/men-shoes",                      "reebok",    "#cc0000", "#ffffff"),
+        "newbalance": ("New Balance","https://www.newbalance.com/men/shoes/",                            "newbalance","#cf102d", "#f2f2f2"),
+        "asics":      ("ASICS",     "https://www.asics.com/us/en-us/mens-shoes/c/aa10101000/",           "asics",     "#1a1a2e", "#e63946"),
+        "converse":   ("Converse",  "https://www.converse.com/shop/mens-shoes",                         "converse",  "#1a1a1a", "#e63946"),
+        "vans":       ("Vans",      "https://www.vans.com/en-us/shoes-c00081",                          "vans",      "#e63946", "#1a1a1a"),
+        "jordan":     ("Jordan",    "https://www.nike.com/w/jordan-shoes-37eefzy7ok",                   "jordan",    "#111111", "#c7482a"),
+    }
+
+    def select_direct_brand_from_query(text_query: str, candidates: set[str]) -> str:
+        raw = str(text_query or "").lower()
+        if not raw:
+            return ""
+        phrase_tokens = [
+            ("newbalance", [r"\bnew\s*balance\b", r"\bnb\b"]),
+            ("jordan", [r"\bjordan(?:s)?\b"]),
+            ("puma", [r"\bpuma(?:s)?\b"]),
+            ("nike", [r"\bnike(?:s)?\b"]),
+            ("adidas", [r"\badidas\b"]),
+            ("reebok", [r"\breebok\b"]),
+            ("asics", [r"\basics\b"]),
+            ("converse", [r"\bconverse\b"]),
+            ("vans", [r"\bvans\b"]),
+        ]
+        best_brand = ""
+        best_idx = 10**9
+        allowed = {b for b in candidates if b in brand_site_map}
+        for brand, patterns in phrase_tokens:
+            if brand not in allowed:
+                continue
+            for pattern in patterns:
+                m = re.search(pattern, raw)
+                if m and int(m.start()) < best_idx:
+                    best_idx = int(m.start())
+                    best_brand = brand
+                    break
+        return best_brand
+
+    def puma_live_search_snapshot(text_query: str, limit: int = 16) -> dict[str, Any]:
+        q_text = str(text_query or "").strip()
+        if not q_text:
+            return {"ok": False, "source": "puma-live", "items": [], "error": "query required"}
+        cache_key = f"puma:{q_text.lower().strip()}:{int(limit)}"
+        now = _time.monotonic()
+        cached = _SHOP_LIVE_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) < _SHOP_LIVE_CACHE_TTL_S:
+            return copy.deepcopy(cached[1])
+        search_url = f"https://us.puma.com/us/en/search?q={quote_plus(q_text)}"
+        try:
+            resp = httpx.get(
+                search_url,
+                timeout=10.0,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if int(resp.status_code) != 200:
+                return {"ok": False, "source": "puma-live", "items": [], "error": f"status {resp.status_code}"}
+            body = str(resp.text or "")
+        except httpx.TimeoutException:
+            return {"ok": False, "source": "puma-live", "items": [], "error": "fetch timeout"}
+        except Exception:
+            return {"ok": False, "source": "puma-live", "items": [], "error": "fetch failed"}
+
+        items_out: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for match in re.finditer(r'href="(/us/en/pd/[^"]+)"', body):
+            href_raw = html.unescape(str(match.group(1) or "")).replace("&amp;", "&").strip()
+            if not href_raw:
+                continue
+            url = f"https://us.puma.com{href_raw}" if href_raw.startswith("/") else href_raw
+            url_key = re.sub(r"[?#].*$", "", url)
+            if url_key in seen_urls:
+                continue
+            start = max(0, match.start() - 1400)
+            end = min(len(body), match.end() + 2600)
+            frag = body[start:end]
+            title_match = re.search(r'aria-label="([^"]+)"', frag)
+            img_match = re.search(r'(?:data-src|src)="(https://images\.puma\.com[^"]+)"', frag)
+            title_raw = html.unescape(str(title_match.group(1) if title_match else "")).strip()
+            title = re.sub(r",\s*(?:Discounted Price|Regular price|Price)[\s,].*?$", "", title_raw, flags=re.IGNORECASE).strip()
+            title = re.sub(r"^\d+\s+Colors?,\s*", "", title, flags=re.IGNORECASE).strip()
+            title = re.sub(r",?\s*\d+\s+Colors?$", "", title, flags=re.IGNORECASE).strip()
+            if not title or "results for" in title.lower():
+                slug = re.search(r"/us/en/pd/([^/?#]+)", url)
+                token = str(slug.group(1) if slug else "").replace("-", " ").strip()
+                title = token.title() if token else "Puma Product"
+            image_raw = html.unescape(str(img_match.group(1) if img_match else "")).replace("&amp;", "&").strip()
+            image_url = re.sub(r",w_\d+", ",w_600", image_raw) if image_raw else ""
+            if not image_url:
+                continue
+            price_match = re.search(r"\$([0-9]+(?:\.[0-9]{2})?)", title_raw)
+            price_usd = float(price_match.group(1)) if price_match else 0.0
+            seen_urls.add(url_key)
+            items_out.append(
+                {
+                    "id": f"puma-live-{len(items_out) + 1}",
+                    "title": title,
+                    "category": "shoes",
+                    "brand": "Puma",
+                    "priceUsd": price_usd,
+                    "imageUrl": image_url,
+                    "url": url,
+                    "sourceHost": url_host(url),
+                }
+            )
+            if len(items_out) >= max(1, min(limit, 24)):
+                break
+        result = {"ok": bool(items_out), "source": "puma-live", "items": items_out, "query": q_text}
+        if bool(result["ok"]):
+            _SHOP_LIVE_CACHE[cache_key] = (now, copy.deepcopy(result))
+        return result
+
+    out: list[dict[str, Any]] = []
+    for item in MOCK_SHOP_ITEMS:
+        if not isinstance(item, dict):
+            continue
+        item_cat = str(item.get("category", "")).strip().lower()
+        if c and item_cat != c:
+            continue
+        title = str(item.get("title", "")).strip()
+        brand = str(item.get("brand", "")).strip()
+        tags = [str(tag).strip().lower() for tag in (item.get("tags", []) if isinstance(item.get("tags"), list) else [])]
+
+        brand_norm = normalize_token(brand)
+        if requested_brands and brand_norm not in requested_brands:
+            continue
+
+        item_tokens: set[str] = set()
+        for part in [title, brand, item_cat, *tags]:
+            for sub in re.split(r"\s+", str(part or "")):
+                token = normalize_token(sub)
+                if token:
+                    item_tokens.add(token)
+
+        score = 0
+        if c and item_cat == c:
+            score += 8
+        if brand_norm and brand_norm in requested_brands:
+            score += 120
+        if wants_men and "men" in tags:
+            score += 28
+        if wants_women and "women" in tags:
+            score += 28
+        if size_tokens and any(size_tag in tags for size_tag in size_tokens):
+            score += 42
+        score += sum(7 for token in query_tokens if token in item_tokens)
+
+        if query_tokens and score <= 0:
+            continue
+
+        out.append(
+            {
+                "id": str(item.get("id", "")),
+                "title": title,
+                "category": item_cat,
+                "brand": brand,
+                "priceUsd": float(item.get("priceUsd", 0.0) or 0.0),
+                "imageUrl": str(item.get("imageUrl", "")).strip(),
+                "url": str(item.get("url", "")).strip(),
+                "sourceHost": url_host(str(item.get("url", "")).strip()),
+                "_score": score,
+            }
+        )
+    source_name = "scaffold"
+    direct_brand = select_direct_brand_from_query(q, requested_brands) or next(
+        (brand for brand in sorted(requested_brands) if brand in brand_site_map),
+        "",
+    )
+    specificity = len(query_tokens) + (1 if wants_men or wants_women else 0) + (1 if size_tokens else 0)
+    if direct_brand == "puma" and specificity >= 3:
+        live = puma_live_search_snapshot(q, limit=16)
+        live_items = live.get("items", []) if isinstance(live.get("items"), list) else []
+        if bool(live.get("ok", False)) and live_items:
+            out = [item for item in live_items if isinstance(item, dict)]
+            source_name = str(live.get("source", "puma-live"))
+            if len(out) < 9:
+                existing = {re.sub(r"[?#].*$", "", str(item.get("url", "")).strip()) for item in out if isinstance(item, dict)}
+                for item in MOCK_SHOP_ITEMS:
+                    if not isinstance(item, dict):
+                        continue
+                    if normalize_token(str(item.get("brand", ""))) != "puma":
+                        continue
+                    candidate_url = str(item.get("url", "")).strip()
+                    key = re.sub(r"[?#].*$", "", candidate_url)
+                    if key in existing:
+                        continue
+                    out.append(
+                        {
+                            "id": str(item.get("id", "")),
+                            "title": str(item.get("title", "")).strip(),
+                            "category": str(item.get("category", "")).strip().lower() or "shoes",
+                            "brand": "Puma",
+                            "priceUsd": float(item.get("priceUsd", 0.0) or 0.0),
+                            "imageUrl": str(item.get("imageUrl", "")).strip(),
+                            "url": candidate_url,
+                            "sourceHost": url_host(candidate_url),
+                        }
+                    )
+                    existing.add(key)
+                    if len(out) >= 12:
+                        break
+    if source_name == "scaffold":
+        out.sort(key=lambda item: (float(item.get("_score", 0.0) or 0.0), -float(item.get("priceUsd", 0.0) or 0.0)), reverse=True)
+    if not out:
+        fallback = [item for item in MOCK_SHOP_ITEMS if isinstance(item, dict) and (not c or str(item.get("category", "")).strip().lower() == c)]
+        out = [
+            {
+                "id": str(item.get("id", "")),
+                "title": str(item.get("title", "")).strip(),
+                "category": str(item.get("category", "")).strip().lower(),
+                "brand": str(item.get("brand", "")).strip(),
+                "priceUsd": float(item.get("priceUsd", 0.0) or 0.0),
+                "imageUrl": str(item.get("imageUrl", "")).strip(),
+                "url": str(item.get("url", "")).strip(),
+                "sourceHost": url_host(str(item.get("url", "")).strip()),
+            }
+            for item in fallback[:12]
+        ]
+    for row in out:
+        if isinstance(row, dict) and "_score" in row:
+            del row["_score"]
+    source_target: dict[str, Any] | None = None
+    if direct_brand:
+        brand_label, brand_url, brand_theme, brand_primary, brand_accent = brand_site_map[direct_brand]
+        mode = "direct" if specificity >= 3 else "assist"
+        host = url_host(brand_url)
+        source_target = {
+            "label": f"Open {brand_label} site",
+            "url": brand_url,
+            "mode": mode,
+            "host": host,
+            "brandName": brand_label,
+            "brandTheme": brand_theme,
+            "brandColors": {"primary": brand_primary, "accent": brand_accent},
+        }
+        if mode == "direct":
+            direct_filtered = [item for item in out if isinstance(item, dict) and host and host in str(item.get("sourceHost", ""))]
+            if direct_filtered:
+                out = direct_filtered
+    elif out:
+        top_brand = normalize_token(str((out[0] if isinstance(out[0], dict) else {}).get("brand", "")))
+        if top_brand in brand_site_map:
+            brand_label, brand_url, brand_theme, brand_primary, brand_accent = brand_site_map[top_brand]
+            host = url_host(brand_url)
+            source_target = {
+                "label": f"Open {brand_label} site",
+                "url": brand_url,
+                "mode": "assist",
+                "host": host,
+                "brandName": brand_label,
+                "brandTheme": brand_theme,
+                "brandColors": {"primary": brand_primary, "accent": brand_accent},
+            }
+    return {
+        "ok": True,
+        "source": source_name,
+        "query": q,
+        "category": c,
+        "normalizedQuery": normalized_query,
+        "items": out[:16],
+        "sourceTarget": source_target,
+    }
+
+
+def looks_like_phone_target(value: str) -> bool:
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D+", "", raw)
+    return len(digits) >= 7
+
+
+def resolve_contact_target(query: str) -> dict[str, str] | None:
+    q = str(query or "").strip()
+    if not q:
+        return None
+    snap = contacts_lookup_snapshot(q)
+    items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+    if not items:
+        return None
+    q_norm = q.lower()
+    exact = next((item for item in items if str(item.get("name", "")).strip().lower() == q_norm), None)
+    pick = exact if isinstance(exact, dict) else (items[0] if isinstance(items[0], dict) else None)
+    if not isinstance(pick, dict):
+        return None
+    return {
+        "name": str(pick.get("name", "")).strip(),
+        "phone": str(pick.get("phone", "")).strip(),
+        "label": str(pick.get("label", "")).strip(),
+    }
+
+
+def weather_read_snapshot(location: str, provider_mode: str | None = None) -> dict[str, Any]:
+    query = str(location or "").strip()
+    if not query:
+        query = "New York"
+    mode = normalize_connector_provider_mode(provider_mode or CONNECTOR_PROVIDER_MODE)
+    if mode == "mock":
+        return weather_mock_snapshot(query)
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            geo = client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": query, "count": 1, "language": "en", "format": "json"},
+            )
+            geo.raise_for_status()
+            geo_json = geo.json()
+            results = geo_json.get("results", []) if isinstance(geo_json, dict) else []
+            if not results or not isinstance(results[0], dict):
+                return weather_fallback_snapshot(query)
+            hit = results[0]
+            lat = float(hit.get("latitude", 0.0) or 0.0)
+            lon = float(hit.get("longitude", 0.0) or 0.0)
+            name = str(hit.get("name", query) or query)
+            country = str(hit.get("country_code", "") or "")
+            wx = client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,wind_speed_10m,weather_code",
+                    "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,weather_code",
+                    "temperature_unit": "fahrenheit",
+                    "wind_speed_unit": "mph",
+                    "timezone": "auto",
+                    "forecast_hours": 12,
+                },
+            )
+            wx.raise_for_status()
+            wx_payload = wx.json()
+            wx_json = wx_payload if isinstance(wx_payload, dict) else {}
+            current = wx_json.get("current", {}) if isinstance(wx_json, dict) else {}
+            hourly = wx_json.get("hourly", {}) if isinstance(wx_json, dict) else {}
+            code = int(current.get("weather_code", -1) or -1)
+            code_map = {
+                0: "clear",
+                1: "mainly clear",
+                2: "partly cloudy",
+                3: "overcast",
+                45: "fog",
+                48: "rime fog",
+                51: "light drizzle",
+                61: "light rain",
+                63: "rain",
+                65: "heavy rain",
+                71: "snow",
+                80: "rain showers",
+                95: "thunderstorm",
+            }
+            hourly_times = hourly.get("time", []) if isinstance(hourly, dict) and isinstance(hourly.get("time"), list) else []
+            hourly_temp = hourly.get("temperature_2m", []) if isinstance(hourly, dict) and isinstance(hourly.get("temperature_2m"), list) else []
+            hourly_wind = hourly.get("wind_speed_10m", []) if isinstance(hourly, dict) and isinstance(hourly.get("wind_speed_10m"), list) else []
+            hourly_precip = hourly.get("precipitation_probability", []) if isinstance(hourly, dict) and isinstance(hourly.get("precipitation_probability"), list) else []
+            hourly_code = hourly.get("weather_code", []) if isinstance(hourly, dict) and isinstance(hourly.get("weather_code"), list) else []
+            hourly_out: list[dict[str, Any]] = []
+            for idx in range(min(len(hourly_times), len(hourly_temp), len(hourly_wind), 12)):
+                raw_time = str(hourly_times[idx] or "")
+                hour_label = raw_time[-5:] if len(raw_time) >= 5 else f"+{idx}h"
+                code_i = int(hourly_code[idx] or code) if idx < len(hourly_code) else code
+                hourly_out.append(
+                    {
+                        "hourOffset": int(idx),
+                        "hourLabel": hour_label,
+                        "tempF": float(hourly_temp[idx] or 0.0),
+                        "windMph": float(hourly_wind[idx] or 0.0),
+                        "precipChance": int(hourly_precip[idx] or 0),
+                        "condition": code_map.get(code_i, f"code {code_i}" if code_i >= 0 else "unknown"),
+                    }
+                )
+            if not hourly_out:
+                hourly_out = weather_fallback_hourly(query, float(current.get("temperature_2m", 0.0) or 0.0), code_map.get(code, "unknown"), float(current.get("wind_speed_10m", 0.0) or 0.0))
+            return {
+                "ok": True,
+                "source": "open-meteo",
+                "location": f"{name}{(', ' + country) if country else ''}",
+                "temperatureF": float(current.get("temperature_2m", 0.0) or 0.0),
+                "windMph": float(current.get("wind_speed_10m", 0.0) or 0.0),
+                "condition": code_map.get(code, f"code {code}" if code >= 0 else "unknown"),
+                "hourly": hourly_out,
+            }
+    except Exception:
+        if mode == "live":
+            return {
+                "ok": False,
+                "source": "open-meteo",
+                "location": query,
+                "temperatureF": 0.0,
+                "windMph": 0.0,
+                "condition": "unavailable",
+                "error": "live provider unavailable",
+            }
+        return weather_fallback_snapshot(query)
 
 
 def default_handoff_state() -> dict[str, Any]:
@@ -512,6 +2576,16 @@ async def load_sessions_from_disk() -> None:
 @app.on_event("startup")
 async def startup_scheduler() -> None:
     await load_sessions_from_disk()
+    async with CONNECTOR_VAULT_LOCK:
+        load_connector_vault_from_disk_sync()
+    # Auto-grant low-risk connectors so core experiences work without manual setup.
+    # Done outside the lock because connector_grant_scope calls persist (disk I/O) and
+    # the lock is not re-entrant.
+    for _auto_scope in ("weather.forecast.read",):
+        if not connector_scope_granted(_auto_scope):
+            connector_grant_scope(_auto_scope)
+    # Connect to MCP servers defined in .mcp.json — non-blocking, errors are stored per server
+    asyncio.create_task(load_mcp_servers_from_config())
     global SCHEDULER_TASK
     if SCHEDULER_TASK is None or SCHEDULER_TASK.done():
         SCHEDULER_TASK = asyncio.create_task(run_scheduler_loop())
@@ -527,6 +2601,9 @@ async def shutdown_scheduler() -> None:
         except asyncio.CancelledError:
             pass
     SCHEDULER_TASK = None
+    await shutdown_mcp_stdio_servers()
+    async with CONNECTOR_VAULT_LOCK:
+        persist_connector_vault_to_disk_sync()
     await persist_sessions_to_disk_safe("shutdown")
 
 
@@ -540,6 +2617,148 @@ async def health() -> dict[str, Any]:
             "large": OLLAMA_MODEL_LARGE or None,
         },
     }
+
+
+@app.get("/api/connectors")
+async def get_connectors(device: str | None = Query(default=None)) -> dict[str, Any]:
+    manifests = list_connector_manifests()
+    normalized_device = normalize_connector_device(device or "")
+    summary = connector_summary(manifests)
+    if normalized_device:
+        summary["device"] = normalized_device
+        summary["deviceSupport"] = connector_device_counts(manifests, normalized_device)
+    return {
+        "ok": True,
+        "summary": summary,
+        "items": manifests,
+    }
+
+
+@app.get("/api/connectors/providers")
+async def get_connector_provider_status() -> dict[str, Any]:
+    mode = normalize_connector_provider_mode(CONNECTOR_PROVIDER_MODE)
+    banking_mode = normalize_connector_service_mode(BANKING_PROVIDER_MODE, default="scaffold")
+    social_mode = normalize_connector_service_mode(SOCIAL_PROVIDER_MODE, default="scaffold")
+    web_mode = normalize_connector_service_mode(WEB_PROVIDER_MODE, default="scaffold")
+    return {
+        "ok": True,
+        "providers": {
+            "weather": {
+                "mode": mode,
+                "mockLocations": sorted(list(MOCK_WEATHER_DATA.keys())),
+            },
+            "web": {
+                "mode": web_mode,
+                "execution": "mock_fetch" if web_mode in {"mock", "scaffold"} else "direct_fetch",
+                "mockUrls": sorted(list(MOCK_WEB_PAGES.keys())),
+            },
+            "contacts": {
+                "mode": "scaffold",
+                "execution": "local_index",
+                "mockCount": len(MOCK_CONTACTS),
+            },
+            "telephony": {
+                "mode": "scaffold",
+                "execution": "handoff_to_mobile",
+            },
+            "banking": {
+                "mode": banking_mode,
+                "execution": "mock_read" if banking_mode in {"mock", "scaffold"} else "unavailable",
+                "configured": bool(
+                    str(os.getenv("BANKING_API_BASE_URL", "") or "").strip()
+                    and connector_secret_provider_value("BANKING_API_TOKEN", "banking.api.token")
+                ),
+            },
+            "social": {
+                "mode": social_mode,
+                "execution": "mock_session" if social_mode in {"mock", "scaffold"} else "unavailable",
+                "configured": bool(
+                    str(os.getenv("SOCIAL_API_BASE_URL", "") or "").strip()
+                    and connector_secret_provider_value("SOCIAL_API_TOKEN", "social.api.token")
+                ),
+            }
+        },
+    }
+
+
+@app.get("/api/connectors/contracts")
+async def get_connector_contracts() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contracts": CONNECTOR_ADAPTER_CONTRACTS,
+    }
+
+
+@app.get("/api/connectors/mock/weather")
+async def get_mock_weather(location: str = Query(default="Seattle")) -> dict[str, Any]:
+    snapshot = weather_mock_snapshot(location)
+    return {"ok": True, "item": snapshot}
+
+
+@app.get("/api/connectors/mock/banking")
+async def get_mock_banking(limit: int = Query(default=5)) -> dict[str, Any]:
+    balance = banking_balance_snapshot(provider_mode="mock")
+    tx = banking_transactions_snapshot(limit=limit, provider_mode="mock")
+    return {"ok": True, "balance": balance, "transactions": tx}
+
+
+@app.get("/api/connectors/mock/social")
+async def get_mock_social() -> dict[str, Any]:
+    feed = social_feed_snapshot(provider_mode="mock")
+    return {"ok": True, "feed": feed}
+
+
+@app.get("/api/connectors/mock/web")
+async def get_mock_web(url: str = Query(default="https://example.com")) -> dict[str, Any]:
+    item = web_fetch_snapshot(url=url, provider_mode="mock")
+    return {"ok": bool(item.get("ok", False)), "item": item}
+
+
+@app.get("/api/connectors/mock/contacts")
+async def get_mock_contacts(query: str = Query(default="")) -> dict[str, Any]:
+    item = contacts_lookup_snapshot(query=query)
+    return {"ok": bool(item.get("ok", False)), "item": item}
+
+
+@app.get("/api/connectors/secrets")
+async def get_connector_secrets() -> dict[str, Any]:
+    async with CONNECTOR_VAULT_LOCK:
+        items = connector_secret_status(["banking.api.token", "social.api.token"])
+    return {"ok": True, "items": items}
+
+
+@app.post("/api/connectors/secrets")
+async def set_connector_secret(body: ConnectorSecretBody) -> dict[str, Any]:
+    key = str(body.key or "").strip().lower()
+    if key not in {"banking.api.token", "social.api.token"}:
+        raise HTTPException(status_code=400, detail="unsupported connector secret key")
+    async with CONNECTOR_VAULT_LOCK:
+        item = connector_secret_set(key, body.value)
+        items = connector_secret_status(["banking.api.token", "social.api.token"])
+    return {"ok": True, "item": item, "items": items}
+
+
+@app.get("/api/connectors/grants")
+async def get_connector_grants() -> dict[str, Any]:
+    async with CONNECTOR_VAULT_LOCK:
+        report = connector_grants_report()
+    return {"ok": True, **report}
+
+
+@app.post("/api/connectors/grants")
+async def upsert_connector_grant(body: ConnectorGrantBody) -> dict[str, Any]:
+    scope = normalize_connector_scope(body.scope)
+    if not scope:
+        raise HTTPException(status_code=400, detail="invalid scope")
+    if scope not in connector_scope_catalog():
+        raise HTTPException(status_code=400, detail="unknown connector scope")
+    async with CONNECTOR_VAULT_LOCK:
+        if bool(body.enabled):
+            item = connector_grant_scope(scope, ttl_ms=max(0, int(body.ttlMs or 0)))
+        else:
+            item = connector_revoke_scope(scope)
+        report = connector_grants_report()
+    return {"ok": True, "item": item, **report}
 
 
 @app.post("/api/session/init")
@@ -793,6 +3012,2150 @@ async def get_session_graph(session_id: str, limit: int = Query(200, ge=1, le=20
         "entities": entities[-limit:],
         "relations": relations[-limit:],
         "events": events[-limit:],
+    }
+
+
+@app.get("/api/session/{session_id}/graph/schema")
+async def get_session_graph_schema(session_id: str) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "schema": build_graph_schema_payload(session.graph),
+    }
+
+
+@app.get("/api/session/{session_id}/graph/query")
+async def get_session_graph_query(
+    session_id: str,
+    kind: str = Query("", max_length=32),
+    relation: str = Query("", max_length=32),
+    q: str = Query("", max_length=120),
+    done: bool | None = Query(None),
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    kind_norm = normalize_entity_kind(kind) if str(kind or "").strip() else ""
+    relation_norm = str(relation or "").strip().lower()
+    query_norm = str(q or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    report = query_graph(
+        session.graph,
+        kind=kind_norm,
+        relation=relation_norm,
+        text_query=query_norm,
+        done=done,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "kind": kind_norm or None,
+            "relation": relation_norm or None,
+            "q": query_norm or None,
+            "done": done,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/neighborhood")
+async def get_session_graph_neighborhood(
+    session_id: str,
+    kind: str = Query(..., min_length=1, max_length=32),
+    selector: str = Query(..., min_length=1, max_length=64),
+    depth: int = Query(1, ge=1, le=4),
+    relation: str = Query("", max_length=32),
+    limit: int = Query(40, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    kind_norm = normalize_entity_kind(kind)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    source = find_entity_by_kind_selector(session.graph, kind_norm, selector)
+    if not source:
+        raise HTTPException(status_code=404, detail="entity not found")
+    report = build_graph_neighborhood(
+        session.graph,
+        source=source,
+        depth=depth,
+        relation=relation_norm,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "kind": kind_norm,
+            "selector": selector,
+            "depth": depth,
+            "relation": relation_norm or None,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/path")
+async def get_session_graph_path(
+    session_id: str,
+    source_kind: str = Query(..., min_length=1, max_length=32),
+    source: str = Query(..., min_length=1, max_length=64),
+    target_kind: str = Query(..., min_length=1, max_length=32),
+    target: str = Query(..., min_length=1, max_length=64),
+    relation: str = Query("", max_length=32),
+    directed: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    source_kind_norm = normalize_entity_kind(source_kind)
+    target_kind_norm = normalize_entity_kind(target_kind)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    source_entity = find_entity_by_kind_selector(session.graph, source_kind_norm, source)
+    target_entity = find_entity_by_kind_selector(session.graph, target_kind_norm, target)
+    if not source_entity or not target_entity:
+        raise HTTPException(status_code=404, detail="source or target not found")
+    report = build_graph_path(
+        session.graph,
+        source=source_entity,
+        target=target_entity,
+        relation=relation_norm,
+        directed=bool(directed),
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "sourceKind": source_kind_norm,
+            "source": source,
+            "targetKind": target_kind_norm,
+            "target": target,
+            "relation": relation_norm or None,
+            "directed": bool(directed),
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/health")
+async def get_session_graph_health(session_id: str) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "health": build_graph_health_report(session.graph),
+    }
+
+
+@app.get("/api/session/{session_id}/graph/components")
+async def get_session_graph_components(
+    session_id: str,
+    relation: str = Query("", max_length=32),
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    report = build_graph_components(session.graph, relation=relation_norm, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "relation": relation_norm or None,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/hubs")
+async def get_session_graph_hubs(
+    session_id: str,
+    relation: str = Query("", max_length=32),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    report = build_graph_hubs(session.graph, relation=relation_norm, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "relation": relation_norm or None,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/events")
+async def get_session_graph_events(
+    session_id: str,
+    kind: str = Query("", max_length=64),
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    kind_norm = str(kind or "").strip().lower()
+    report = build_graph_events_report(session.graph, kind=kind_norm, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "kind": kind_norm or None,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/summary")
+async def get_session_graph_summary(
+    session_id: str,
+    relation: str = Query("", max_length=32),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    report = build_graph_summary_report(session.graph, relation=relation_norm, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "relation": relation_norm or None,
+            "limit": limit,
+        },
+        "summary": report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/relation-matrix")
+async def get_session_graph_relation_matrix(
+    session_id: str,
+    relation: str = Query("", max_length=32),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    relation_norm = str(relation or "").strip().lower()
+    if relation_norm and relation_norm not in GRAPH_RELATION_KINDS:
+        raise HTTPException(status_code=400, detail="invalid relation kind")
+    report = build_graph_relation_matrix(session.graph, relation=relation_norm, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {
+            "relation": relation_norm or None,
+            "limit": limit,
+        },
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/anomalies")
+async def get_session_graph_anomalies(
+    session_id: str,
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_anomalies_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/guidance")
+async def get_session_graph_guidance(
+    session_id: str,
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_guidance_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score")
+async def get_session_graph_score(session_id: str) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_report(session.graph)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "score": report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-trend")
+async def get_session_graph_score_trend(
+    session_id: str,
+    window_ms: int = Query(3600000, ge=60000, le=604800000),
+    buckets: int = Query(8, ge=2, le=48),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_trend_report(session.graph, window_ms=window_ms, buckets=buckets)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "buckets": buckets},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-guidance")
+async def get_session_graph_score_guidance(
+    session_id: str,
+    limit: int = Query(6, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_guidance_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-alerts")
+async def get_session_graph_score_alerts(
+    session_id: str,
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_alerts_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-alerts-history")
+async def get_session_graph_score_alerts_history(
+    session_id: str,
+    window_ms: int = Query(3600000, ge=60000, le=604800000),
+    buckets: int = Query(8, ge=2, le=48),
+    limit: int = Query(5, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_alerts_history_report(session.graph, window_ms=window_ms, buckets=buckets, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "buckets": buckets, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-remediation")
+async def get_session_graph_score_remediation(
+    session_id: str,
+    limit: int = Query(6, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_remediation_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-forecast")
+async def get_session_graph_score_forecast(
+    session_id: str,
+    horizon_ms: int = Query(3600000, ge=60000, le=604800000),
+    step_buckets: int = Query(6, ge=2, le=24),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_forecast_report(session.graph, horizon_ms=horizon_ms, step_buckets=step_buckets)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"horizonMs": horizon_ms, "stepBuckets": step_buckets},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-forecast-guidance")
+async def get_session_graph_score_forecast_guidance(
+    session_id: str,
+    limit: int = Query(6, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_forecast_guidance_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-guardrails")
+async def get_session_graph_score_guardrails(
+    session_id: str,
+    warn_below: int = Query(75, ge=0, le=100),
+    fail_below: int = Query(60, ge=0, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_guardrails_report(session.graph, warn_below=warn_below, fail_below=fail_below)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"warnBelow": warn_below, "failBelow": fail_below},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot-preview")
+async def get_session_graph_score_autopilot_preview(
+    session_id: str,
+    limit: int = Query(6, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_preview_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/run")
+async def post_session_graph_score_autopilot_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    limit = max(1, min(int(body.get("limit", 6) or 6), 20))
+    report = build_graph_score_autopilot_run_report(session.graph, mode=mode, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/history")
+async def get_session_graph_score_autopilot_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_history_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/metrics")
+async def get_session_graph_score_autopilot_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_metrics_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/anomalies")
+async def get_session_graph_score_autopilot_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_anomalies_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/guidance")
+async def get_session_graph_score_autopilot_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_guidance_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy")
+async def get_session_graph_score_autopilot_policy(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-drift")
+async def get_session_graph_score_autopilot_policy_drift(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_drift_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-actions")
+async def get_session_graph_score_autopilot_policy_alignment_actions(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(6, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_actions_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-run")
+async def post_session_graph_score_autopilot_policy_alignment_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 6) or 6), 30))
+    report = build_graph_score_autopilot_policy_alignment_run_report(session.graph, mode=mode, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-history")
+async def get_session_graph_score_autopilot_policy_alignment_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_history_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_metrics_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_anomalies_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_guidance_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy")
+async def get_session_graph_score_autopilot_policy_alignment_policy(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-drift")
+async def get_session_graph_score_autopilot_policy_alignment_policy_drift(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_drift_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_guidance_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 8) or 8), 30))
+    report = build_graph_score_autopilot_policy_alignment_policy_run_report(session.graph, mode=mode, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_history_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_metrics_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_anomalies_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_summary_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(6, ge=1, le=20),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 6) or 6), 20))
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_run_report(session.graph, mode=mode, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_history_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_summary_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-drift")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 8) or 8), 30))
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run_report(
+        session.graph,
+        mode=mode,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history_report(session.graph, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics_report(session.graph, window_ms=window_ms)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies_report(session.graph, window_ms=window_ms, limit=limit)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 8) or 8), 30))
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run_report(
+        session.graph,
+        mode=mode,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-trend")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-offenders")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=50),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-timeline")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-matrix")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 8) or 8), 30))
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run_report(
+        session.graph,
+        mode=mode,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str((body or {}).get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = int((body or {}).get("windowMs", 86400000) or 86400000)
+    limit = int((body or {}).get("limit", 8) or 8)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_report(
+        session.graph,
+        mode=mode,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"mode": mode, "windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-summary")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(8, ge=1, le=30),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.post("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run")
+async def post_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run(
+    session_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    mode = str(body.get("mode", "dry_run")).strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    window_ms = max(60000, min(int(body.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+    limit = max(1, min(int(body.get("limit", 8) or 8), 30))
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_report(
+        session.graph,
+        mode=mode,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "mode": mode,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-history")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history(
+    session_id: str,
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history_report(
+        session.graph,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"limit": limit},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-metrics")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics_report(
+        session.graph,
+        window_ms=window_ms,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms},
+        **report,
+    }
+
+
+@app.get("/api/session/{session_id}/graph/score-autopilot/policy-alignment-policy-trend-guidance-policy-guidance-state-guidance-state-guidance-state-run-state-guidance-run-anomalies")
+async def get_session_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies(
+    session_id: str,
+    window_ms: int = Query(86400000, ge=60000, le=604800000),
+    limit: int = Query(10, ge=1, le=100),
+) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies_report(
+        session.graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "query": {"windowMs": window_ms, "limit": limit},
+        **report,
     }
 
 
@@ -2873,6 +7236,20 @@ async def stream_session(sessionId: str = Query(...)):
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+# ── MCP Server Registry Endpoints ─────────────────────────────────────────────
+
+@app.get("/api/mcp/servers")
+async def mcp_list_servers():
+    """List all MCP servers loaded from .mcp.json and their available tools."""
+    return {
+        "count": len(MCP_SERVER_REGISTRY),
+        "servers": list(MCP_SERVER_REGISTRY.values()),
+    }
+
+
+# ── End MCP Endpoints ──────────────────────────────────────────────────────────
+
+
 @app.websocket("/ws")
 async def ws_session(websocket: WebSocket):
     await websocket.accept()
@@ -2979,6 +7356,40 @@ async def turn(body: TurnBody) -> dict[str, Any]:
         }
     else:
         execution = await execute_operations(session, sid, envelope["stateIntent"]["writeOperations"])
+        # MCP fallback: if no connector produced results and MCP servers are registered,
+        # try matching the user intent to a registered MCP tool (fires at most once per turn).
+        if MCP_SERVER_REGISTRY and not execution.get("toolResults") and not execution.get("needsClarification"):
+            _mcp_sid, _mcp_tool, _mcp_score = find_best_mcp_tool(intent)
+            if _mcp_sid and _mcp_score >= MCP_TOOL_MATCH_THRESHOLD:
+                _mcp_server = MCP_SERVER_REGISTRY.get(_mcp_sid, {})
+                try:
+                    _mcp_result = await _call_mcp_stdio_tool(_mcp_sid, _mcp_tool or "", {}, timeout=10.0)
+                    execution["toolResults"] = [{
+                        "op": "mcp_tool_call",
+                        "ok": not _mcp_result.get("isError", False),
+                        "serverId": _mcp_sid,
+                        "serverName": str(_mcp_server.get("name", "")),
+                        "toolName": _mcp_tool,
+                        "matchScore": round(_mcp_score, 3),
+                        "data": {"content": _mcp_result.get("content", [])},
+                        "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
+                        "previewLines": [f"mcp: {_mcp_server.get('name', '')} → {_mcp_tool}",
+                                         f"match: {round(_mcp_score * 100)}%"],
+                    }]
+                    execution["ok"] = True
+                    execution["message"] = f"MCP: {_mcp_server.get('name', '')} / {_mcp_tool}"
+                except Exception as _mcp_exc:
+                    execution["toolResults"] = [{
+                        "op": "mcp_tool_call",
+                        "ok": False,
+                        "serverId": _mcp_sid,
+                        "serverName": str(_mcp_server.get("name", "")),
+                        "toolName": _mcp_tool,
+                        "matchScore": round(_mcp_score, 3),
+                        "data": {"content": []},
+                        "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
+                        "previewLines": [f"mcp error: {str(_mcp_exc)[:120]}"],
+                    }]
     execute_done_ms = now_ms()
     planner_memory_fingerprint = stable_memory_fingerprint(session.memory)
     route = planner_route(envelope, execution, session.graph)
@@ -3006,13 +7417,13 @@ async def turn(body: TurnBody) -> dict[str, Any]:
     if route["target"].startswith("ollama") and route.get("model"):
         try:
             remote = await generate_plan_with_ollama(intent, envelope, session.graph, execution, local_plan, route["model"])
-            plan = normalize_plan(remote)
+            plan = enrich_plan_trace(normalize_plan(remote), session.graph, route)
             planner = route["target"]
         except Exception:
-            plan = normalize_plan(local_plan)
+            plan = enrich_plan_trace(normalize_plan(local_plan), session.graph, route)
             planner = "local-fallback"
     else:
-        plan = normalize_plan(local_plan)
+        plan = enrich_plan_trace(normalize_plan(local_plan), session.graph, route)
     plan_done_ms = now_ms()
 
     perf_trace = {
@@ -3044,7 +7455,7 @@ async def turn(body: TurnBody) -> dict[str, Any]:
         "planner": planner,
         "route": route,
         "merge": merge_info,
-        "timestamp": int(datetime.utcnow().timestamp() * 1000),
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
     }
     session.turn_history.append(summarize_turn_history_item(session.last_turn))
     if len(session.turn_history) > int(TURN_HISTORY_MAX_ENTRIES):
@@ -3133,7 +7544,9 @@ async def run_due_jobs_for_session(session_id: str, session: SessionState, force
             job["failureCount"] = 0
             job["lastError"] = ""
             interval_ms = int(job.get("intervalMs", 0) or 0)
-            if interval_ms <= 0:
+            if bool(job.get("oneShot", False)):
+                job["active"] = False
+            elif interval_ms <= 0:
                 job["active"] = False
             else:
                 job["nextRunAt"] = now + interval_ms
@@ -7989,6 +12402,28 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
         )
         return
 
+    if kind == "remind_once":
+        text = str(job.get("text", "")).strip()
+        if not text:
+            text = "Reminder"
+        note_text = f"[reminder once] {text}"
+        job["lastResult"] = note_text[:120]
+        graph_add_entity(session.graph, {"kind": "note", "text": note_text, "createdAt": now_ms()})
+        graph_add_event(session.graph, "job_tick", {"jobId": job.get("id"), "kind": kind, "summary": note_text[:120]})
+        record_journal_entry(
+            session,
+            session_id,
+            {"type": "job_tick"},
+            {
+                "ok": True,
+                "message": f"one-shot reminder created: {text[:72]}",
+                "policy": {"allowed": True, "reason": "scheduled", "code": "scheduled"},
+                "capability": {"domain": "system", "risk": "low"},
+                "diff": {"tasks": 0, "expenses": 0, "notes": 1},
+            },
+        )
+        return
+
     if kind == "audit_open_tasks":
         projection = graph_projection(session.graph)
         open_tasks = sum(1 for t in projection["tasks"] if not t.get("done"))
@@ -8036,9 +12471,10 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
 
 
 def compile_intent_envelope(text: str) -> dict[str, Any]:
-    lower = text.lower()
-    writes = parse_commands(text)
-    clarification = build_clarification_signal(text, lower, writes)
+    normalized_text = normalize_intent_text(text)
+    lower = normalized_text.lower()
+    writes = parse_commands(normalized_text)
+    clarification = build_clarification_signal(normalized_text, lower, writes)
 
     state_domains = [op["domain"] for op in writes] if writes else infer_domains(lower)
     state_domains = list(dict.fromkeys(state_domains))
@@ -8054,7 +12490,7 @@ def compile_intent_envelope(text: str) -> dict[str, Any]:
             "raw": text,
             "normalized": lower,
             "kind": "question" if "?" in lower else ("command" if writes else "statement"),
-            "timestamp": int(datetime.utcnow().timestamp() * 1000),
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
         },
         "taskIntent": {
             "goal": "mutate" if writes else ("overview" if set(state_domains) == {"tasks", "expenses", "notes"} else "inspect"),
@@ -8161,7 +12597,7 @@ def infer_domains(lower: str) -> list[str]:
         "tasks": any(x in lower for x in ["task", "todo", "ship"]),
         "expenses": any(x in lower for x in ["expense", "money", "budget", "cost"]),
         "notes": any(x in lower for x in ["note", "idea", "research", "nca"]),
-        "graph": any(x in lower for x in ["depend", "dependency", "dependencies", "reference", "references", "link"]),
+        "graph": any(x in lower for x in ["graph", "depend", "dependency", "dependencies", "reference", "references", "link"]),
         "files": any(x in lower for x in ["file", "folder", "directory", "path", "readme"]),
         "web": any(x in lower for x in ["web", "url", "http", "https", "site", "fetch"]),
     }
@@ -8170,6 +12606,10 @@ def infer_domains(lower: str) -> list[str]:
 
 
 def parse_commands(text: str) -> list[dict[str, Any]]:
+    text = normalize_intent_text(text)
+    semantic = parse_semantic_command(text)
+    if semantic:
+        return [semantic]
     patterns = [
         (r"^add task\s+(.+)$", lambda m: {"type": "add_task", "domain": "tasks", "payload": {"title": m.group(1)}}),
         (r"^(complete|done|finish)\s+task\s+(\S+)$", lambda m: {"type": "toggle_task", "domain": "tasks", "payload": {"selector": m.group(2)}}),
@@ -8192,6 +12632,1793 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
             },
         ),
         (
+            r"^(show|list)\s+graph\s+schema$",
+            lambda _m: {
+                "type": "graph_schema",
+                "domain": "graph",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+health$",
+            lambda _m: {
+                "type": "graph_health",
+                "domain": "graph",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+components(?:\s+relation\s+(depends_on|references))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_components",
+                "domain": "graph",
+                "payload": {
+                    "relation": str(m.group(2) or "").strip().lower(),
+                    "limit": int(m.group(3) or 20),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+hubs(?:\s+relation\s+(depends_on|references))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_hubs",
+                "domain": "graph",
+                "payload": {
+                    "relation": str(m.group(2) or "").strip().lower(),
+                    "limit": int(m.group(3) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+events(?:\s+kind\s+([a-zA-Z0-9_-]+))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_events",
+                "domain": "graph",
+                "payload": {
+                    "kind": str(m.group(2) or "").strip().lower(),
+                    "limit": int(m.group(3) or 50),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+summary(?:\s+relation\s+(depends_on|references))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_summary",
+                "domain": "graph",
+                "payload": {
+                    "relation": str(m.group(2) or "").strip().lower(),
+                    "limit": int(m.group(3) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+relation\s+matrix(?:\s+relation\s+(depends_on|references))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_relation_matrix",
+                "domain": "graph",
+                "payload": {
+                    "relation": str(m.group(2) or "").strip().lower(),
+                    "limit": int(m.group(3) or 100),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+anomalies(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "limit": int(m.group(2) or 50),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+guidance(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_guidance",
+                "domain": "graph",
+                "payload": {
+                    "limit": int(m.group(2) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score$",
+            lambda _m: {
+                "type": "graph_score",
+                "domain": "graph",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+trend(?:\s+window\s+(\d+)\s*(ms|s|m|h))?(?:\s+buckets\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_trend",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 3600000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                    ),
+                    "buckets": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+guidance(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_guidance",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 6)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+alerts(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_alerts",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 10)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+alerts\s+history(?:\s+window\s+(\d+)\s*(ms|s|m|h))?(?:\s+buckets\s+(\d+))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_alerts_history",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 3600000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                    ),
+                    "buckets": int(m.group(4) or 8),
+                    "limit": int(m.group(5) or 5),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+remediation(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_remediation",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 6)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+forecast(?:\s+horizon\s+(\d+)\s*(ms|s|m|h))?(?:\s+steps\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_forecast",
+                "domain": "graph",
+                "payload": {
+                    "horizonMs": int(m.group(2) or 3600000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                    ),
+                    "stepBuckets": int(m.group(4) or 6),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+forecast\s+guidance(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_forecast_guidance",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 6)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+guardrails(?:\s+warn\s+below\s+(\d+))?(?:\s+fail\s+below\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_guardrails",
+                "domain": "graph",
+                "payload": {"warnBelow": int(m.group(2) or 75), "failBelow": int(m.group(3) or 60)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+preview(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_preview",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 6)},
+            },
+        ),
+        (
+            r"^(run|apply)\s+graph\s+score\s+autopilot(?:\s+(dry\s*run|apply))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "apply"
+                    if str(m.group(1) or "").strip().lower() == "apply" or str(m.group(2) or "").strip().lower() == "apply"
+                    else "dry_run",
+                    "limit": int(m.group(3) or 6),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+drift(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_drift",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+actions(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_actions",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 6),
+                },
+            },
+        ),
+        (
+            r"^(run|apply)\s+graph\s+score\s+autopilot\s+policy\s+alignment(?:\s+(dry\s*run|apply))?(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "apply"
+                    if str(m.group(1) or "").strip().lower() == "apply" or str(m.group(2) or "").strip().lower() == "apply"
+                    else "dry_run",
+                    "windowMs": int(m.group(3) or 86400000)
+                    * (
+                        1
+                        if str(m.group(4) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(4) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(4) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(4) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(5) or 6),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+drift(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_drift",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(run|apply)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy(?:\s+(dry\s*run|apply))?(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "apply"
+                    if str(m.group(1) or "").strip().lower() == "apply" or str(m.group(2) or "").strip().lower() == "apply"
+                    else "dry_run",
+                    "windowMs": int(m.group(3) or 86400000)
+                    * (
+                        1
+                        if str(m.group(4) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(4) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(4) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(4) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(5) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 6),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 6),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+drift(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+trend(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+offenders(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+timeline(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 20),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+matrix(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+summary(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+guidance(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^run\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+guidance\s+(dry\s*run|dry_run|apply)(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run",
+                "domain": "graph",
+                "payload": {
+                    "mode": "dry_run" if str(m.group(1) or "dry_run").strip().lower() in {"dry run", "dry_run", "dryrun"} else "apply",
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 8),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+guidance\s+run\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+guidance\s+run\s+metrics(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+guidance\s+state\s+guidance\s+state\s+run\s+state\s+guidance\s+run\s+anomalies(?:\s+window\s+(\d+)\s*(ms|s|m|h|d))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies",
+                "domain": "graph",
+                "payload": {
+                    "windowMs": int(m.group(2) or 86400000)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                    "limit": int(m.group(4) or 10),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+score\s+autopilot\s+policy\s+alignment\s+policy\s+trend\s+guidance\s+policy\s+guidance\s+state\s+history(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history",
+                "domain": "graph",
+                "payload": {"limit": int(m.group(2) or 20)},
+            },
+        ),
+        (
+            r"^(show|list)\s+graph\s+neighborhood\s+for\s+(task|tasks|note|notes|expense|expenses)\s+(\S+)(?:\s+depth\s+(\d+))?(?:\s+relation\s+(depends_on|references))?$",
+            lambda m: {
+                "type": "graph_neighborhood",
+                "domain": "graph",
+                "payload": {
+                    "kind": normalize_entity_kind(m.group(2) or ""),
+                    "selector": str(m.group(3) or "").strip(),
+                    "depth": int(m.group(4) or 1),
+                    "relation": str(m.group(5) or "").strip().lower(),
+                },
+            },
+        ),
+        (
+            r"^(show|find)\s+graph\s+path\s+(task|tasks|note|notes|expense|expenses)\s+(\S+)\s+to\s+(task|tasks|note|notes|expense|expenses)\s+(\S+)(?:\s+relation\s+(depends_on|references))?(?:\s+directed\s+(on|off))?$",
+            lambda m: {
+                "type": "graph_path",
+                "domain": "graph",
+                "payload": {
+                    "sourceKind": normalize_entity_kind(m.group(2) or ""),
+                    "sourceSelector": str(m.group(3) or "").strip(),
+                    "targetKind": normalize_entity_kind(m.group(4) or ""),
+                    "targetSelector": str(m.group(5) or "").strip(),
+                    "relation": str(m.group(6) or "").strip().lower(),
+                    "directed": str(m.group(7) or "off").strip().lower() == "on",
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+graph(?:\s+kind\s+(task|tasks|note|notes|expense|expenses))?(?:\s+relation\s+(depends_on|references))?(?:\s+search\s+(.+?))?(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_query",
+                "domain": "graph",
+                "payload": {
+                    "kind": normalize_entity_kind(m.group(2) or ""),
+                    "relation": str(m.group(3) or "").strip().lower(),
+                    "q": str(m.group(4) or "").strip(),
+                    "limit": int(m.group(5) or 20),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+open\s+tasks\s+graph(?:\s+limit\s+(\d+))?$",
+            lambda m: {
+                "type": "graph_query",
+                "domain": "graph",
+                "payload": {
+                    "kind": "task",
+                    "done": False,
+                    "limit": int(m.group(2) or 20),
+                },
+            },
+        ),
+        (
             r"^watch\s+task\s+(\S+)\s+every\s+(\d+)\s*(m|min|mins|minute|minutes)$",
             lambda m: {
                 "type": "schedule_watch_task",
@@ -8205,6 +14432,64 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
                 "type": "schedule_remind_note",
                 "domain": "system",
                 "payload": {"text": m.group(1).strip(), "intervalMinutes": int(m.group(2))},
+            },
+        ),
+        (
+            r"^remind\s+me\s+to\s+(.+)\s+in\s+(\d+)\s*(s|sec|secs|m|min|mins|h|hr|hrs)$",
+            lambda m: {
+                "type": "schedule_remind_once",
+                "domain": "system",
+                "payload": {
+                    "text": m.group(1).strip(),
+                    "delayMs": int(m.group(2))
+                    * (
+                        1000
+                        if str(m.group(3) or "").lower() in {"s", "sec", "secs"}
+                        else 60_000
+                        if str(m.group(3) or "").lower() in {"m", "min", "mins"}
+                        else 3_600_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^(show|list)\s+reminders$",
+            lambda _m: {
+                "type": "list_reminders",
+                "domain": "system",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+reminder\s+status$",
+            lambda _m: {
+                "type": "reminder_status",
+                "domain": "system",
+                "payload": {},
+            },
+        ),
+        (
+            r"^cancel\s+reminder\s+(\S+)$",
+            lambda m: {
+                "type": "cancel_reminder",
+                "domain": "system",
+                "payload": {"selector": str(m.group(1) or "").strip()},
+            },
+        ),
+        (
+            r"^pause\s+reminder\s+(\S+)$",
+            lambda m: {
+                "type": "pause_reminder",
+                "domain": "system",
+                "payload": {"selector": str(m.group(1) or "").strip()},
+            },
+        ),
+        (
+            r"^resume\s+reminder\s+(\S+)$",
+            lambda m: {
+                "type": "resume_reminder",
+                "domain": "system",
+                "payload": {"selector": str(m.group(1) or "").strip()},
             },
         ),
         (
@@ -9869,6 +16154,30 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
             },
         ),
         (
+            r"^(search\s+web|search\s+for)\s+(.+)$",
+            lambda m: {
+                "type": "web_search",
+                "domain": "web",
+                "payload": {"query": str(m.group(2) or "").strip()},
+            },
+        ),
+        (
+            r"^summarize\s+(?:website|web\s+page|site|url)\s+(\S+)$",
+            lambda m: {
+                "type": "web_summarize",
+                "domain": "web",
+                "payload": {"url": m.group(1).strip()},
+            },
+        ),
+        (
+            r"^(open|read)\s+(?:website|web\s+page|site)\s+(\S+)$",
+            lambda m: {
+                "type": "fetch_url",
+                "domain": "web",
+                "payload": {"url": m.group(2).strip()},
+            },
+        ),
+        (
             r"^(show|list)\s+audit\s+op\s+([a-zA-Z0-9_-]+)$",
             lambda m: {
                 "type": "list_audit",
@@ -9930,6 +16239,210 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
                 "type": "list_trace",
                 "domain": "system",
                 "payload": {"limit": 20},
+            },
+        ),
+        (
+            r"^(show|list)\s+connectors(?:\s+(desktop|mobile))?$",
+            lambda m: {
+                "type": "list_connectors",
+                "domain": "system",
+                "payload": {"device": str(m.group(2) or "").strip().lower()},
+            },
+        ),
+        (
+            r"^(show|list)\s+connector\s+grants$",
+            lambda _m: {
+                "type": "list_connector_grants",
+                "domain": "system",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+contacts$",
+            lambda _m: {
+                "type": "contacts_lookup",
+                "domain": "contacts",
+                "payload": {"query": ""},
+            },
+        ),
+        (
+            r"^(find|search)\s+contact\s+(.+)$",
+            lambda m: {
+                "type": "contacts_lookup",
+                "domain": "contacts",
+                "payload": {"query": str(m.group(2) or "").strip()},
+            },
+        ),
+        (
+            r"^grant\s+weather\s+forecast(?:\s+for\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "grant_connector_scope",
+                "domain": "system",
+                "payload": {
+                    "scope": "weather.forecast.read",
+                    "ttlMs": int(m.group(1) or 0)
+                    * (
+                        1
+                        if str(m.group(2) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(2) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(2) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(2) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^grant\s+connector\s+scope\s+([a-zA-Z0-9._-]+)(?:\s+for\s+(\d+)\s*(ms|s|m|h|d))?$",
+            lambda m: {
+                "type": "grant_connector_scope",
+                "domain": "system",
+                "payload": {
+                    "scope": str(m.group(1) or "").strip().lower(),
+                    "ttlMs": int(m.group(2) or 0)
+                    * (
+                        1
+                        if str(m.group(3) or "ms").lower() == "ms"
+                        else 1000
+                        if str(m.group(3) or "").lower() == "s"
+                        else 60_000
+                        if str(m.group(3) or "").lower() == "m"
+                        else 3_600_000
+                        if str(m.group(3) or "").lower() == "h"
+                        else 86_400_000
+                    ),
+                },
+            },
+        ),
+        (
+            r"^revoke\s+weather\s+forecast$",
+            lambda _m: {
+                "type": "revoke_connector_scope",
+                "domain": "system",
+                "payload": {"scope": "weather.forecast.read"},
+            },
+        ),
+        (
+            r"^revoke\s+connector\s+scope\s+([a-zA-Z0-9._-]+)$",
+            lambda m: {
+                "type": "revoke_connector_scope",
+                "domain": "system",
+                "payload": {"scope": str(m.group(1) or "").strip().lower()},
+            },
+        ),
+        (
+            r"^(show|check|get)\s+weather(?:\s+in\s+(.+))?$",
+            lambda m: {
+                "type": "weather_forecast",
+                "domain": "weather",
+                "payload": {"location": str(m.group(2) or "New York").strip()},
+            },
+        ),
+        (
+            r"^(show|list)\s+telephony\s+status$",
+            lambda _m: {
+                "type": "telephony_status",
+                "domain": "telephony",
+                "payload": {},
+            },
+        ),
+        (
+            r"^call\s+(.+)$",
+            lambda m: {
+                "type": "telephony_call_start",
+                "domain": "telephony",
+                "payload": {"target": str(m.group(1) or "").strip()},
+            },
+        ),
+        (
+            r"^confirm\s+call\s+(.+)$",
+            lambda m: {
+                "type": "telephony_call_start",
+                "domain": "telephony",
+                "payload": {"target": str(m.group(1) or "").strip(), "confirmed": True},
+            },
+        ),
+        (
+            r"^handoff\s+call\s+(.+)\s+to\s+mobile$",
+            lambda m: {
+                "type": "telephony_call_start",
+                "domain": "telephony",
+                "payload": {"target": str(m.group(1) or "").strip(), "confirmed": True, "forceHandoff": True},
+            },
+        ),
+        (
+            r"^(show|list)\s+banking\s+status$",
+            lambda _m: {
+                "type": "banking_status",
+                "domain": "bank",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|check|get)\s+(bank\s+)?balance$",
+            lambda _m: {
+                "type": "banking_balance_read",
+                "domain": "bank",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+recent\s+transactions$",
+            lambda _m: {
+                "type": "banking_transactions_read",
+                "domain": "bank",
+                "payload": {"limit": 5},
+            },
+        ),
+        (
+            r"^(show|list)\s+social\s+status$",
+            lambda _m: {
+                "type": "social_status",
+                "domain": "social",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+contacts\s+status$",
+            lambda _m: {
+                "type": "contacts_status",
+                "domain": "contacts",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|list)\s+web\s+status$",
+            lambda _m: {
+                "type": "web_status",
+                "domain": "web",
+                "payload": {},
+            },
+        ),
+        (
+            r"^(show|open|get)\s+social\s+feed$",
+            lambda _m: {
+                "type": "social_feed_read",
+                "domain": "social",
+                "payload": {},
+            },
+        ),
+        (
+            r"^send\s+social\s+message\s+(.+)$",
+            lambda m: {
+                "type": "social_message_send",
+                "domain": "social",
+                "payload": {"text": str(m.group(1) or "").strip()},
+            },
+        ),
+        (
+            r"^confirm\s+send\s+social\s+message\s+(.+)$",
+            lambda m: {
+                "type": "social_message_send",
+                "domain": "social",
+                "payload": {"text": str(m.group(1) or "").strip(), "confirmed": True},
             },
         ),
         (
@@ -10079,7 +16592,179 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
     return []
 
 
+def normalize_intent_text(text: str) -> str:
+    normalized = str(text or "")
+    normalized = normalized.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    normalized = normalized.strip()
+    # Users often submit quoted prompts; strip one balanced wrapper so parser rules still match.
+    if len(normalized) >= 2:
+        quote_pairs = {('"', '"'), ("'", "'")}
+        changed = True
+        while changed and len(normalized) >= 2:
+            changed = False
+            for left, right in quote_pairs:
+                if normalized.startswith(left) and normalized.endswith(right):
+                    normalized = normalized[1:-1].strip()
+                    changed = True
+                    break
+    return normalized
+
+
+def resolve_user_location_hint() -> str:
+    env_location = str(os.getenv("GENOME_HOME_LOCATION", "") or os.getenv("GENOME_DEFAULT_LOCATION", "")).strip()
+    if env_location:
+        return env_location
+    secret_location = str(connector_secret_get("user.home.location") or "").strip()
+    if secret_location:
+        return secret_location
+    return "New York"
+
+
+def normalize_weather_location(raw: str) -> str:
+    location = normalize_intent_text(raw)
+    lower = location.lower()
+    if not location or lower in {"current", "current location", "my location", "where i am", "here", "right now", "today"}:
+        return resolve_user_location_hint()
+    if location == "__current__":
+        return resolve_user_location_hint()
+    return location
+
+
+def parse_semantic_command(text: str) -> dict[str, Any] | None:
+    lower = text.lower().strip()
+    if not lower:
+        return None
+
+    brand_signal = any(word in lower for word in ("puma", "pumas", "nike", "adidas", "reebok", "new balance", "asics", "converse", "vans"))
+    size_signal = bool(re.search(r"\bsize\s+\d+(?:\s*[/-]\s*\d+)?\b", lower))
+    shopping_signal = any(word in lower for word in ("shoe", "shoes", "sneaker", "sneakers", "outfit", "jacket", "jeans", "hoodie", "style")) or brand_signal or size_signal
+    if shopping_signal:
+        category = "shoes" if (brand_signal or size_signal or any(word in lower for word in ("shoe", "shoes", "sneaker", "sneakers"))) else "outfit"
+        return {"type": "shop_catalog_search", "domain": "shopping", "payload": {"query": text, "category": category}}
+
+    if re.match(r"^(where am i|where am i right now|what(?:'s| is) my location|my location)$", lower):
+        return {"type": "location_status", "domain": "system", "payload": {}}
+
+    weather_signal = any(word in lower for word in ("weather", "forecast", "temperature", "rain", "snow", "wind"))
+    if not weather_signal:
+        return None
+
+    location = ""
+    match = re.search(r"\b(?:in|at|for)\s+(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        candidate = normalize_intent_text(match.group(1))
+        if candidate.lower() not in {"today", "tomorrow", "now", "right now"}:
+            location = candidate
+    if not location and any(phrase in lower for phrase in ("where i am", "my location", "where am i", "here")):
+        location = "__current__"
+    if not location and re.match(r"^(what(?:'s| is)|whats|show|check|get|tell me|how(?:'s| is)|weather|forecast|temperature)\b", lower):
+        location = "__current__"
+    if not location:
+        return None
+    return {"type": "weather_forecast", "domain": "weather", "payload": {"location": location}}
+
+
 CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
+    "graph_schema": {"domain": "graph", "risk": "low"},
+    "graph_health": {"domain": "graph", "risk": "low"},
+    "graph_components": {"domain": "graph", "risk": "low"},
+    "graph_hubs": {"domain": "graph", "risk": "low"},
+    "graph_events": {"domain": "graph", "risk": "low"},
+    "graph_summary": {"domain": "graph", "risk": "low"},
+    "graph_relation_matrix": {"domain": "graph", "risk": "low"},
+    "graph_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score": {"domain": "graph", "risk": "low"},
+    "graph_score_trend": {"domain": "graph", "risk": "low"},
+    "graph_score_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_alerts": {"domain": "graph", "risk": "low"},
+    "graph_score_alerts_history": {"domain": "graph", "risk": "low"},
+    "graph_score_remediation": {"domain": "graph", "risk": "low"},
+    "graph_score_forecast": {"domain": "graph", "risk": "low"},
+    "graph_score_forecast_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_guardrails": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_preview": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_drift": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_actions": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_drift": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies": {"domain": "graph", "risk": "low"},
+    "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history": {"domain": "graph", "risk": "low"},
+    "graph_query": {"domain": "graph", "risk": "low"},
+    "graph_neighborhood": {"domain": "graph", "risk": "low"},
+    "graph_path": {"domain": "graph", "risk": "low"},
     "explain_intent": {"domain": "system", "risk": "low"},
     "preview_intent": {"domain": "system", "risk": "low"},
     "policy_drill_confirm": {"domain": "system", "risk": "high"},
@@ -10092,6 +16777,12 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "link_entities": {"domain": "graph", "risk": "low"},
     "schedule_watch_task": {"domain": "system", "risk": "low"},
     "schedule_remind_note": {"domain": "system", "risk": "low"},
+    "schedule_remind_once": {"domain": "system", "risk": "low"},
+    "list_reminders": {"domain": "system", "risk": "low"},
+    "reminder_status": {"domain": "system", "risk": "low"},
+    "cancel_reminder": {"domain": "system", "risk": "low"},
+    "pause_reminder": {"domain": "system", "risk": "low"},
+    "resume_reminder": {"domain": "system", "risk": "low"},
     "schedule_audit_open_tasks": {"domain": "system", "risk": "low"},
     "schedule_summarize_expenses_daily": {"domain": "system", "risk": "low"},
     "schedule_failing_probe": {"domain": "system", "risk": "medium"},
@@ -10205,9 +16896,29 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "list_files": {"domain": "files", "risk": "low"},
     "read_file": {"domain": "files", "risk": "medium"},
     "fetch_url": {"domain": "web", "risk": "medium"},
+    "web_summarize": {"domain": "web", "risk": "low"},
+    "web_search": {"domain": "web", "risk": "low"},
     "list_audit": {"domain": "system", "risk": "low"},
     "trace_summary": {"domain": "system", "risk": "low"},
     "list_trace": {"domain": "system", "risk": "low"},
+    "list_connectors": {"domain": "system", "risk": "low"},
+    "list_connector_grants": {"domain": "system", "risk": "low"},
+    "grant_connector_scope": {"domain": "system", "risk": "low"},
+    "revoke_connector_scope": {"domain": "system", "risk": "low"},
+    "location_status": {"domain": "system", "risk": "low"},
+    "shop_catalog_search": {"domain": "shopping", "risk": "low"},
+    "weather_forecast": {"domain": "weather", "risk": "low"},
+    "telephony_status": {"domain": "telephony", "risk": "low"},
+    "telephony_call_start": {"domain": "telephony", "risk": "high"},
+    "banking_status": {"domain": "bank", "risk": "low"},
+    "banking_balance_read": {"domain": "bank", "risk": "low"},
+    "banking_transactions_read": {"domain": "bank", "risk": "low"},
+    "contacts_status": {"domain": "contacts", "risk": "low"},
+    "social_status": {"domain": "social", "risk": "low"},
+    "web_status": {"domain": "web", "risk": "low"},
+    "social_feed_read": {"domain": "social", "risk": "low"},
+    "social_message_send": {"domain": "social", "risk": "medium"},
+    "contacts_lookup": {"domain": "contacts", "risk": "low"},
     "export_trace": {"domain": "system", "risk": "low"},
     "restore_preview": {"domain": "system", "risk": "medium"},
     "restore_apply": {"domain": "system", "risk": "high"},
@@ -10240,6 +16951,7 @@ async def execute_operations(session: SessionState, session_id: str, operations:
             result = {
                 "ok": False,
                 "message": policy["reason"],
+                "previewLines": build_policy_preview_lines(op, policy),
                 "policy": policy,
                 "capability": capability,
                 "diff": zero_diff(),
@@ -10297,6 +17009,37 @@ def resolve_capability(op: dict[str, Any]) -> dict[str, Any]:
     return {"name": kind, "domain": spec["domain"], "risk": spec["risk"], "known": True}
 
 
+def build_policy_preview_lines(op: dict[str, Any], policy: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    code = str(policy.get("code", "unknown"))
+    reason = str(policy.get("reason", "") or "")
+    lines.append(f"policy: {code}")
+    if reason:
+        lines.append(reason[:180])
+    match = re.search(r"try:\s*(.+)$", reason, flags=re.IGNORECASE)
+    if match:
+        cmd = str(match.group(1) or "").strip()
+        if cmd:
+            lines.append(f"next: {cmd}")
+    op_type = str(op.get("type", "")).strip()
+    if code == "connector_scope_required":
+        scope_hints = {
+            "fetch_url": "grant connector scope web.page.read",
+            "contacts_lookup": "grant connector scope contacts.read",
+            "weather_forecast": "grant weather forecast",
+            "telephony_call_start": "grant connector scope telephony.call.start",
+            "banking_balance_read": "grant connector scope bank.account.balance.read",
+            "banking_transactions_read": "grant connector scope bank.transaction.read",
+            "social_feed_read": "grant connector scope social.feed.read",
+            "social_message_send": "grant connector scope social.message.send",
+        }
+        hint = scope_hints.get(op_type, "")
+        if hint:
+            lines.append(f"grant: {hint}")
+        lines.append("inspect: show connector grants")
+    return lines[:6]
+
+
 def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str, Any]:
     if not capability.get("known"):
         return {"allowed": False, "reason": f"Policy denied unknown capability: {capability['name']}", "code": "unknown_capability"}
@@ -10323,6 +17066,32 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
             "reason": f"Policy requires confirmation for high-risk action. Try: confirm compact journal keep {keep}",
             "code": "confirmation_required",
         }
+    if capability["name"] == "telephony_call_start":
+        target = str(payload.get("target", "")).strip()
+        if not target:
+            return {
+                "allowed": False,
+                "reason": "Call target is required. Try: call 5550100",
+                "code": "invalid_target",
+            }
+        if not connector_scope_granted("telephony.call.start"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope telephony.call.start",
+                "code": "connector_scope_required",
+            }
+        if not looks_like_phone_target(target) and not connector_scope_granted("contacts.read"):
+            return {
+                "allowed": False,
+                "reason": "Contact lookup scope missing for named call target. Try: grant connector scope contacts.read",
+                "code": "connector_scope_required",
+            }
+        if not bool(payload.get("confirmed")):
+            return {
+                "allowed": False,
+                "reason": f"Policy requires confirmation for high-risk action. Try: confirm call {target}",
+                "code": "confirmation_required",
+            }
 
     if risk == "high" and not bool(payload.get("confirmed")):
         return {
@@ -10338,13 +17107,110 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "reason": "Policy denied path outside workspace root.",
                 "code": "path_outside_workspace",
             }
-    if capability["name"] == "fetch_url":
+    if capability["name"] in {"fetch_url", "web_summarize"}:
         url = str(payload.get("url", "")).strip()
         if not is_allowed_web_url(url):
             return {
                 "allowed": False,
                 "reason": "Policy denied URL. Only public http/https URLs are allowed.",
                 "code": "url_not_allowed",
+            }
+        if not connector_scope_granted("web.page.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope web.page.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "web_search":
+        query = str(payload.get("query", "")).strip()
+        if not query:
+            return {
+                "allowed": False,
+                "reason": "Web search query is required.",
+                "code": "invalid_payload",
+            }
+        if not connector_scope_granted("web.page.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope web.page.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "grant_connector_scope":
+        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        if scope not in connector_scope_catalog():
+            return {
+                "allowed": False,
+                "reason": "Unknown connector scope.",
+                "code": "unknown_connector_scope",
+            }
+    if capability["name"] == "revoke_connector_scope":
+        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        if scope not in connector_scope_catalog():
+            return {
+                "allowed": False,
+                "reason": "Unknown connector scope.",
+                "code": "unknown_connector_scope",
+            }
+    if capability["name"] == "weather_forecast":
+        if not connector_scope_granted("weather.forecast.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant weather forecast",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "contacts_lookup":
+        if not connector_scope_granted("contacts.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope contacts.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "banking_balance_read":
+        if not connector_scope_granted("bank.account.balance.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope bank.account.balance.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "banking_transactions_read":
+        if not connector_scope_granted("bank.transaction.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope bank.transaction.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "social_feed_read":
+        if not connector_scope_granted("social.feed.read"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope social.feed.read",
+                "code": "connector_scope_required",
+            }
+    if capability["name"] == "social_message_send":
+        if not connector_scope_granted("social.message.send"):
+            return {
+                "allowed": False,
+                "reason": "Connector scope missing. Try: grant connector scope social.message.send",
+                "code": "connector_scope_required",
+            }
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return {
+                "allowed": False,
+                "reason": "Social message text is required.",
+                "code": "invalid_payload",
+            }
+        if len(text) > 280:
+            return {
+                "allowed": False,
+                "reason": "Social message is too long (max 280 chars).",
+                "code": "invalid_payload",
+            }
+        if not bool(payload.get("confirmed")):
+            return {
+                "allowed": False,
+                "reason": f"Policy requires confirmation for write action. Try: confirm send social message {text}",
+                "code": "confirmation_required",
             }
 
     return {"allowed": True, "reason": "allowed", "code": "ok"}
@@ -10590,6 +17456,106 @@ def should_record_undo(op_type: str) -> bool:
         "continuity_alerts",
         "clear_continuity_alerts",
         "drill_continuity_breach",
+        "graph_schema",
+        "graph_health",
+        "graph_components",
+        "graph_hubs",
+        "graph_events",
+        "graph_summary",
+        "graph_relation_matrix",
+        "graph_anomalies",
+        "graph_guidance",
+        "graph_score",
+        "graph_score_trend",
+        "graph_score_guidance",
+        "graph_score_alerts",
+        "graph_score_alerts_history",
+        "graph_score_remediation",
+        "graph_score_forecast",
+        "graph_score_forecast_guidance",
+        "graph_score_guardrails",
+        "graph_score_autopilot_preview",
+        "graph_score_autopilot_run",
+        "graph_score_autopilot_history",
+        "graph_score_autopilot_metrics",
+        "graph_score_autopilot_anomalies",
+        "graph_score_autopilot_guidance",
+        "graph_score_autopilot_policy",
+        "graph_score_autopilot_policy_drift",
+        "graph_score_autopilot_policy_alignment_actions",
+        "graph_score_autopilot_policy_alignment_run",
+        "graph_score_autopilot_policy_alignment_history",
+        "graph_score_autopilot_policy_alignment_metrics",
+        "graph_score_autopilot_policy_alignment_anomalies",
+        "graph_score_autopilot_policy_alignment_guidance",
+        "graph_score_autopilot_policy_alignment_policy",
+        "graph_score_autopilot_policy_alignment_policy_drift",
+        "graph_score_autopilot_policy_alignment_policy_guidance",
+        "graph_score_autopilot_policy_alignment_policy_run",
+        "graph_score_autopilot_policy_alignment_policy_history",
+        "graph_score_autopilot_policy_alignment_policy_metrics",
+        "graph_score_autopilot_policy_alignment_policy_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies",
+        "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history",
+        "graph_query",
+        "graph_neighborhood",
+        "graph_path",
         "snapshot_stats",
         "verify_journal_integrity",
         "repair_journal_integrity",
@@ -10601,6 +17567,19 @@ def should_record_undo(op_type: str) -> bool:
         "list_audit",
         "trace_summary",
         "list_trace",
+        "list_connectors",
+        "list_connector_grants",
+        "weather_forecast",
+        "grant_connector_scope",
+        "revoke_connector_scope",
+        "telephony_status",
+        "telephony_call_start",
+        "banking_status",
+        "banking_balance_read",
+        "banking_transactions_read",
+        "social_status",
+        "social_feed_read",
+        "social_message_send",
         "export_trace",
         "restore_preview",
         "list_checkpoints",
@@ -10622,6 +17601,10 @@ def is_replayable_mutation_op(op_type: str) -> bool:
         "link_entities",
         "schedule_watch_task",
         "schedule_remind_note",
+        "schedule_remind_once",
+        "cancel_reminder",
+        "pause_reminder",
+        "resume_reminder",
         "schedule_audit_open_tasks",
         "schedule_summarize_expenses_daily",
         "schedule_failing_probe",
@@ -11178,6 +18161,5853 @@ def graph_relation_kinds(graph: dict[str, Any]) -> dict[str, int]:
     return kinds
 
 
+def graph_entity_text(entity: dict[str, Any]) -> str:
+    kind = normalize_entity_kind(entity.get("kind", ""))
+    if kind == "task":
+        return str(entity.get("title", "")).strip().lower()
+    if kind == "note":
+        return str(entity.get("text", "")).strip().lower()
+    if kind == "expense":
+        category = str(entity.get("category", "")).strip().lower()
+        note = str(entity.get("note", "")).strip().lower()
+        amount = str(float(entity.get("amount", 0.0) or 0.0))
+        return f"{category} {note} {amount}".strip()
+    return str(entity.get("id", "")).strip().lower()
+
+
+def build_graph_schema_payload(graph: dict[str, Any]) -> dict[str, Any]:
+    counts = graph_counts(graph)
+    kinds = sorted({normalize_entity_kind(item.get("kind", "")) for item in graph.get("entities", []) if str(item.get("kind", "")).strip()})
+    return {
+        "entityKinds": kinds,
+        "relationKinds": sorted(list(GRAPH_RELATION_KINDS)),
+        "counts": counts,
+    }
+
+
+def query_graph(
+    graph: dict[str, Any],
+    kind: str = "",
+    relation: str = "",
+    text_query: str = "",
+    done: Any = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    entities_all = list(graph.get("entities", []))
+    kind_norm = normalize_entity_kind(kind) if str(kind or "").strip() else ""
+    relation_norm = str(relation or "").strip().lower()
+    query_norm = str(text_query or "").strip().lower()
+    filtered_entities: list[dict[str, Any]] = []
+    for entity in entities_all:
+        if kind_norm and normalize_entity_kind(entity.get("kind", "")) != kind_norm:
+            continue
+        if done is not None and normalize_entity_kind(entity.get("kind", "")) == "task":
+            if bool(entity.get("done", False)) != bool(done):
+                continue
+        if query_norm and query_norm not in graph_entity_text(entity):
+            continue
+        filtered_entities.append(entity)
+    filtered_entities.sort(key=lambda item: int(item.get("createdAt", 0) or 0), reverse=True)
+    filtered_entities = filtered_entities[:limit]
+    entities_by_id = {str(item.get("id", "")): item for item in entities_all}
+    allowed_ids = {str(item.get("id", "")) for item in filtered_entities}
+    filtered_relations: list[dict[str, Any]] = []
+    for rel in reversed(list(graph.get("relations", []))):
+        rel_kind = str(rel.get("kind", "")).strip().lower()
+        if relation_norm and rel_kind != relation_norm:
+            continue
+        src_id = str(rel.get("sourceId", ""))
+        tgt_id = str(rel.get("targetId", ""))
+        if allowed_ids and src_id not in allowed_ids and tgt_id not in allowed_ids:
+            continue
+        source = entities_by_id.get(src_id)
+        target = entities_by_id.get(tgt_id)
+        source_label = graph_entity_label(source) if isinstance(source, dict) else f"entity:{src_id[:8]}"
+        target_label = graph_entity_label(target) if isinstance(target, dict) else f"entity:{tgt_id[:8]}"
+        rel_line = f"{source_label} {rel_kind} {target_label}".lower()
+        if query_norm and query_norm not in rel_line:
+            continue
+        filtered_relations.append(
+            {
+                "id": str(rel.get("id", ""))[:8],
+                "kind": rel_kind,
+                "sourceId": src_id,
+                "targetId": tgt_id,
+                "sourceLabel": source_label,
+                "targetLabel": target_label,
+                "createdAt": int(rel.get("createdAt", 0) or 0),
+            }
+        )
+        if len(filtered_relations) >= limit:
+            break
+    entities_view = [
+        {
+            "id": str(item.get("id", ""))[:8],
+            "kind": normalize_entity_kind(item.get("kind", "")),
+            "label": graph_entity_label(item),
+            "done": bool(item.get("done", False)) if normalize_entity_kind(item.get("kind", "")) == "task" else None,
+            "createdAt": int(item.get("createdAt", 0) or 0),
+        }
+        for item in filtered_entities
+    ]
+    return {
+        "summary": {"entities": len(entities_view), "relations": len(filtered_relations)},
+        "entities": entities_view,
+        "relations": filtered_relations,
+    }
+
+
+def build_graph_neighborhood(
+    graph: dict[str, Any],
+    source: dict[str, Any],
+    depth: int = 1,
+    relation: str = "",
+    limit: int = 40,
+) -> dict[str, Any]:
+    entities_by_id = {str(item.get("id", "")): item for item in graph.get("entities", [])}
+    relations = list(graph.get("relations", []))
+    relation_norm = str(relation or "").strip().lower()
+    source_id = str(source.get("id", ""))
+    visited = {source_id}
+    frontier = [source_id]
+    nodes = [
+        {
+            "id": source_id[:8],
+            "kind": normalize_entity_kind(source.get("kind", "")),
+            "label": graph_entity_label(source),
+            "depth": 0,
+            "isSource": True,
+        }
+    ]
+    edges: list[dict[str, Any]] = []
+    max_depth = max(1, min(int(depth or 1), 4))
+    max_items = max(1, min(int(limit or 40), 200))
+    for layer in range(1, max_depth + 1):
+        if not frontier:
+            break
+        next_frontier: list[str] = []
+        for current in frontier:
+            for rel in relations:
+                rel_kind = str(rel.get("kind", "")).strip().lower()
+                if relation_norm and rel_kind != relation_norm:
+                    continue
+                src_id = str(rel.get("sourceId", ""))
+                tgt_id = str(rel.get("targetId", ""))
+                direction = ""
+                neighbor_id = ""
+                if src_id == current:
+                    direction = "out"
+                    neighbor_id = tgt_id
+                elif tgt_id == current:
+                    direction = "in"
+                    neighbor_id = src_id
+                else:
+                    continue
+                source_entity = entities_by_id.get(src_id)
+                target_entity = entities_by_id.get(tgt_id)
+                edges.append(
+                    {
+                        "id": str(rel.get("id", ""))[:8],
+                        "kind": rel_kind,
+                        "sourceId": src_id[:8],
+                        "targetId": tgt_id[:8],
+                        "sourceLabel": graph_entity_label(source_entity) if isinstance(source_entity, dict) else f"entity:{src_id[:8]}",
+                        "targetLabel": graph_entity_label(target_entity) if isinstance(target_entity, dict) else f"entity:{tgt_id[:8]}",
+                        "directionFromCurrent": direction,
+                    }
+                )
+                if len(edges) >= max_items:
+                    break
+                if neighbor_id and neighbor_id not in visited:
+                    neighbor = entities_by_id.get(neighbor_id)
+                    visited.add(neighbor_id)
+                    next_frontier.append(neighbor_id)
+                    nodes.append(
+                        {
+                            "id": neighbor_id[:8],
+                            "kind": normalize_entity_kind((neighbor or {}).get("kind", "")),
+                            "label": graph_entity_label(neighbor) if isinstance(neighbor, dict) else f"entity:{neighbor_id[:8]}",
+                            "depth": layer,
+                            "isSource": False,
+                        }
+                    )
+                    if len(nodes) >= max_items:
+                        break
+            if len(edges) >= max_items or len(nodes) >= max_items:
+                break
+        frontier = next_frontier
+        if len(edges) >= max_items or len(nodes) >= max_items:
+            break
+    return {
+        "summary": {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "depth": max_depth,
+            "sourceLabel": graph_entity_label(source),
+        },
+        "nodes": nodes[:max_items],
+        "edges": edges[:max_items],
+    }
+
+
+def build_graph_path(
+    graph: dict[str, Any],
+    source: dict[str, Any],
+    target: dict[str, Any],
+    relation: str = "",
+    directed: bool = False,
+    limit: int = 100,
+) -> dict[str, Any]:
+    entities_by_id = {str(item.get("id", "")): item for item in graph.get("entities", [])}
+    source_id = str(source.get("id", ""))
+    target_id = str(target.get("id", ""))
+    relation_norm = str(relation or "").strip().lower()
+    max_items = max(1, min(int(limit or 100), 500))
+    adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for rel in graph.get("relations", []):
+        rel_kind = str(rel.get("kind", "")).strip().lower()
+        if relation_norm and rel_kind != relation_norm:
+            continue
+        src = str(rel.get("sourceId", ""))
+        tgt = str(rel.get("targetId", ""))
+        if not src or not tgt:
+            continue
+        adjacency.setdefault(src, []).append((tgt, rel))
+        if not directed:
+            adjacency.setdefault(tgt, []).append((src, rel))
+    if source_id == target_id:
+        source_label = graph_entity_label(source)
+        return {
+            "summary": {
+                "pathFound": True,
+                "pathLength": 0,
+                "sourceLabel": source_label,
+                "targetLabel": source_label,
+                "directed": bool(directed),
+                "relation": relation_norm or None,
+            },
+            "nodes": [{"id": source_id[:8], "kind": normalize_entity_kind(source.get("kind", "")), "label": source_label}],
+            "edges": [],
+        }
+
+    from collections import deque
+
+    queue = deque([source_id])
+    visited = {source_id}
+    prev_node: dict[str, str] = {}
+    prev_edge: dict[str, dict[str, Any]] = {}
+    steps = 0
+    while queue and steps < max_items:
+        current = queue.popleft()
+        steps += 1
+        for neighbor, edge in adjacency.get(current, []):
+            if neighbor in visited:
+                continue
+            visited.add(neighbor)
+            prev_node[neighbor] = current
+            prev_edge[neighbor] = edge
+            if neighbor == target_id:
+                queue.clear()
+                break
+            queue.append(neighbor)
+    found = target_id in visited
+    if not found:
+        return {
+            "summary": {
+                "pathFound": False,
+                "pathLength": 0,
+                "sourceLabel": graph_entity_label(source),
+                "targetLabel": graph_entity_label(target),
+                "directed": bool(directed),
+                "relation": relation_norm or None,
+            },
+            "nodes": [],
+            "edges": [],
+        }
+
+    path_ids = [target_id]
+    while path_ids[-1] != source_id:
+        parent = prev_node.get(path_ids[-1], "")
+        if not parent:
+            break
+        path_ids.append(parent)
+    path_ids.reverse()
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    for item_id in path_ids:
+        entity = entities_by_id.get(item_id)
+        nodes.append(
+            {
+                "id": item_id[:8],
+                "kind": normalize_entity_kind((entity or {}).get("kind", "")),
+                "label": graph_entity_label(entity) if isinstance(entity, dict) else f"entity:{item_id[:8]}",
+            }
+        )
+    for idx in range(1, len(path_ids)):
+        current = path_ids[idx]
+        parent = path_ids[idx - 1]
+        edge = prev_edge.get(current, {})
+        edges.append(
+            {
+                "id": str(edge.get("id", ""))[:8],
+                "kind": str(edge.get("kind", "")),
+                "sourceId": parent[:8],
+                "targetId": current[:8],
+            }
+        )
+    return {
+        "summary": {
+            "pathFound": True,
+            "pathLength": max(0, len(path_ids) - 1),
+            "sourceLabel": graph_entity_label(source),
+            "targetLabel": graph_entity_label(target),
+            "directed": bool(directed),
+            "relation": relation_norm or None,
+        },
+        "nodes": nodes[:max_items],
+        "edges": edges[:max_items],
+    }
+
+
+def build_graph_health_report(graph: dict[str, Any]) -> dict[str, Any]:
+    entities = list(graph.get("entities", []))
+    relations = list(graph.get("relations", []))
+    entity_ids = {str(item.get("id", "")) for item in entities}
+    in_deg: dict[str, int] = {item_id: 0 for item_id in entity_ids}
+    out_deg: dict[str, int] = {item_id: 0 for item_id in entity_ids}
+    dangling = 0
+    depends_on_count = 0
+    for rel in relations:
+        src = str(rel.get("sourceId", ""))
+        tgt = str(rel.get("targetId", ""))
+        kind = str(rel.get("kind", "")).strip().lower()
+        if kind == "depends_on":
+            depends_on_count += 1
+        if src in entity_ids:
+            out_deg[src] = int(out_deg.get(src, 0) or 0) + 1
+        else:
+            dangling += 1
+        if tgt in entity_ids:
+            in_deg[tgt] = int(in_deg.get(tgt, 0) or 0) + 1
+        else:
+            dangling += 1
+    isolated = [item_id for item_id in entity_ids if int(in_deg.get(item_id, 0) or 0) == 0 and int(out_deg.get(item_id, 0) or 0) == 0]
+    tasks = [item for item in entities if normalize_entity_kind(item.get("kind", "")) == "task"]
+    task_ids = {str(item.get("id", "")) for item in tasks}
+    blocked_tasks = 0
+    ready_tasks = 0
+    for task_id in task_ids:
+        task_blockers = 0
+        for rel in relations:
+            if str(rel.get("kind", "")).strip().lower() != "depends_on":
+                continue
+            if str(rel.get("sourceId", "")) == task_id:
+                task_blockers += 1
+        if task_blockers > 0:
+            blocked_tasks += 1
+        else:
+            ready_tasks += 1
+    status = "healthy"
+    if dangling > 0:
+        status = "degraded"
+    return {
+        "summary": {
+            "status": status,
+            "entities": len(entities),
+            "relations": len(relations),
+            "isolatedEntities": len(isolated),
+            "danglingRelations": int(dangling),
+            "dependsOnEdges": int(depends_on_count),
+            "tasks": {
+                "total": len(tasks),
+                "blocked": int(blocked_tasks),
+                "ready": int(ready_tasks),
+            },
+        },
+        "isolated": [item[:8] for item in isolated[:20]],
+    }
+
+
+def build_graph_components(graph: dict[str, Any], relation: str = "", limit: int = 20) -> dict[str, Any]:
+    entities = list(graph.get("entities", []))
+    entity_ids = [str(item.get("id", "")) for item in entities if str(item.get("id", "")).strip()]
+    entity_by_id = {str(item.get("id", "")): item for item in entities if str(item.get("id", "")).strip()}
+    relation_norm = str(relation or "").strip().lower()
+    adjacency: dict[str, set[str]] = {item_id: set() for item_id in entity_ids}
+    for rel in graph.get("relations", []):
+        rel_kind = str(rel.get("kind", "")).strip().lower()
+        if relation_norm and rel_kind != relation_norm:
+            continue
+        src = str(rel.get("sourceId", ""))
+        tgt = str(rel.get("targetId", ""))
+        if src in adjacency and tgt in adjacency:
+            adjacency[src].add(tgt)
+            adjacency[tgt].add(src)
+    seen: set[str] = set()
+    components: list[list[str]] = []
+    for item_id in entity_ids:
+        if item_id in seen:
+            continue
+        stack = [item_id]
+        group: list[str] = []
+        seen.add(item_id)
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                stack.append(neighbor)
+        components.append(group)
+    components.sort(key=lambda group: len(group), reverse=True)
+    max_items = max(1, min(int(limit or 20), 200))
+    items: list[dict[str, Any]] = []
+    for idx, group in enumerate(components[:max_items], start=1):
+        labels = []
+        kinds: dict[str, int] = {}
+        for item_id in group:
+            entity = entity_by_id.get(item_id, {})
+            labels.append(graph_entity_label(entity))
+            kind = normalize_entity_kind(entity.get("kind", ""))
+            kinds[kind] = int(kinds.get(kind, 0) or 0) + 1
+        items.append(
+            {
+                "index": idx,
+                "size": len(group),
+                "kinds": kinds,
+                "sample": labels[:4],
+            }
+        )
+    return {
+        "summary": {
+            "components": len(components),
+            "largest": len(components[0]) if components else 0,
+            "singletons": sum(1 for group in components if len(group) == 1),
+            "relation": relation_norm or None,
+        },
+        "items": items,
+    }
+
+
+def build_graph_hubs(graph: dict[str, Any], relation: str = "", limit: int = 10) -> dict[str, Any]:
+    entities = list(graph.get("entities", []))
+    entity_by_id = {str(item.get("id", "")): item for item in entities if str(item.get("id", "")).strip()}
+    relation_norm = str(relation or "").strip().lower()
+    in_deg: dict[str, int] = {item_id: 0 for item_id in entity_by_id.keys()}
+    out_deg: dict[str, int] = {item_id: 0 for item_id in entity_by_id.keys()}
+    for rel in graph.get("relations", []):
+        rel_kind = str(rel.get("kind", "")).strip().lower()
+        if relation_norm and rel_kind != relation_norm:
+            continue
+        src = str(rel.get("sourceId", ""))
+        tgt = str(rel.get("targetId", ""))
+        if src in out_deg:
+            out_deg[src] = int(out_deg.get(src, 0) or 0) + 1
+        if tgt in in_deg:
+            in_deg[tgt] = int(in_deg.get(tgt, 0) or 0) + 1
+    rows: list[dict[str, Any]] = []
+    for item_id, entity in entity_by_id.items():
+        incoming = int(in_deg.get(item_id, 0) or 0)
+        outgoing = int(out_deg.get(item_id, 0) or 0)
+        total = incoming + outgoing
+        rows.append(
+            {
+                "id": item_id[:8],
+                "kind": normalize_entity_kind(entity.get("kind", "")),
+                "label": graph_entity_label(entity),
+                "in": incoming,
+                "out": outgoing,
+                "total": total,
+            }
+        )
+    rows.sort(key=lambda item: (int(item.get("total", 0) or 0), int(item.get("in", 0) or 0)), reverse=True)
+    max_items = max(1, min(int(limit or 10), 100))
+    top = rows[:max_items]
+    return {
+        "summary": {
+            "entities": len(rows),
+            "hubs": len(top),
+            "maxDegree": int(top[0].get("total", 0) or 0) if top else 0,
+            "relation": relation_norm or None,
+        },
+        "items": top,
+    }
+
+
+def build_graph_events_report(graph: dict[str, Any], kind: str = "", limit: int = 50) -> dict[str, Any]:
+    kind_norm = str(kind or "").strip().lower()
+    events_raw = list(graph.get("events", []))
+    filtered: list[dict[str, Any]] = []
+    per_kind: dict[str, int] = {}
+    for item in events_raw:
+        event_kind = str(item.get("kind", "")).strip().lower()
+        if kind_norm and event_kind != kind_norm:
+            continue
+        per_kind[event_kind] = int(per_kind.get(event_kind, 0) or 0) + 1
+        filtered.append(item)
+    max_items = max(1, min(int(limit or 50), 500))
+    selected = filtered[-max_items:]
+    items: list[dict[str, Any]] = []
+    latest_ts = 0
+    for event in selected:
+        ts = int(event.get("createdAt", 0) or 0)
+        latest_ts = max(latest_ts, ts)
+        payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
+        compact = {str(k): str(v)[:64] for k, v in payload.items() if isinstance(k, (str, int, float, bool))}
+        items.append(
+            {
+                "kind": str(event.get("kind", "")),
+                "createdAt": ts,
+                "payload": compact,
+            }
+        )
+    return {
+        "summary": {
+            "count": len(filtered),
+            "returned": len(items),
+            "latestTs": latest_ts,
+            "kinds": per_kind,
+            "kind": kind_norm or None,
+        },
+        "items": items,
+    }
+
+
+def build_graph_summary_report(graph: dict[str, Any], relation: str = "", limit: int = 10) -> dict[str, Any]:
+    schema = build_graph_schema_payload(graph)
+    health = build_graph_health_report(graph)
+    components = build_graph_components(graph, relation=relation, limit=limit)
+    hubs = build_graph_hubs(graph, relation=relation, limit=limit)
+    events = build_graph_events_report(graph, kind="", limit=max(20, limit))
+    return {
+        "schema": schema,
+        "health": health,
+        "components": components,
+        "hubs": hubs,
+        "events": events,
+    }
+
+
+def build_graph_relation_matrix(graph: dict[str, Any], relation: str = "", limit: int = 100) -> dict[str, Any]:
+    relation_norm = str(relation or "").strip().lower()
+    entities = list(graph.get("entities", []))
+    entity_kind_by_id = {str(item.get("id", "")): normalize_entity_kind(item.get("kind", "")) for item in entities if str(item.get("id", "")).strip()}
+    rows: dict[str, dict[str, Any]] = {}
+    for rel in graph.get("relations", []):
+        rel_kind = str(rel.get("kind", "")).strip().lower()
+        if relation_norm and rel_kind != relation_norm:
+            continue
+        src_kind = entity_kind_by_id.get(str(rel.get("sourceId", "")), "unknown")
+        tgt_kind = entity_kind_by_id.get(str(rel.get("targetId", "")), "unknown")
+        key = f"{src_kind}->{tgt_kind}:{rel_kind}"
+        bucket = rows.get(key)
+        if not isinstance(bucket, dict):
+            bucket = {"sourceKind": src_kind, "targetKind": tgt_kind, "relation": rel_kind, "count": 0}
+            rows[key] = bucket
+        bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+    sorted_rows = sorted(rows.values(), key=lambda item: int(item.get("count", 0) or 0), reverse=True)
+    max_items = max(1, min(int(limit or 100), 500))
+    return {
+        "summary": {
+            "rows": len(sorted_rows),
+            "relation": relation_norm or None,
+            "relationsTotal": sum(int(item.get("count", 0) or 0) for item in sorted_rows),
+        },
+        "items": sorted_rows[:max_items],
+    }
+
+
+def build_graph_anomalies_report(graph: dict[str, Any], limit: int = 50) -> dict[str, Any]:
+    entities = list(graph.get("entities", []))
+    relations = list(graph.get("relations", []))
+    entity_by_id = {str(item.get("id", "")): item for item in entities if str(item.get("id", "")).strip()}
+    in_deg: dict[str, int] = {item_id: 0 for item_id in entity_by_id.keys()}
+    out_deg: dict[str, int] = {item_id: 0 for item_id in entity_by_id.keys()}
+    anomalies: list[dict[str, Any]] = []
+    for rel in relations:
+        src = str(rel.get("sourceId", ""))
+        tgt = str(rel.get("targetId", ""))
+        kind = str(rel.get("kind", "")).strip().lower()
+        if src in out_deg:
+            out_deg[src] = int(out_deg.get(src, 0) or 0) + 1
+        else:
+            anomalies.append({"type": "dangling_source", "detail": f"{kind}:{src[:8]}->{tgt[:8]}", "severity": "high"})
+        if tgt in in_deg:
+            in_deg[tgt] = int(in_deg.get(tgt, 0) or 0) + 1
+        else:
+            anomalies.append({"type": "dangling_target", "detail": f"{kind}:{src[:8]}->{tgt[:8]}", "severity": "high"})
+        if src and tgt and src == tgt:
+            anomalies.append({"type": "self_loop", "detail": f"{kind}:{src[:8]}", "severity": "medium"})
+    for entity_id, entity in entity_by_id.items():
+        total_deg = int(in_deg.get(entity_id, 0) or 0) + int(out_deg.get(entity_id, 0) or 0)
+        label = graph_entity_label(entity)
+        if total_deg == 0:
+            anomalies.append({"type": "isolated_entity", "detail": label, "severity": "low"})
+        if total_deg >= 12:
+            anomalies.append({"type": "hub_hotspot", "detail": f"{label} deg={total_deg}", "severity": "medium"})
+    anomalies.sort(key=lambda item: (str(item.get("severity", "")), str(item.get("type", "")), str(item.get("detail", ""))), reverse=True)
+    max_items = max(1, min(int(limit or 50), 500))
+    selected = anomalies[:max_items]
+    type_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for item in anomalies:
+        t = str(item.get("type", "unknown"))
+        s = str(item.get("severity", "low"))
+        type_counts[t] = int(type_counts.get(t, 0) or 0) + 1
+        severity_counts[s] = int(severity_counts.get(s, 0) or 0) + 1
+    return {
+        "summary": {
+            "count": len(anomalies),
+            "returned": len(selected),
+            "types": type_counts,
+            "severity": severity_counts,
+            "status": "healthy" if len(anomalies) == 0 else "attention",
+        },
+        "items": selected,
+    }
+
+
+def build_graph_guidance_report(graph: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+    health = build_graph_health_report(graph)
+    anomalies = build_graph_anomalies_report(graph, limit=100)
+    matrix = build_graph_relation_matrix(graph, relation="", limit=20)
+    health_summary = health.get("summary", {}) if isinstance(health.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    anomaly_types = anomaly_summary.get("types", {}) if isinstance(anomaly_summary.get("types"), dict) else {}
+    items: list[dict[str, Any]] = []
+    status = str(health_summary.get("status", "healthy"))
+    if int(anomaly_summary.get("count", 0) or 0) == 0 and status == "healthy":
+        items.append(
+            {
+                "priority": "p3",
+                "command": "show graph summary relation depends_on limit 10",
+                "reason": "graph currently healthy; keep periodic checks",
+            }
+        )
+    if int((health_summary.get("danglingRelations", 0) or 0)) > 0:
+        items.append(
+            {
+                "priority": "p1",
+                "command": "show graph anomalies limit 50",
+                "reason": "dangling relations detected; inspect and repair links",
+            }
+        )
+    if int((health_summary.get("isolatedEntities", 0) or 0)) > 0:
+        items.append(
+            {
+                "priority": "p2",
+                "command": "show graph components limit 20",
+                "reason": "isolated entities detected; review disconnected objects",
+            }
+        )
+    if int(anomaly_types.get("hub_hotspot", 0) or 0) > 0:
+        items.append(
+            {
+                "priority": "p2",
+                "command": "show graph hubs limit 10",
+                "reason": "hotspots detected; inspect high-degree entities",
+            }
+        )
+    matrix_items = matrix.get("items", []) if isinstance(matrix.get("items"), list) else []
+    if matrix_items:
+        top = matrix_items[0] if isinstance(matrix_items[0], dict) else {}
+        rel = str(top.get("relation", "")).strip()
+        if rel:
+            items.append(
+                {
+                    "priority": "p3",
+                    "command": f"show graph relation matrix relation {rel} limit 100",
+                    "reason": "review dominant relation pattern",
+                }
+            )
+    dedup: dict[str, dict[str, Any]] = {}
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    for item in items:
+        cmd = str(item.get("command", "")).strip()
+        if not cmd:
+            continue
+        existing = dedup.get(cmd)
+        if not existing:
+            dedup[cmd] = item
+            continue
+        old_p = priority_order.get(str(existing.get("priority", "p3")), 3)
+        new_p = priority_order.get(str(item.get("priority", "p3")), 3)
+        if new_p < old_p:
+            dedup[cmd] = item
+    ranked = sorted(
+        dedup.values(),
+        key=lambda item: (
+            priority_order.get(str(item.get("priority", "p3")), 3),
+            str(item.get("command", "")),
+        ),
+    )
+    max_items = max(1, min(int(limit or 8), 30))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "status": status,
+            "guidanceCount": len(selected),
+            "anomalyCount": int(anomaly_summary.get("count", 0) or 0),
+            "topAnomalyType": next(iter(anomaly_types.keys()), "none") if anomaly_types else "none",
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_report(graph: dict[str, Any]) -> dict[str, Any]:
+    health = build_graph_health_report(graph)
+    anomalies = build_graph_anomalies_report(graph, limit=500)
+    health_summary = health.get("summary", {}) if isinstance(health.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    severity = anomaly_summary.get("severity", {}) if isinstance(anomaly_summary.get("severity"), dict) else {}
+    total_entities = int(health_summary.get("entities", 0) or 0)
+    total_relations = int(health_summary.get("relations", 0) or 0)
+    isolated = int(health_summary.get("isolatedEntities", 0) or 0)
+    dangling = int(health_summary.get("danglingRelations", 0) or 0)
+    high = int(severity.get("high", 0) or 0)
+    medium = int(severity.get("medium", 0) or 0)
+    low = int(severity.get("low", 0) or 0)
+    score = 100
+    score -= min(40, dangling * 8)
+    score -= min(25, high * 5)
+    score -= min(20, medium * 2)
+    score -= min(15, low)
+    if total_entities > 0:
+        score -= min(15, int((isolated / max(1, total_entities)) * 100) // 4)
+    if total_relations == 0 and total_entities > 2:
+        score -= 10
+    score = max(0, min(100, score))
+    grade = "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D" if score >= 45 else "F"
+    return {
+        "score": int(score),
+        "grade": grade,
+        "status": "healthy" if score >= 80 else "attention" if score >= 60 else "degraded",
+        "signals": {
+            "entities": total_entities,
+            "relations": total_relations,
+            "isolatedEntities": isolated,
+            "danglingRelations": dangling,
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "severity": {"high": high, "medium": medium, "low": low},
+        },
+    }
+
+
+def build_graph_score_trend_report(graph: dict[str, Any], window_ms: int = 3600000, buckets: int = 8) -> dict[str, Any]:
+    base = build_graph_score_report(graph)
+    base_score = int(base.get("score", 0) or 0)
+    now_ts = now_ms()
+    win = max(60000, min(int(window_ms or 3600000), 7 * 24 * 60 * 60 * 1000))
+    bucket_count = max(2, min(int(buckets or 8), 48))
+    bucket_ms = max(1, win // bucket_count)
+    events = [item for item in graph.get("events", []) if isinstance(item, dict)]
+    series: list[dict[str, Any]] = []
+    for idx in range(bucket_count):
+        start = now_ts - win + idx * bucket_ms
+        end = now_ts - win + (idx + 1) * bucket_ms
+        bucket_events = [item for item in events if start <= int(item.get("createdAt", 0) or 0) < end]
+        churn = sum(
+            1
+            for item in bucket_events
+            if str(item.get("kind", "")).lower() in {"delete_task", "clear_completed", "restore_checkpoint", "restore_from_journal", "reset_memory"}
+        )
+        links = sum(1 for item in bucket_events if str(item.get("kind", "")).lower().startswith("link"))
+        volume = len(bucket_events)
+        # Event-heavy buckets reduce confidence slightly; linking activity offsets some penalty.
+        penalty = min(20, volume // 3) + min(10, churn * 2) - min(8, links // 2)
+        bucket_score = max(0, min(100, base_score - penalty))
+        series.append(
+            {
+                "index": idx,
+                "startTs": start,
+                "endTs": end,
+                "events": volume,
+                "churn": churn,
+                "links": links,
+                "score": int(bucket_score),
+            }
+        )
+    first = int(series[0].get("score", base_score) if series else base_score)
+    last = int(series[-1].get("score", base_score) if series else base_score)
+    trend = "up" if last > first else "down" if last < first else "flat"
+    return {
+        "summary": {
+            "currentScore": base_score,
+            "firstScore": first,
+            "lastScore": last,
+            "trend": trend,
+            "windowMs": win,
+            "buckets": bucket_count,
+        },
+        "series": series,
+    }
+
+
+def build_graph_score_guidance_report(graph: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+    score = build_graph_score_report(graph)
+    trend = build_graph_score_trend_report(graph, window_ms=3600000, buckets=8)
+    anomalies = build_graph_anomalies_report(graph, limit=100)
+    score_value = int(score.get("score", 0) or 0)
+    trend_value = str((trend.get("summary", {}) or {}).get("trend", "flat"))
+    anomaly_count = int((anomalies.get("summary", {}) or {}).get("count", 0) or 0)
+    items: list[dict[str, Any]] = []
+    if score_value < 60:
+        items.append({"priority": "p1", "command": "show graph anomalies limit 50", "reason": "graph score is degraded"})
+        items.append({"priority": "p1", "command": "show graph relation matrix relation depends_on limit 100", "reason": "inspect dependency load concentration"})
+    if score_value < 75:
+        items.append({"priority": "p2", "command": "show graph health", "reason": "review integrity and isolation signals"})
+    if trend_value == "down":
+        items.append({"priority": "p1", "command": "show graph score trend window 1h buckets 8", "reason": "score trending down; inspect recent buckets"})
+        items.append({"priority": "p2", "command": "show graph events limit 50", "reason": "identify event bursts driving score drop"})
+    elif trend_value == "flat":
+        items.append({"priority": "p3", "command": "show graph score trend window 1h buckets 8", "reason": "track stability over time"})
+    if anomaly_count > 0:
+        items.append({"priority": "p2", "command": "show graph guidance limit 8", "reason": "review graph-level remediation guidance"})
+    items.append({"priority": "p3", "command": "show graph summary relation depends_on limit 10", "reason": "confirm consolidated state"})
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in items:
+        command = str(item.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(item.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = item
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 6), 20))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "score": score_value,
+            "trend": trend_value,
+            "anomalies": anomaly_count,
+            "guidanceCount": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_alerts_report(graph: dict[str, Any], limit: int = 10) -> dict[str, Any]:
+    score = build_graph_score_report(graph)
+    trend = build_graph_score_trend_report(graph, window_ms=3600000, buckets=8)
+    anomalies = build_graph_anomalies_report(graph, limit=500)
+    score_value = int(score.get("score", 0) or 0)
+    grade = str(score.get("grade", "F"))
+    trend_value = str((trend.get("summary", {}) or {}).get("trend", "flat"))
+    severity = (((score.get("signals", {}) if isinstance(score.get("signals", {}), dict) else {}).get("severity", {}))
+        if isinstance((score.get("signals", {}) if isinstance(score.get("signals", {}), dict) else {}).get("severity", {}), dict)
+        else {})
+    anomaly_count = int((anomalies.get("summary", {}) or {}).get("count", 0) or 0)
+    alerts: list[dict[str, Any]] = []
+    if score_value < 45:
+        alerts.append({"severity": "critical", "code": "score_critical", "message": f"Graph score {score_value} ({grade}) is critically low."})
+    elif score_value < 60:
+        alerts.append({"severity": "high", "code": "score_degraded", "message": f"Graph score {score_value} ({grade}) is degraded."})
+    elif score_value < 75:
+        alerts.append({"severity": "medium", "code": "score_attention", "message": f"Graph score {score_value} ({grade}) needs attention."})
+    if trend_value == "down":
+        alerts.append({"severity": "high" if score_value < 75 else "medium", "code": "trend_down", "message": "Graph score trend is downward over the last window."})
+    high_anom = int(severity.get("high", 0) or 0)
+    if high_anom > 0:
+        alerts.append({"severity": "high", "code": "high_severity_anomalies", "message": f"Detected {high_anom} high-severity graph anomalies."})
+    if anomaly_count > 20:
+        alerts.append({"severity": "medium", "code": "anomaly_volume", "message": f"High anomaly volume detected ({anomaly_count})."})
+    if not alerts:
+        alerts.append({"severity": "low", "code": "healthy", "message": f"Graph score {score_value} ({grade}) is healthy and stable."})
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    alerts.sort(key=lambda item: (severity_rank.get(str(item.get("severity", "low")), 3), str(item.get("code", ""))))
+    max_items = max(1, min(int(limit or 10), 100))
+    selected = alerts[:max_items]
+    return {
+        "summary": {
+            "score": score_value,
+            "grade": grade,
+            "trend": trend_value,
+            "anomalyCount": anomaly_count,
+            "alertCount": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_alerts_history_report(
+    graph: dict[str, Any],
+    window_ms: int = 3600000,
+    buckets: int = 8,
+    limit: int = 5,
+) -> dict[str, Any]:
+    trend = build_graph_score_trend_report(graph, window_ms=window_ms, buckets=buckets)
+    summary = trend.get("summary", {}) if isinstance(trend.get("summary"), dict) else {}
+    series = trend.get("series", []) if isinstance(trend.get("series"), list) else []
+    rows: list[dict[str, Any]] = []
+    for item in series:
+        if not isinstance(item, dict):
+            continue
+        score = int(item.get("score", 0) or 0)
+        events = int(item.get("events", 0) or 0)
+        churn = int(item.get("churn", 0) or 0)
+        alerts = 0
+        if score < 60:
+            alerts += 1
+        if score < 45:
+            alerts += 1
+        if events >= 10:
+            alerts += 1
+        if churn > 0:
+            alerts += 1
+        severity = "critical" if score < 45 else "high" if score < 60 else "medium" if alerts > 0 else "low"
+        rows.append(
+            {
+                "index": int(item.get("index", 0) or 0),
+                "startTs": int(item.get("startTs", 0) or 0),
+                "endTs": int(item.get("endTs", 0) or 0),
+                "score": score,
+                "events": events,
+                "churn": churn,
+                "alertCount": alerts,
+                "severity": severity,
+            }
+        )
+    max_items = max(1, min(int(limit or 5), 20))
+    ranked = sorted(rows, key=lambda row: (-int(row.get("alertCount", 0) or 0), -int(row.get("index", 0) or 0)))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "currentScore": int(summary.get("currentScore", 0) or 0),
+            "trend": str(summary.get("trend", "flat")),
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+            "buckets": int(summary.get("buckets", buckets) or buckets),
+            "totalAlertSignals": int(sum(int(row.get("alertCount", 0) or 0) for row in rows)),
+            "peakAlertCount": int(max((int(row.get("alertCount", 0) or 0) for row in rows), default=0)),
+            "returned": len(selected),
+        },
+        "items": selected,
+        "series": rows,
+    }
+
+
+def build_graph_score_remediation_report(graph: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+    score = build_graph_score_report(graph)
+    alerts = build_graph_score_alerts_report(graph, limit=20)
+    history = build_graph_score_alerts_history_report(graph, window_ms=3600000, buckets=8, limit=8)
+    guidance = build_graph_score_guidance_report(graph, limit=20)
+    score_value = int(score.get("score", 0) or 0)
+    trend = str((history.get("summary", {}) or {}).get("trend", "flat"))
+    alert_count = int((alerts.get("summary", {}) or {}).get("alertCount", 0) or 0)
+    total_signals = int((history.get("summary", {}) or {}).get("totalAlertSignals", 0) or 0)
+    actions: list[dict[str, Any]] = []
+    if score_value < 60:
+        actions.append({"priority": "p1", "command": "show graph anomalies limit 50", "reason": "score is degraded"})
+        actions.append({"priority": "p1", "command": "show graph score alerts limit 10", "reason": "review active score alerts"})
+    if trend == "down":
+        actions.append({"priority": "p1", "command": "show graph score alerts history window 1h buckets 8 limit 5", "reason": "track recent alert acceleration"})
+        actions.append({"priority": "p2", "command": "show graph score trend window 1h buckets 8", "reason": "validate score trajectory"})
+    if total_signals > 0:
+        actions.append({"priority": "p2", "command": "show graph events limit 50", "reason": "inspect event bursts behind alerts"})
+    if alert_count > 0:
+        actions.append({"priority": "p2", "command": "show graph relation matrix relation depends_on limit 100", "reason": "inspect dependency concentration"})
+    for item in (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[:6]:
+        if not isinstance(item, dict):
+            continue
+        actions.append(
+            {
+                "priority": str(item.get("priority", "p3")),
+                "command": str(item.get("command", "")).strip(),
+                "reason": str(item.get("reason", "")).strip() or "score-guidance recommended follow-up",
+            }
+        )
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        command = str(action.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(action.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = action
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 6), 20))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "score": score_value,
+            "trend": trend,
+            "alerts": alert_count,
+            "alertSignals": total_signals,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_forecast_report(
+    graph: dict[str, Any],
+    horizon_ms: int = 3600000,
+    step_buckets: int = 6,
+) -> dict[str, Any]:
+    score = build_graph_score_report(graph)
+    trend = build_graph_score_trend_report(graph, window_ms=horizon_ms, buckets=step_buckets)
+    history = build_graph_score_alerts_history_report(graph, window_ms=horizon_ms, buckets=step_buckets, limit=step_buckets)
+    base_score = int(score.get("score", 0) or 0)
+    trend_summary = trend.get("summary", {}) if isinstance(trend.get("summary"), dict) else {}
+    first_score = int(trend_summary.get("firstScore", base_score) or base_score)
+    last_score = int(trend_summary.get("lastScore", base_score) or base_score)
+    slope = (last_score - first_score) / max(1, int(step_buckets))
+    history_items = history.get("items", []) if isinstance(history.get("items"), list) else []
+    pressure = int(sum(int(item.get("alertCount", 0) or 0) for item in history_items))
+    horizon = max(60000, min(int(horizon_ms or 3600000), 7 * 24 * 60 * 60 * 1000))
+    steps = max(2, min(int(step_buckets or 6), 24))
+    step_ms = max(1, horizon // steps)
+    forecast: list[dict[str, Any]] = []
+    projected = float(base_score)
+    for idx in range(1, steps + 1):
+        projected += slope
+        projected -= min(2.5, pressure / max(steps, 1) / 4.0)
+        projected = max(0.0, min(100.0, projected))
+        ts = now_ms() + idx * step_ms
+        risk = "high" if projected < 60 else "medium" if projected < 75 else "low"
+        forecast.append({"step": idx, "ts": int(ts), "score": int(round(projected)), "risk": risk})
+    end_score = int(forecast[-1]["score"]) if forecast else base_score
+    direction = "up" if end_score > base_score else "down" if end_score < base_score else "flat"
+    return {
+        "summary": {
+            "currentScore": base_score,
+            "forecastEndScore": end_score,
+            "direction": direction,
+            "horizonMs": horizon,
+            "steps": steps,
+            "alertPressure": pressure,
+        },
+        "forecast": forecast,
+    }
+
+
+def build_graph_score_forecast_guidance_report(graph: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+    forecast = build_graph_score_forecast_report(graph, horizon_ms=3600000, step_buckets=6)
+    remediation = build_graph_score_remediation_report(graph, limit=10)
+    summary = forecast.get("summary", {}) if isinstance(forecast.get("summary"), dict) else {}
+    forecast_items = forecast.get("forecast", []) if isinstance(forecast.get("forecast"), list) else []
+    current_score = int(summary.get("currentScore", 0) or 0)
+    end_score = int(summary.get("forecastEndScore", current_score) or current_score)
+    direction = str(summary.get("direction", "flat"))
+    actions: list[dict[str, Any]] = []
+    if direction == "down":
+        actions.append({"priority": "p1", "command": "show graph score remediation limit 6", "reason": "forecast indicates score decay"})
+        actions.append({"priority": "p1", "command": "show graph score alerts history window 1h buckets 8 limit 5", "reason": "identify where decay is concentrated"})
+    high_risk_steps = sum(1 for item in forecast_items if isinstance(item, dict) and str(item.get("risk", "low")) == "high")
+    if high_risk_steps > 0:
+        actions.append({"priority": "p1", "command": "show graph anomalies limit 50", "reason": "high-risk forecast steps detected"})
+        actions.append({"priority": "p2", "command": "show graph events limit 50", "reason": "inspect event bursts preceding high-risk windows"})
+    if end_score < 75:
+        actions.append({"priority": "p2", "command": "show graph relation matrix relation depends_on limit 100", "reason": "inspect graph load concentration"})
+        actions.append({"priority": "p2", "command": "show graph health", "reason": "verify integrity signals before further writes"})
+    for item in (remediation.get("items", []) if isinstance(remediation.get("items"), list) else [])[:6]:
+        if not isinstance(item, dict):
+            continue
+        actions.append(
+            {
+                "priority": str(item.get("priority", "p3")),
+                "command": str(item.get("command", "")).strip(),
+                "reason": str(item.get("reason", "")).strip() or "remediation follow-up",
+            }
+        )
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        command = str(action.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(action.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = action
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 6), 20))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "currentScore": current_score,
+            "forecastEndScore": end_score,
+            "direction": direction,
+            "highRiskSteps": high_risk_steps,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_guardrails_report(
+    graph: dict[str, Any],
+    warn_below: int = 75,
+    fail_below: int = 60,
+) -> dict[str, Any]:
+    warn = max(0, min(int(warn_below), 100))
+    fail = max(0, min(int(fail_below), 100))
+    if fail > warn:
+        fail, warn = warn, fail
+    score = build_graph_score_report(graph)
+    forecast = build_graph_score_forecast_report(graph, horizon_ms=3600000, step_buckets=6)
+    current = int(score.get("score", 0) or 0)
+    forecast_items = forecast.get("forecast", []) if isinstance(forecast.get("forecast"), list) else []
+    min_forecast = min((int(item.get("score", current) or current) for item in forecast_items if isinstance(item, dict)), default=current)
+    status = "fail" if current < fail or min_forecast < fail else "warn" if current < warn or min_forecast < warn else "pass"
+    breaches = [
+        item
+        for item in forecast_items
+        if isinstance(item, dict) and int(item.get("score", 100) or 100) < warn
+    ]
+    return {
+        "summary": {
+            "status": status,
+            "currentScore": current,
+            "forecastMinScore": int(min_forecast),
+            "warnBelow": warn,
+            "failBelow": fail,
+            "breaches": len(breaches),
+        },
+        "breaches": [
+            {
+                "step": int(item.get("step", 0) or 0),
+                "score": int(item.get("score", 0) or 0),
+                "risk": str(item.get("risk", "low")),
+            }
+            for item in breaches
+        ][:10],
+    }
+
+
+def build_graph_score_autopilot_preview_report(graph: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+    guardrails = build_graph_score_guardrails_report(graph, warn_below=75, fail_below=60)
+    forecast_guidance = build_graph_score_forecast_guidance_report(graph, limit=10)
+    remediation = build_graph_score_remediation_report(graph, limit=10)
+    guard_summary = guardrails.get("summary", {}) if isinstance(guardrails.get("summary"), dict) else {}
+    status = str(guard_summary.get("status", "pass"))
+    priority = "p1" if status == "fail" else "p2" if status == "warn" else "p3"
+    items: list[dict[str, Any]] = []
+    if status in {"fail", "warn"}:
+        items.append(
+            {
+                "priority": priority,
+                "command": "show graph score guardrails warn below 75 fail below 60",
+                "reason": "verify guardrail status before action",
+            }
+        )
+    for source in (forecast_guidance, remediation):
+        for item in (source.get("items", []) if isinstance(source.get("items"), list) else [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            items.append(
+                {
+                    "priority": str(item.get("priority", "p3")),
+                    "command": str(item.get("command", "")).strip(),
+                    "reason": str(item.get("reason", "")).strip() or "autopilot suggested follow-up",
+                }
+            )
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in items:
+        command = str(item.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(item.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = item
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 6), 20))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "status": status,
+            "currentScore": int(guard_summary.get("currentScore", 0) or 0),
+            "forecastMinScore": int(guard_summary.get("forecastMinScore", 0) or 0),
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_run_report(graph: dict[str, Any], mode: str = "dry_run", limit: int = 6) -> dict[str, Any]:
+    preview = build_graph_score_autopilot_preview_report(graph, limit=limit)
+    summary = preview.get("summary", {}) if isinstance(preview.get("summary"), dict) else {}
+    items = preview.get("items", []) if isinstance(preview.get("items"), list) else []
+    selected = []
+    for item in items[: max(1, min(int(limit or 6), 20))]:
+        if not isinstance(item, dict):
+            continue
+        selected.append(
+            {
+                "priority": str(item.get("priority", "p3")),
+                "command": str(item.get("command", "")).strip(),
+                "reason": str(item.get("reason", "")).strip(),
+            }
+        )
+    applied = mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_run",
+            {
+                "mode": "apply",
+                "actions": len(selected),
+                "commands": [str(item.get("command", "")) for item in selected[:5]],
+                "status": str(summary.get("status", "pass")),
+            },
+        )
+    return {
+        "summary": {
+            "mode": mode,
+            "status": str(summary.get("status", "pass")),
+            "currentScore": int(summary.get("currentScore", 0) or 0),
+            "forecastMinScore": int(summary.get("forecastMinScore", 0) or 0),
+            "actions": len(selected),
+            "applied": applied,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_history_report(graph: dict[str, Any], limit: int = 20) -> dict[str, Any]:
+    events = [item for item in graph.get("events", []) if isinstance(item, dict) and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_run"]
+    max_items = max(1, min(int(limit or 20), 200))
+    selected = events[-max_items:]
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    for event in selected:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "status": str(payload.get("status", "pass")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+        },
+        "items": list(reversed(rows)),
+    }
+
+
+def build_graph_score_autopilot_metrics_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    total_actions = 0
+    status_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "pass"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        total_actions += actions
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        for cmd in commands:
+            cmd_norm = str(cmd).strip()
+            if not cmd_norm:
+                continue
+            command_counts[cmd_norm] = int(command_counts.get(cmd_norm, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(total_actions / count) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(avg_actions, 2),
+            "statusCounts": status_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_events = 0
+    fail_events = 0
+    high_action_events = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "pass"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_events += 1
+        if status == "fail":
+            fail_events += 1
+        if actions >= 6:
+            high_action_events += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"Autopilot run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+        if mode == "apply" and status in {"warn", "fail"}:
+            anomalies.append(
+                {
+                    "severity": "high" if status == "fail" else "medium",
+                    "code": "risky_apply",
+                    "message": f"Apply run executed under {status} status.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_events / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Apply ratio is elevated ({apply_events}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and fail_events / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "fail_heavy_window",
+                "message": f"Fail ratio is elevated ({fail_events}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if high_action_events >= 3:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "repeated_high_action_runs",
+                "message": f"{high_action_events} runs had high action volume.",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    max_items = max(1, min(int(limit or 10), 100))
+    selected = anomalies[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_events,
+            "failRuns": fail_events,
+            "highActionRuns": high_action_events,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    metrics = build_graph_score_autopilot_metrics_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_anomalies_report(graph, window_ms=win, limit=20)
+    guardrails = build_graph_score_guardrails_report(graph, warn_below=75, fail_below=60)
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    guard_summary = guardrails.get("summary", {}) if isinstance(guardrails.get("summary"), dict) else {}
+    items: list[dict[str, Any]] = []
+    status = str(guard_summary.get("status", "pass"))
+    anomaly_count = int(anomaly_summary.get("count", 0) or 0)
+    apply_count = int(metrics_summary.get("applyCount", 0) or 0)
+    dry_count = int(metrics_summary.get("dryRunCount", 0) or 0)
+    runs = int(metrics_summary.get("count", 0) or 0)
+    if status in {"warn", "fail"}:
+        items.append({"priority": "p1", "command": "show graph score guardrails warn below 75 fail below 60", "reason": "guardrails indicate elevated risk"})
+        items.append({"priority": "p1", "command": "show graph score forecast guidance limit 6", "reason": "forecast guidance needed under degraded guardrails"})
+    if anomaly_count > 0:
+        items.append({"priority": "p1", "command": "show graph score autopilot anomalies window 24h limit 10", "reason": "investigate autopilot anomaly signals"})
+        items.append({"priority": "p2", "command": "show graph score autopilot history limit 20", "reason": "review recent autopilot run timeline"})
+    if runs > 0 and apply_count > dry_count:
+        items.append({"priority": "p2", "command": "run graph score autopilot dry run limit 6", "reason": "increase dry-run checks before further apply runs"})
+    if runs == 0:
+        items.append({"priority": "p3", "command": "run graph score autopilot dry run limit 6", "reason": "establish baseline autopilot behavior"})
+    items.append({"priority": "p2", "command": "show graph score autopilot metrics window 24h", "reason": "monitor autopilot health envelope"})
+    items.append({"priority": "p3", "command": "show graph score autopilot preview limit 6", "reason": "inspect next suggested autopilot actions"})
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in items:
+        command = str(item.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(item.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = item
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 8), 30))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "guardrailStatus": status,
+            "runs": runs,
+            "anomalies": anomaly_count,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    guard = build_graph_score_guardrails_report(graph, warn_below=75, fail_below=60)
+    anomalies = build_graph_score_autopilot_anomalies_report(graph, window_ms=win, limit=20)
+    metrics = build_graph_score_autopilot_metrics_report(graph, window_ms=win)
+    guard_summary = guard.get("summary", {}) if isinstance(guard.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    metric_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    status = str(guard_summary.get("status", "pass"))
+    anomaly_count = int(anomaly_summary.get("count", 0) or 0)
+    apply_runs = int(metric_summary.get("applyCount", 0) or 0)
+    dry_runs = int(metric_summary.get("dryRunCount", 0) or 0)
+    runs = int(metric_summary.get("count", 0) or 0)
+    mode = "balanced"
+    if status == "fail" or anomaly_count >= 2:
+        mode = "safe"
+    elif status == "pass" and anomaly_count == 0 and runs >= 3 and apply_runs >= dry_runs:
+        mode = "aggressive"
+    policy = {
+        "mode": mode,
+        "warnBelow": 80 if mode == "safe" else 75 if mode == "balanced" else 70,
+        "failBelow": 65 if mode == "safe" else 60 if mode == "balanced" else 55,
+        "preferDryRun": mode != "aggressive",
+        "maxApplyRatio": 0.4 if mode == "safe" else 0.6 if mode == "balanced" else 0.8,
+    }
+    rationale = []
+    rationale.append(f"guardrail status: {status}")
+    rationale.append(f"autopilot anomalies: {anomaly_count}")
+    rationale.append(f"run mix apply/dry: {apply_runs}/{dry_runs}")
+    if runs == 0:
+        rationale.append("no recent runs; defaulting to cautious posture")
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "status": status,
+            "anomalies": anomaly_count,
+        },
+        "policy": policy,
+        "rationale": rationale,
+    }
+
+
+def build_graph_score_autopilot_policy_drift_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    policy = build_graph_score_autopilot_policy_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_metrics_report(graph, window_ms=win)
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    runs = int(metrics_summary.get("count", 0) or 0)
+    apply_runs = int(metrics_summary.get("applyCount", 0) or 0)
+    dry_runs = int(metrics_summary.get("dryRunCount", 0) or 0)
+    apply_ratio = float(apply_runs / max(1, runs)) if runs > 0 else 0.0
+    max_apply_ratio = float(policy_cfg.get("maxApplyRatio", 0.6) or 0.6)
+    prefer_dry_run = bool(policy_cfg.get("preferDryRun", True))
+    status_counts = metrics_summary.get("statusCounts", {}) if isinstance(metrics_summary.get("statusCounts"), dict) else {}
+    fail_count = int(status_counts.get("fail", 0) or 0)
+    fail_ratio = float(fail_count / max(1, runs)) if runs > 0 else 0.0
+    checks: list[dict[str, Any]] = []
+    checks.append(
+        {
+            "name": "apply_ratio",
+            "expected": f"<= {max_apply_ratio:.2f}",
+            "actual": f"{apply_ratio:.2f}",
+            "ok": apply_ratio <= max_apply_ratio,
+            "severity": "high" if apply_ratio > max_apply_ratio else "low",
+        }
+    )
+    checks.append(
+        {
+            "name": "dry_run_preference",
+            "expected": "dry>=apply" if prefer_dry_run else "no constraint",
+            "actual": f"dry={dry_runs}, apply={apply_runs}",
+            "ok": (dry_runs >= apply_runs) if prefer_dry_run else True,
+            "severity": "medium" if prefer_dry_run and dry_runs < apply_runs else "low",
+        }
+    )
+    checks.append(
+        {
+            "name": "fail_ratio",
+            "expected": "<= 0.20",
+            "actual": f"{fail_ratio:.2f}",
+            "ok": fail_ratio <= 0.20,
+            "severity": "high" if fail_ratio > 0.20 else "low",
+        }
+    )
+    failed = [item for item in checks if not bool(item.get("ok", False))]
+    status = "aligned" if not failed else "drift"
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "status": status,
+            "driftChecks": len(failed),
+            "applyRatio": round(apply_ratio, 3),
+            "maxApplyRatio": round(max_apply_ratio, 3),
+            "preferDryRun": prefer_dry_run,
+            "failRatio": round(fail_ratio, 3),
+        },
+        "checks": checks,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_actions_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 6,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    drift = build_graph_score_autopilot_policy_drift_report(graph, window_ms=win)
+    policy = build_graph_score_autopilot_policy_report(graph, window_ms=win)
+    summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    checks = drift.get("checks", []) if isinstance(drift.get("checks"), list) else []
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    mode = str(policy_cfg.get("mode", "balanced"))
+    actions: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict) or bool(check.get("ok", False)):
+            continue
+        name = str(check.get("name", "")).strip().lower()
+        if name == "apply_ratio":
+            actions.append({"priority": "p1", "command": "run graph score autopilot dry run limit 6", "reason": "reduce apply ratio drift"})
+            actions.append({"priority": "p2", "command": "show graph score autopilot metrics window 24h", "reason": "verify apply ratio trend"})
+        elif name == "dry_run_preference":
+            actions.append({"priority": "p1", "command": "run graph score autopilot dry run limit 6", "reason": "restore dry-run preference"})
+            actions.append({"priority": "p2", "command": "show graph score autopilot history limit 20", "reason": "review recent apply-heavy behavior"})
+        elif name == "fail_ratio":
+            actions.append({"priority": "p1", "command": "show graph score autopilot anomalies window 24h limit 10", "reason": "investigate fail-heavy autopilot window"})
+            actions.append({"priority": "p1", "command": "show graph score autopilot guidance window 24h limit 8", "reason": "apply safer corrective actions"})
+    if not actions:
+        actions.append({"priority": "p3", "command": "show graph score autopilot policy window 24h", "reason": "policy remains aligned"})
+        actions.append({"priority": "p3", "command": "show graph score autopilot metrics window 24h", "reason": "continue monitoring"})
+    if mode == "safe":
+        actions.append({"priority": "p2", "command": "show graph score guardrails warn below 75 fail below 60", "reason": "validate safe posture guardrails"})
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        command = str(action.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(action.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = action
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 6), 30))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "status": str(summary.get("status", "aligned")),
+            "driftChecks": int(summary.get("driftChecks", 0) or 0),
+            "mode": mode,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 6,
+) -> dict[str, Any]:
+    report = build_graph_score_autopilot_policy_alignment_actions_report(graph, window_ms=window_ms, limit=limit)
+    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    items = report.get("items", []) if isinstance(report.get("items"), list) else []
+    selected: list[dict[str, Any]] = []
+    for item in items[: max(1, min(int(limit or 6), 30))]:
+        if not isinstance(item, dict):
+            continue
+        selected.append(
+            {
+                "priority": str(item.get("priority", "p3")),
+                "command": str(item.get("command", "")).strip(),
+                "reason": str(item.get("reason", "")).strip(),
+            }
+        )
+    applied = mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_run",
+            {
+                "mode": "apply",
+                "actions": len(selected),
+                "status": str(summary.get("status", "aligned")),
+                "commands": [str(item.get("command", "")) for item in selected[:6]],
+            },
+        )
+    return {
+        "summary": {
+            "mode": mode,
+            "status": str(summary.get("status", "aligned")),
+            "driftChecks": int(summary.get("driftChecks", 0) or 0),
+            "actions": len(selected),
+            "applied": applied,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_history_report(graph: dict[str, Any], limit: int = 20) -> dict[str, Any]:
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict) and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_run"
+    ]
+    max_items = max(1, min(int(limit or 20), 200))
+    selected = events[-max_items:]
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    for event in selected:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "status": str(payload.get("status", "aligned")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+        },
+        "items": list(reversed(rows)),
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_metrics_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    total_actions = 0
+    status_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        total_actions += actions
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        for cmd in commands:
+            cmd_norm = str(cmd).strip()
+            if not cmd_norm:
+                continue
+            command_counts[cmd_norm] = int(command_counts.get(cmd_norm, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(total_actions / count) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(avg_actions, 2),
+            "statusCounts": status_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_runs = 0
+    fail_runs = 0
+    high_action_runs = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if status in {"drift", "fail"}:
+            fail_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high" if status == "fail" else "medium",
+                    "code": "non_aligned_run",
+                    "message": f"Alignment run ended with status {status}.",
+                    "createdAt": created_at,
+                }
+            )
+        if actions >= 6:
+            high_action_runs += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"Alignment run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_runs / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Alignment apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and fail_runs / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "drift_heavy_window",
+                "message": f"Drift/fail ratio elevated ({fail_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    max_items = max(1, min(int(limit or 10), 100))
+    selected = anomalies[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "driftRuns": fail_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    drift = build_graph_score_autopilot_policy_drift_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_anomalies_report(graph, window_ms=win, limit=20)
+    metrics = build_graph_score_autopilot_policy_alignment_metrics_report(graph, window_ms=win)
+    drift_summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    status = str(drift_summary.get("status", "aligned"))
+    drift_checks = int(drift_summary.get("driftChecks", 0) or 0)
+    anomaly_count = int(anomaly_summary.get("count", 0) or 0)
+    runs = int(metrics_summary.get("count", 0) or 0)
+    apply_runs = int(metrics_summary.get("applyCount", 0) or 0)
+    dry_runs = int(metrics_summary.get("dryRunCount", 0) or 0)
+    actions: list[dict[str, Any]] = []
+    if status == "drift":
+        actions.append({"priority": "p1", "command": "show graph score autopilot policy drift window 24h", "reason": "confirm current policy drift checks"})
+        actions.append({"priority": "p1", "command": "show graph score autopilot policy alignment actions window 24h limit 6", "reason": "review drift remediation actions"})
+        actions.append({"priority": "p1", "command": "run graph score autopilot policy alignment dry run window 24h limit 6", "reason": "simulate corrective alignment execution"})
+    if anomaly_count > 0:
+        actions.append({"priority": "p1", "command": "show graph score autopilot policy alignment anomalies window 24h limit 10", "reason": "inspect alignment anomalies before apply"})
+        actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment history limit 20", "reason": "review recent alignment run outcomes"})
+    if runs > 0 and apply_runs > dry_runs:
+        actions.append({"priority": "p2", "command": "run graph score autopilot policy alignment dry run window 24h limit 6", "reason": "restore dry-run-first posture"})
+    actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment metrics window 24h", "reason": "track alignment run quality trend"})
+    if not actions:
+        actions.append({"priority": "p3", "command": "show graph score autopilot policy alignment metrics window 24h", "reason": "alignment healthy; continue monitoring"})
+        actions.append({"priority": "p3", "command": "show graph score autopilot policy window 24h", "reason": "validate policy posture remains stable"})
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        command = str(action.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(action.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = action
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 8), 30))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "status": status,
+            "driftChecks": drift_checks,
+            "anomalies": anomaly_count,
+            "runs": runs,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    drift = build_graph_score_autopilot_policy_drift_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_anomalies_report(graph, window_ms=win, limit=20)
+    metrics = build_graph_score_autopilot_policy_alignment_metrics_report(graph, window_ms=win)
+    drift_summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    status = str(drift_summary.get("status", "aligned"))
+    drift_checks = int(drift_summary.get("driftChecks", 0) or 0)
+    anomaly_count = int(anomaly_summary.get("count", 0) or 0)
+    runs = int(metrics_summary.get("count", 0) or 0)
+    apply_runs = int(metrics_summary.get("applyCount", 0) or 0)
+    dry_runs = int(metrics_summary.get("dryRunCount", 0) or 0)
+    mode = "balanced"
+    if status == "drift" or anomaly_count >= 2:
+        mode = "safe"
+    elif status == "aligned" and anomaly_count == 0 and runs >= 3 and dry_runs >= apply_runs:
+        mode = "aggressive"
+    policy = {
+        "mode": mode,
+        "targetStatus": "aligned",
+        "preferDryRun": mode != "aggressive",
+        "maxApplyRatio": 0.4 if mode == "safe" else 0.6 if mode == "balanced" else 0.8,
+        "maxActionsPerRun": 4 if mode == "safe" else 6 if mode == "balanced" else 8,
+        "driftCheckBudget": 0 if mode == "safe" else 1 if mode == "balanced" else 2,
+    }
+    rationale = [
+        f"alignment status: {status}",
+        f"drift checks: {drift_checks}",
+        f"alignment anomalies: {anomaly_count}",
+        f"run mix apply/dry: {apply_runs}/{dry_runs}",
+    ]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "status": status,
+            "driftChecks": drift_checks,
+            "anomalies": anomaly_count,
+        },
+        "policy": policy,
+        "rationale": rationale,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_drift_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    policy = build_graph_score_autopilot_policy_alignment_policy_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_policy_alignment_metrics_report(graph, window_ms=win)
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    runs = int(metrics_summary.get("count", 0) or 0)
+    apply_runs = int(metrics_summary.get("applyCount", 0) or 0)
+    dry_runs = int(metrics_summary.get("dryRunCount", 0) or 0)
+    avg_actions = float(metrics_summary.get("avgActions", 0.0) or 0.0)
+    status_counts = metrics_summary.get("statusCounts", {}) if isinstance(metrics_summary.get("statusCounts"), dict) else {}
+    non_aligned = int(status_counts.get("drift", 0) or 0) + int(status_counts.get("fail", 0) or 0)
+    apply_ratio = float(apply_runs / max(1, runs)) if runs > 0 else 0.0
+    non_aligned_ratio = float(non_aligned / max(1, runs)) if runs > 0 else 0.0
+    max_apply_ratio = float(policy_cfg.get("maxApplyRatio", 0.6) or 0.6)
+    prefer_dry_run = bool(policy_cfg.get("preferDryRun", True))
+    max_actions = int(policy_cfg.get("maxActionsPerRun", 6) or 6)
+    drift_budget = int(policy_cfg.get("driftCheckBudget", 1) or 1)
+    checks: list[dict[str, Any]] = []
+    checks.append(
+        {
+            "name": "apply_ratio",
+            "expected": f"<= {max_apply_ratio:.2f}",
+            "actual": f"{apply_ratio:.2f}",
+            "ok": apply_ratio <= max_apply_ratio,
+            "severity": "high" if apply_ratio > max_apply_ratio else "low",
+        }
+    )
+    checks.append(
+        {
+            "name": "dry_run_preference",
+            "expected": "dry>=apply" if prefer_dry_run else "no constraint",
+            "actual": f"dry={dry_runs}, apply={apply_runs}",
+            "ok": (dry_runs >= apply_runs) if prefer_dry_run else True,
+            "severity": "medium" if prefer_dry_run and dry_runs < apply_runs else "low",
+        }
+    )
+    checks.append(
+        {
+            "name": "actions_per_run",
+            "expected": f"<= {max_actions}",
+            "actual": f"{avg_actions:.2f}",
+            "ok": avg_actions <= float(max_actions),
+            "severity": "medium" if avg_actions > float(max_actions) else "low",
+        }
+    )
+    checks.append(
+        {
+            "name": "non_aligned_ratio",
+            "expected": f"<= {float(drift_budget / max(1, runs)):.2f}" if runs > 0 else "<= 0.00",
+            "actual": f"{non_aligned_ratio:.2f}",
+            "ok": non_aligned <= drift_budget,
+            "severity": "high" if non_aligned > drift_budget else "low",
+        }
+    )
+    failed = [item for item in checks if not bool(item.get("ok", False))]
+    status = "aligned" if not failed else "drift"
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "status": status,
+            "driftChecks": len(failed),
+            "applyRatio": round(apply_ratio, 3),
+            "maxApplyRatio": round(max_apply_ratio, 3),
+            "avgActions": round(avg_actions, 3),
+            "maxActionsPerRun": max_actions,
+            "nonAlignedRuns": non_aligned,
+            "driftCheckBudget": drift_budget,
+        },
+        "checks": checks,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    drift = build_graph_score_autopilot_policy_alignment_policy_drift_report(graph, window_ms=win)
+    policy = build_graph_score_autopilot_policy_alignment_policy_report(graph, window_ms=win)
+    checks = drift.get("checks", []) if isinstance(drift.get("checks"), list) else []
+    drift_summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    actions: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict) or bool(check.get("ok", False)):
+            continue
+        name = str(check.get("name", "")).strip().lower()
+        if name == "apply_ratio":
+            actions.append({"priority": "p1", "command": "run graph score autopilot policy alignment dry run window 24h limit 6", "reason": "reduce apply ratio toward policy cap"})
+            actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment metrics window 24h", "reason": "verify apply ratio trend"})
+        elif name == "dry_run_preference":
+            actions.append({"priority": "p1", "command": "run graph score autopilot policy alignment dry run window 24h limit 6", "reason": "restore dry-run preference"})
+            actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment history limit 20", "reason": "inspect recent run-mode mix"})
+        elif name == "actions_per_run":
+            actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment actions window 24h limit 6", "reason": "review action set size"})
+            actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment anomalies window 24h limit 10", "reason": "check high-volume run anomalies"})
+        elif name == "non_aligned_ratio":
+            actions.append({"priority": "p1", "command": "show graph score autopilot policy alignment anomalies window 24h limit 10", "reason": "investigate non-aligned run spikes"})
+            actions.append({"priority": "p1", "command": "show graph score autopilot policy alignment guidance window 24h limit 8", "reason": "apply corrective alignment guidance"})
+    if not actions:
+        actions.append({"priority": "p3", "command": "show graph score autopilot policy alignment policy window 24h", "reason": "policy is aligned with behavior"})
+        actions.append({"priority": "p3", "command": "show graph score autopilot policy alignment metrics window 24h", "reason": "continue monitoring run quality"})
+    mode = str(policy_cfg.get("mode", "balanced"))
+    if mode == "safe":
+        actions.append({"priority": "p2", "command": "show graph score autopilot policy alignment policy drift window 24h", "reason": "recheck strict safe-mode constraints"})
+    priority_order = {"p1": 1, "p2": 2, "p3": 3}
+    dedup: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        command = str(action.get("command", "")).strip()
+        if not command:
+            continue
+        prev = dedup.get(command)
+        if not prev or priority_order.get(str(action.get("priority", "p3")), 3) < priority_order.get(str(prev.get("priority", "p3")), 3):
+            dedup[command] = action
+    ranked = sorted(dedup.values(), key=lambda item: (priority_order.get(str(item.get("priority", "p3")), 3), str(item.get("command", ""))))
+    max_items = max(1, min(int(limit or 8), 30))
+    selected = ranked[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "status": str(drift_summary.get("status", "aligned")),
+            "driftChecks": int(drift_summary.get("driftChecks", 0) or 0),
+            "mode": mode,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    report = build_graph_score_autopilot_policy_alignment_policy_guidance_report(graph, window_ms=window_ms, limit=limit)
+    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    items = report.get("items", []) if isinstance(report.get("items"), list) else []
+    selected: list[dict[str, Any]] = []
+    for item in items[: max(1, min(int(limit or 8), 30))]:
+        if not isinstance(item, dict):
+            continue
+        selected.append(
+            {
+                "priority": str(item.get("priority", "p3")),
+                "command": str(item.get("command", "")).strip(),
+                "reason": str(item.get("reason", "")).strip(),
+            }
+        )
+    applied = mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_run",
+            {
+                "mode": "apply",
+                "actions": len(selected),
+                "status": str(summary.get("status", "aligned")),
+                "commands": [str(item.get("command", "")) for item in selected[:8]],
+            },
+        )
+    return {
+        "summary": {
+            "mode": mode,
+            "status": str(summary.get("status", "aligned")),
+            "driftChecks": int(summary.get("driftChecks", 0) or 0),
+            "actions": len(selected),
+            "applied": applied,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_history_report(graph: dict[str, Any], limit: int = 20) -> dict[str, Any]:
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict) and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_run"
+    ]
+    max_items = max(1, min(int(limit or 20), 200))
+    selected = events[-max_items:]
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    for event in selected:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "status": str(payload.get("status", "aligned")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+        },
+        "items": list(reversed(rows)),
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_metrics_report(graph: dict[str, Any], window_ms: int = 86400000) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    total_actions = 0
+    status_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        total_actions += actions
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        for cmd in commands:
+            cmd_norm = str(cmd).strip()
+            if not cmd_norm:
+                continue
+            command_counts[cmd_norm] = int(command_counts.get(cmd_norm, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(total_actions / count) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(avg_actions, 2),
+            "statusCounts": status_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_runs = 0
+    non_aligned_runs = 0
+    high_action_runs = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if status in {"drift", "fail"}:
+            non_aligned_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high" if status == "fail" else "medium",
+                    "code": "non_aligned_policy_run",
+                    "message": f"Policy run ended with status {status}.",
+                    "createdAt": created_at,
+                }
+            )
+        if actions >= 8:
+            high_action_runs += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"Policy run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_runs / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Policy apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and non_aligned_runs / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "non_aligned_window",
+                "message": f"Non-aligned run ratio elevated ({non_aligned_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    max_items = max(1, min(int(limit or 10), 100))
+    selected = anomalies[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "nonAlignedRuns": non_aligned_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    policy = build_graph_score_autopilot_policy_alignment_policy_report(graph, window_ms=win)
+    drift = build_graph_score_autopilot_policy_alignment_policy_drift_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_policy_alignment_policy_metrics_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_anomalies_report(graph, window_ms=win, limit=limit)
+    guidance = build_graph_score_autopilot_policy_alignment_policy_guidance_report(graph, window_ms=win, limit=limit)
+    policy_summary = policy.get("summary", {}) if isinstance(policy.get("summary"), dict) else {}
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    drift_summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    guidance_summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "mode": str(policy_cfg.get("mode", "balanced")),
+            "status": str(policy_summary.get("status", "aligned")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "driftChecks": int(drift_summary.get("driftChecks", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "guidanceActions": int(guidance_summary.get("actions", 0) or 0),
+        },
+        "policy": policy_cfg,
+        "drift": drift_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "guidance": guidance_summary,
+        "items": (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    now = now_ms()
+    current_cutoff = now - win
+    previous_cutoff = current_cutoff - win
+    current_events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_run"
+        and int(item.get("createdAt", 0) or 0) >= current_cutoff
+    ]
+    previous_events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_run"
+        and previous_cutoff <= int(item.get("createdAt", 0) or 0) < current_cutoff
+    ]
+
+    def _stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+        apply_count = 0
+        dry_count = 0
+        non_aligned = 0
+        total_actions = 0
+        for event in events:
+            payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+            mode = str(payload.get("mode", "dry_run"))
+            status = str(payload.get("status", "aligned"))
+            actions = int(payload.get("actions", 0) or 0)
+            if mode == "apply":
+                apply_count += 1
+            else:
+                dry_count += 1
+            if status in {"drift", "fail"}:
+                non_aligned += 1
+            total_actions += actions
+        count = len(events)
+        return {
+            "runs": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "nonAlignedRuns": non_aligned,
+            "avgActions": round(float(total_actions / count), 2) if count > 0 else 0.0,
+        }
+
+    current_stats = _stats(current_events)
+    previous_stats = _stats(previous_events)
+    runs_delta = int(current_stats.get("runs", 0) or 0) - int(previous_stats.get("runs", 0) or 0)
+    apply_delta = int(current_stats.get("applyCount", 0) or 0) - int(previous_stats.get("applyCount", 0) or 0)
+    non_aligned_delta = int(current_stats.get("nonAlignedRuns", 0) or 0) - int(previous_stats.get("nonAlignedRuns", 0) or 0)
+    avg_actions_delta = round(float(current_stats.get("avgActions", 0.0) or 0.0) - float(previous_stats.get("avgActions", 0.0) or 0.0), 2)
+    worsening = 0
+    if non_aligned_delta > 0:
+        worsening += 1
+    if apply_delta > 0:
+        worsening += 1
+    if avg_actions_delta > 0:
+        worsening += 1
+    improving = 0
+    if non_aligned_delta < 0:
+        improving += 1
+    if apply_delta < 0:
+        improving += 1
+    if avg_actions_delta < 0:
+        improving += 1
+    direction = "flat"
+    if worsening > improving:
+        direction = "worse"
+    elif improving > worsening:
+        direction = "better"
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": direction,
+            "currentRuns": int(current_stats.get("runs", 0) or 0),
+            "previousRuns": int(previous_stats.get("runs", 0) or 0),
+            "deltaRuns": runs_delta,
+            "deltaApplyRuns": apply_delta,
+            "deltaNonAlignedRuns": non_aligned_delta,
+            "deltaAvgActions": avg_actions_delta,
+        },
+        "current": current_stats,
+        "previous": previous_stats,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 6,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 6), 20))
+    trend = build_graph_score_autopilot_policy_alignment_policy_trend_report(graph, window_ms=win)
+    summary = trend.get("summary", {}) if isinstance(trend.get("summary"), dict) else {}
+    direction = str(summary.get("direction", "flat"))
+    actions: list[dict[str, Any]] = []
+    if direction == "worse":
+        actions.append(
+            {
+                "priority": "p1",
+                "command": "show graph score autopilot policy alignment policy drift window 24h",
+                "reason": "trend worsened, verify drift checks immediately",
+            }
+        )
+        actions.append(
+            {
+                "priority": "p1",
+                "command": "run graph score autopilot policy alignment policy dry run window 24h limit 8",
+                "reason": "simulate corrective policy actions before apply",
+            }
+        )
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy anomalies window 24h limit 10",
+                "reason": "inspect anomaly contributors driving trend regression",
+            }
+        )
+    elif direction == "better":
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy summary window 24h limit 8",
+                "reason": "trend improved, confirm policy posture remains stable",
+            }
+        )
+        actions.append(
+            {
+                "priority": "p3",
+                "command": "show graph score autopilot policy alignment policy trend window 24h",
+                "reason": "continue monitoring trend slope",
+            }
+        )
+    else:
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy metrics window 24h",
+                "reason": "trend is flat, inspect volume and run mix",
+            }
+        )
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy guidance window 24h limit 8",
+                "reason": "identify low-risk optimization steps",
+            }
+        )
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": direction,
+            "actions": len(actions[:max_items]),
+        },
+        "trend": summary,
+        "items": actions[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 6,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_report(graph, window_ms=window_ms, limit=limit)
+    summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    items = guidance.get("items", []) if isinstance(guidance.get("items"), list) else []
+    commands = [str(item.get("command", "")).strip() for item in items if isinstance(item, dict) and str(item.get("command", "")).strip()]
+    selected = commands[: max(1, min(int(limit or 6), 20))]
+    direction = str(summary.get("direction", "flat"))
+    status = "aligned" if direction in {"flat", "better"} else "drift"
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_run",
+            {
+                "mode": normalized_mode,
+                "status": status,
+                "direction": direction,
+                "actions": len(selected),
+                "commands": selected,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "status": status,
+            "direction": direction,
+            "actions": len(selected),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": selected,
+        "items": items[: len(selected)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "status": str(payload.get("status", "aligned")),
+                "direction": str(payload.get("direction", "flat")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    status_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    total_actions = 0
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        total_actions += actions
+        for command in commands:
+            cmd = str(command).strip()
+            if not cmd:
+                continue
+            command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = round(float(total_actions / count), 2) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": avg_actions,
+            "statusCounts": status_counts,
+            "directionCounts": direction_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_runs = 0
+    drift_runs = 0
+    high_action_runs = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if status in {"drift", "fail"}:
+            drift_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high" if status == "fail" else "medium",
+                    "code": "non_aligned_trend_guidance_run",
+                    "message": f"Trend-guidance run ended with status {status}.",
+                    "createdAt": created_at,
+                }
+            )
+        if actions >= 6:
+            high_action_runs += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"Trend-guidance run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_runs / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Trend-guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and drift_runs / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "drift_window",
+                "message": f"Trend-guidance drift ratio elevated ({drift_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    selected = anomalies[: max(1, min(int(limit or 10), 100))]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "driftRuns": drift_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    trend = build_graph_score_autopilot_policy_alignment_policy_trend_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies_report(graph, window_ms=win, limit=limit)
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_report(graph, window_ms=win, limit=limit)
+    trend_summary = trend.get("summary", {}) if isinstance(trend.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    guidance_summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": str(trend_summary.get("direction", "flat")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "guidanceActions": int(guidance_summary.get("actions", 0) or 0),
+        },
+        "trend": trend_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "guidance": guidance_summary,
+        "items": (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_summary_report(graph, window_ms=win, limit=8)
+    summary_rollup = summary.get("summary", {}) if isinstance(summary.get("summary"), dict) else {}
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    anomalies = summary.get("anomalies", {}) if isinstance(summary.get("anomalies"), dict) else {}
+    direction = str(summary_rollup.get("direction", "flat"))
+    runs = int(metrics.get("count", 0) or 0)
+    anomaly_count = int(anomalies.get("count", 0) or 0)
+    drift_runs = int(anomalies.get("driftRuns", 0) or 0)
+
+    mode = "balanced"
+    if direction == "worse" or anomaly_count >= 3 or drift_runs >= 2:
+        mode = "safe"
+    elif direction == "better" and anomaly_count == 0 and runs >= 3:
+        mode = "aggressive"
+
+    dry_run_preferred = mode != "aggressive"
+    apply_ratio_cap = 0.25 if mode == "safe" else 0.5 if mode == "balanced" else 0.75
+    action_cap = 4 if mode == "safe" else 6 if mode == "balanced" else 8
+    anomaly_budget = 1 if mode == "safe" else 2 if mode == "balanced" else 3
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "direction": direction,
+            "status": "aligned" if anomaly_count == 0 and direction in {"flat", "better"} else "drift",
+        },
+        "policy": {
+            "mode": mode,
+            "dryRunPreferred": dry_run_preferred,
+            "applyRatioCap": apply_ratio_cap,
+            "actionCap": action_cap,
+            "anomalyBudget": anomaly_budget,
+            "direction": direction,
+        },
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    policy_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_report(graph, window_ms=win)
+    metrics_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics_report(graph, window_ms=win)
+    policy_summary = policy_report.get("summary", {}) if isinstance(policy_report.get("summary"), dict) else {}
+    policy_cfg = policy_report.get("policy", {}) if isinstance(policy_report.get("policy"), dict) else {}
+    metrics_summary = metrics_report.get("summary", {}) if isinstance(metrics_report.get("summary"), dict) else {}
+    runs = int(metrics_summary.get("count", 0) or 0)
+    apply_count = int(metrics_summary.get("applyCount", 0) or 0)
+    avg_actions = float(metrics_summary.get("avgActions", 0.0) or 0.0)
+    observed_apply_ratio = float(apply_count / max(1, runs)) if runs > 0 else 0.0
+    apply_ratio_cap = float(policy_cfg.get("applyRatioCap", 0.5) or 0.5)
+    action_cap = int(policy_cfg.get("actionCap", 6) or 6)
+    direction = str(policy_summary.get("direction", "flat"))
+    dry_preferred = bool(policy_cfg.get("dryRunPreferred", True))
+    checks: list[dict[str, Any]] = []
+
+    apply_ratio_ok = observed_apply_ratio <= apply_ratio_cap + 1e-9
+    checks.append(
+        {
+            "name": "apply_ratio",
+            "ok": apply_ratio_ok,
+            "target": round(apply_ratio_cap, 2),
+            "observed": round(observed_apply_ratio, 2),
+            "message": f"apply ratio {observed_apply_ratio:.2f} vs cap {apply_ratio_cap:.2f}",
+        }
+    )
+
+    action_volume_ok = avg_actions <= float(action_cap) + 1e-9
+    checks.append(
+        {
+            "name": "action_volume",
+            "ok": action_volume_ok,
+            "target": int(action_cap),
+            "observed": round(avg_actions, 2),
+            "message": f"avg actions {avg_actions:.2f} vs cap {action_cap}",
+        }
+    )
+
+    direction_ok = not (direction == "worse" and observed_apply_ratio > 0.0 and dry_preferred)
+    checks.append(
+        {
+            "name": "direction_vs_mode",
+            "ok": direction_ok,
+            "target": "dry_run_bias" if dry_preferred else "mixed",
+            "observed": "apply_heavy" if observed_apply_ratio > 0.5 else "dry_run_bias",
+            "message": f"direction {direction} with observed apply ratio {observed_apply_ratio:.2f}",
+        }
+    )
+
+    drift_count = sum(0 if bool(item.get("ok", False)) else 1 for item in checks)
+    status = "aligned" if drift_count == 0 else "drift"
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": runs,
+            "status": status,
+            "driftChecks": drift_count,
+            "mode": str(policy_cfg.get("mode", "balanced")),
+        },
+        "policy": policy_cfg,
+        "checks": checks,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    drift_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift_report(graph, window_ms=win)
+    summary = drift_report.get("summary", {}) if isinstance(drift_report.get("summary"), dict) else {}
+    policy = drift_report.get("policy", {}) if isinstance(drift_report.get("policy"), dict) else {}
+    checks = drift_report.get("checks", []) if isinstance(drift_report.get("checks"), list) else []
+    actions: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict) or bool(check.get("ok", False)):
+            continue
+        name = str(check.get("name", ""))
+        if name == "apply_ratio":
+            actions.append(
+                {
+                    "priority": "p1",
+                    "command": "run graph score autopilot policy alignment policy trend guidance dry run window 24h limit 6",
+                    "reason": "observed apply ratio exceeds policy cap",
+                }
+            )
+        elif name == "action_volume":
+            cap = int(policy.get("actionCap", 6) or 6)
+            actions.append(
+                {
+                    "priority": "p1",
+                    "command": f"run graph score autopilot policy alignment policy trend guidance dry run window 24h limit {max(1, cap)}",
+                    "reason": "reduce action volume to policy cap",
+                }
+            )
+        elif name == "direction_vs_mode":
+            actions.append(
+                {
+                    "priority": "p2",
+                    "command": "show graph score autopilot policy alignment policy trend guidance policy window 24h",
+                    "reason": "re-evaluate policy posture against current trend direction",
+                }
+            )
+    if not actions:
+        actions.append(
+            {
+                "priority": "p3",
+                "command": "show graph score autopilot policy alignment policy trend guidance summary window 24h limit 8",
+                "reason": "policy drift checks are aligned",
+            }
+        )
+    max_items = max(1, min(int(limit or 8), 30))
+    return {
+        "summary": {
+            "windowMs": int(summary.get("windowMs", win) or win),
+            "status": str(summary.get("status", "aligned")),
+            "mode": str(summary.get("mode", "balanced")),
+            "driftChecks": int(summary.get("driftChecks", 0) or 0),
+            "actions": len(actions[:max_items]),
+        },
+        "items": actions[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_report(
+        graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    items = guidance.get("items", []) if isinstance(guidance.get("items"), list) else []
+    commands = [str(item.get("command", "")).strip() for item in items if isinstance(item, dict) and str(item.get("command", "")).strip()]
+    selected = commands[: max(1, min(int(limit or 8), 30))]
+    status = str(summary.get("status", "aligned"))
+    mode_label = str(summary.get("mode", "balanced"))
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run",
+            {
+                "mode": normalized_mode,
+                "status": status,
+                "policyMode": mode_label,
+                "actions": len(selected),
+                "commands": selected,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "status": status,
+            "policyMode": mode_label,
+            "actions": len(selected),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": selected,
+        "items": items[: len(selected)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "status": str(payload.get("status", "aligned")),
+                "policyMode": str(payload.get("policyMode", "balanced")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    total_actions = 0
+    status_counts: dict[str, int] = {}
+    policy_mode_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        policy_mode = str(payload.get("policyMode", "balanced"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        total_actions += actions
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        policy_mode_counts[policy_mode] = int(policy_mode_counts.get(policy_mode, 0) or 0) + 1
+        for cmd in commands:
+            cmd_norm = str(cmd).strip()
+            if not cmd_norm:
+                continue
+            command_counts[cmd_norm] = int(command_counts.get(cmd_norm, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(total_actions / count) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(avg_actions, 2),
+            "statusCounts": status_counts,
+            "policyModeCounts": policy_mode_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_runs = 0
+    drift_runs = 0
+    high_action_runs = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if status in {"drift", "fail"}:
+            drift_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high" if status == "fail" else "medium",
+                    "code": "non_aligned_policy_guidance_run",
+                    "message": f"Policy-guidance run ended with status {status}.",
+                    "createdAt": created_at,
+                }
+            )
+        if actions >= 8:
+            high_action_runs += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"Policy-guidance run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_runs / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Policy-guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and drift_runs / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "drift_window",
+                "message": f"Policy-guidance drift ratio elevated ({drift_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    selected = anomalies[: max(1, min(int(limit or 10), 100))]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "driftRuns": drift_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    policy = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_report(graph, window_ms=win)
+    drift = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    policy_summary = policy.get("summary", {}) if isinstance(policy.get("summary"), dict) else {}
+    policy_cfg = policy.get("policy", {}) if isinstance(policy.get("policy"), dict) else {}
+    drift_summary = drift.get("summary", {}) if isinstance(drift.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    guidance_summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": str(policy_summary.get("direction", "flat")),
+            "mode": str(policy_cfg.get("mode", "balanced")),
+            "status": str(policy_summary.get("status", "aligned")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "driftChecks": int(drift_summary.get("driftChecks", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "guidanceActions": int(guidance_summary.get("actions", 0) or 0),
+        },
+        "policy": policy_cfg,
+        "drift": drift_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "guidance": guidance_summary,
+        "items": (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary_report(
+        graph,
+        window_ms=win,
+        limit=8,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    direction = str(summary.get("direction", "flat"))
+    mode = str(summary.get("mode", "balanced"))
+    status = str(summary.get("status", "aligned"))
+    drift_checks = int(summary.get("driftChecks", 0) or 0)
+    anomalies = int(summary.get("anomalies", 0) or 0)
+    actions = int(summary.get("guidanceActions", 0) or 0)
+    runs = int(summary.get("runs", 0) or 0)
+
+    severity = "low"
+    if status in {"drift", "fail"} or anomalies >= 3 or drift_checks >= 2:
+        severity = "high"
+    elif anomalies > 0 or drift_checks > 0:
+        severity = "medium"
+
+    state = "steady"
+    if severity == "high":
+        state = "unstable"
+    elif direction == "better" and status == "aligned" and anomalies == 0:
+        state = "improving"
+    elif direction == "worse" or severity == "medium":
+        state = "watch"
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": state,
+            "severity": severity,
+            "mode": mode,
+            "status": status,
+            "direction": direction,
+            "runs": runs,
+            "driftChecks": drift_checks,
+            "anomalies": anomalies,
+            "guidanceActions": actions,
+        },
+        "state": {
+            "name": state,
+            "severity": severity,
+            "message": f"{state} | mode {mode} | status {status} | direction {direction}",
+        },
+    }
+
+
+def classify_policy_guidance_state_from_run(status: str, mode: str, actions: int) -> tuple[str, str]:
+    severity = "low"
+    if status in {"drift", "fail"} or actions >= 8 or mode == "safe":
+        severity = "high"
+    elif actions >= 5 or mode == "balanced":
+        severity = "medium"
+    state = "steady"
+    if severity == "high":
+        state = "unstable"
+    elif severity == "medium":
+        state = "watch"
+    elif mode == "aggressive" and status == "aligned":
+        state = "improving"
+    return state, severity
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    state_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        status = str(payload.get("status", "aligned"))
+        mode = str(payload.get("policyMode", "balanced"))
+        actions = int(payload.get("actions", 0) or 0)
+        state, severity = classify_policy_guidance_state_from_run(status=status, mode=mode, actions=actions)
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        severity_counts[severity] = int(severity_counts.get(severity, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": str(payload.get("mode", "dry_run")),
+                "policyMode": mode,
+                "status": status,
+                "actions": actions,
+                "state": state,
+                "severity": severity,
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "stateCounts": state_counts,
+            "severityCounts": severity_counts,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    state_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    mode_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    actions_total = 0
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        status = str(payload.get("status", "aligned"))
+        mode = str(payload.get("policyMode", "balanced"))
+        actions = int(payload.get("actions", 0) or 0)
+        state, severity = classify_policy_guidance_state_from_run(status=status, mode=mode, actions=actions)
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        severity_counts[severity] = int(severity_counts.get(severity, 0) or 0) + 1
+        mode_counts[mode] = int(mode_counts.get(mode, 0) or 0) + 1
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        actions_total += actions
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(actions_total / count) if count > 0 else 0.0
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "avgActions": round(avg_actions, 2),
+            "stateCounts": state_counts,
+            "severityCounts": severity_counts,
+            "modeCounts": mode_counts,
+            "statusCounts": status_counts,
+            "lastRunAt": int(last_run_at),
+        },
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    unstable_runs = 0
+    state_flips = 0
+    prev_state = ""
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        status = str(payload.get("status", "aligned"))
+        mode = str(payload.get("policyMode", "balanced"))
+        actions = int(payload.get("actions", 0) or 0)
+        state, severity = classify_policy_guidance_state_from_run(status=status, mode=mode, actions=actions)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if state == "unstable":
+            unstable_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "unstable_run",
+                    "message": f"Run entered unstable state ({status}/{mode}, actions {actions}).",
+                    "createdAt": created_at,
+                }
+            )
+        if prev_state and state != prev_state:
+            state_flips += 1
+        prev_state = state
+    total = len(events)
+    if total >= 4 and unstable_runs / max(1, total) >= 0.4:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "unstable_window",
+                "message": f"Unstable state ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 5 and state_flips >= 3:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "state_churn",
+                "message": f"State changed frequently ({state_flips} flips / {total} runs).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    selected = anomalies[: max(1, min(int(limit or 10), 100))]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "unstableRuns": unstable_runs,
+            "stateFlips": state_flips,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    state = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_report(graph, window_ms=win)
+    metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics_report(graph, window_ms=win)
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history_report(graph, limit=limit)
+    state_summary = state.get("summary", {}) if isinstance(state.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    history_summary = history.get("summary", {}) if isinstance(history.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": str(state_summary.get("state", "steady")),
+            "severity": str(state_summary.get("severity", "low")),
+            "mode": str(state_summary.get("mode", "balanced")),
+            "status": str(state_summary.get("status", "aligned")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "stateFlips": int(anomaly_summary.get("stateFlips", 0) or 0),
+            "historyCount": int(history_summary.get("count", 0) or 0),
+        },
+        "state": state_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "history": history_summary,
+        "items": (history.get("items", []) if isinstance(history.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    actions: list[dict[str, Any]] = []
+    state = str(summary.get("state", "steady"))
+    severity = str(summary.get("severity", "low"))
+    status = str(summary.get("status", "aligned"))
+    anomalies = int(summary.get("anomalies", 0) or 0)
+    runs = int(summary.get("runs", 0) or 0)
+    flips = int(summary.get("stateFlips", 0) or 0)
+    max_items = max(1, min(int(limit or 8), 30))
+
+    if severity == "high" or state == "unstable":
+        actions.append(
+            {
+                "priority": "p1",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state anomalies window 24h limit 10",
+                "reason": "unstable state detected; inspect active anomalies first",
+            }
+        )
+        actions.append(
+            {
+                "priority": "p1",
+                "command": "run graph score autopilot policy alignment policy trend guidance policy guidance dry run window 24h limit 8",
+                "reason": "force dry-run remediation while state is unstable",
+            }
+        )
+    if anomalies > 0 or flips >= 3:
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state history limit 20",
+                "reason": "review recent state transitions and churn",
+            }
+        )
+    if status in {"drift", "fail"}:
+        actions.append(
+            {
+                "priority": "p2",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance window 24h limit 8",
+                "reason": "re-evaluate policy-guidance actions for drift status",
+            }
+        )
+    if runs < 3:
+        actions.append(
+            {
+                "priority": "p3",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state metrics window 24h",
+                "reason": "collect more run volume before hard policy shifts",
+            }
+        )
+    if not actions:
+        actions.append(
+            {
+                "priority": "p3",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state summary window 24h limit 8",
+                "reason": "state posture is stable; continue periodic summary checks",
+            }
+        )
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": state,
+            "severity": severity,
+            "status": status,
+            "anomalies": anomalies,
+            "actions": len(actions[:max_items]),
+        },
+        "items": actions[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_report(
+        graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    items = guidance.get("items", []) if isinstance(guidance.get("items"), list) else []
+    commands = [str(item.get("command", "")).strip() for item in items if isinstance(item, dict) and str(item.get("command", "")).strip()]
+    selected = commands[: max(1, min(int(limit or 8), 30))]
+    state = str(summary.get("state", "steady"))
+    severity = str(summary.get("severity", "low"))
+    status = str(summary.get("status", "aligned"))
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run",
+            {
+                "mode": normalized_mode,
+                "state": state,
+                "severity": severity,
+                "status": status,
+                "actions": len(selected),
+                "commands": selected,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "state": state,
+            "severity": severity,
+            "status": status,
+            "actions": len(selected),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": selected,
+        "items": items[: len(selected)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    state_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        severity_counts[severity] = int(severity_counts.get(severity, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "state": state,
+                "severity": severity,
+                "status": str(payload.get("status", "aligned")),
+                "actions": int(payload.get("actions", 0) or 0),
+                "commands": payload.get("commands", []) if isinstance(payload.get("commands"), list) else [],
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "stateCounts": state_counts,
+            "severityCounts": severity_counts,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    total_actions = 0
+    state_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    last_run_at = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        total_actions += actions
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        severity_counts[severity] = int(severity_counts.get(severity, 0) or 0) + 1
+        status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+        for command in commands:
+            cmd = str(command).strip()
+            if not cmd:
+                continue
+            command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+        ts = int(event.get("createdAt", 0) or 0)
+        if ts > last_run_at:
+            last_run_at = ts
+    count = len(events)
+    avg_actions = float(total_actions / count) if count > 0 else 0.0
+    top_commands = sorted(command_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(avg_actions, 2),
+            "stateCounts": state_counts,
+            "severityCounts": severity_counts,
+            "statusCounts": status_counts,
+            "lastRunAt": int(last_run_at),
+        },
+        "topCommands": [{"command": cmd, "count": int(freq)} for cmd, freq in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    anomalies: list[dict[str, Any]] = []
+    apply_runs = 0
+    unstable_runs = 0
+    high_action_runs = 0
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if state == "unstable" or severity == "high":
+            unstable_runs += 1
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "unstable_state_guidance_run",
+                    "message": f"State-guidance run entered {state}/{severity}.",
+                    "createdAt": created_at,
+                }
+            )
+        if actions >= 8:
+            high_action_runs += 1
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "code": "high_action_volume",
+                    "message": f"State-guidance run emitted {actions} actions.",
+                    "createdAt": created_at,
+                }
+            )
+    total = len(events)
+    if total >= 3 and apply_runs / max(1, total) >= 0.8:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"State-guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and unstable_runs / max(1, total) >= 0.3:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "unstable_window",
+                "message": f"Unstable state-guidance ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )
+    selected = anomalies[: max(1, min(int(limit or 10), 100))]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "unstableRuns": unstable_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history_report(
+        graph,
+        limit=limit,
+    )
+    metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics_report(
+        graph,
+        window_ms=win,
+    )
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    guidance_summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    history_summary = history.get("summary", {}) if isinstance(history.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": str(guidance_summary.get("state", "steady")),
+            "severity": str(guidance_summary.get("severity", "low")),
+            "status": str(guidance_summary.get("status", "aligned")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "guidanceActions": int(guidance_summary.get("actions", 0) or 0),
+            "historyCount": int(history_summary.get("count", 0) or 0),
+        },
+        "guidance": guidance_summary,
+        "history": history_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "items": (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary_report(
+        graph,
+        window_ms=win,
+        limit=8,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    state = str(summary.get("state", "steady"))
+    severity = str(summary.get("severity", "low"))
+    status = str(summary.get("status", "aligned"))
+    runs = int(summary.get("runs", 0) or 0)
+    anomalies = int(summary.get("anomalies", 0) or 0)
+    actions = int(summary.get("guidanceActions", 0) or 0)
+
+    posture = "steady"
+    if severity == "high" or state == "unstable":
+        posture = "critical"
+    elif severity == "medium" or anomalies > 0:
+        posture = "watch"
+    elif status == "aligned" and runs >= 3 and anomalies == 0:
+        posture = "healthy"
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "posture": posture,
+            "state": state,
+            "severity": severity,
+            "status": status,
+            "runs": runs,
+            "anomalies": anomalies,
+            "guidanceActions": actions,
+        },
+        "state": {
+            "posture": posture,
+            "state": state,
+            "severity": severity,
+            "status": status,
+            "message": f"{posture} | {state}/{severity}/{status} | runs {runs} | anomalies {anomalies}",
+        },
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    now = now_ms()
+    current_cutoff = now - win
+    previous_cutoff = current_cutoff - win
+    event_kind = "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+    current_events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == event_kind
+        and int(item.get("createdAt", 0) or 0) >= current_cutoff
+    ]
+    previous_events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == event_kind
+        and previous_cutoff <= int(item.get("createdAt", 0) or 0) < current_cutoff
+    ]
+
+    def _dominant(counts: dict[str, int], fallback: str) -> str:
+        if not counts:
+            return fallback
+        return sorted(counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[0][0]
+
+    def _stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+        state_counts: dict[str, int] = {}
+        severity_counts: dict[str, int] = {}
+        posture_counts: dict[str, int] = {}
+        actions_total = 0
+        unstable_runs = 0
+        critical_runs = 0
+        for event in events:
+            payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+            state = str(payload.get("state", "steady"))
+            severity = str(payload.get("severity", "low"))
+            status = str(payload.get("status", "aligned"))
+            actions = int(payload.get("actions", 0) or 0)
+            posture = "steady"
+            if severity == "high" or state == "unstable":
+                posture = "critical"
+            elif severity == "medium":
+                posture = "watch"
+            elif status == "aligned":
+                posture = "healthy"
+            state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+            severity_counts[severity] = int(severity_counts.get(severity, 0) or 0) + 1
+            posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+            actions_total += actions
+            if state == "unstable":
+                unstable_runs += 1
+            if posture == "critical":
+                critical_runs += 1
+        count = len(events)
+        return {
+            "runs": count,
+            "actions": actions_total,
+            "avgActions": round(float(actions_total / count), 2) if count > 0 else 0.0,
+            "unstableRuns": unstable_runs,
+            "criticalRuns": critical_runs,
+            "dominantState": _dominant(state_counts, "steady"),
+            "dominantSeverity": _dominant(severity_counts, "low"),
+            "dominantPosture": _dominant(posture_counts, "steady"),
+            "stateCounts": state_counts,
+            "severityCounts": severity_counts,
+            "postureCounts": posture_counts,
+        }
+
+    current_stats = _stats(current_events)
+    previous_stats = _stats(previous_events)
+    delta_runs = int(current_stats.get("runs", 0) or 0) - int(previous_stats.get("runs", 0) or 0)
+    delta_critical = int(current_stats.get("criticalRuns", 0) or 0) - int(previous_stats.get("criticalRuns", 0) or 0)
+    delta_unstable = int(current_stats.get("unstableRuns", 0) or 0) - int(previous_stats.get("unstableRuns", 0) or 0)
+    delta_avg_actions = round(float(current_stats.get("avgActions", 0.0) or 0.0) - float(previous_stats.get("avgActions", 0.0) or 0.0), 2)
+    worsening = 0
+    improving = 0
+    if delta_critical > 0:
+        worsening += 1
+    elif delta_critical < 0:
+        improving += 1
+    if delta_unstable > 0:
+        worsening += 1
+    elif delta_unstable < 0:
+        improving += 1
+    if delta_avg_actions > 0:
+        worsening += 1
+    elif delta_avg_actions < 0:
+        improving += 1
+    direction = "flat"
+    if worsening > improving:
+        direction = "worse"
+    elif improving > worsening:
+        direction = "better"
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": direction,
+            "currentRuns": int(current_stats.get("runs", 0) or 0),
+            "previousRuns": int(previous_stats.get("runs", 0) or 0),
+            "deltaRuns": delta_runs,
+            "deltaCriticalRuns": delta_critical,
+            "deltaUnstableRuns": delta_unstable,
+            "deltaAvgActions": delta_avg_actions,
+            "currentPosture": str(current_stats.get("dominantPosture", "steady")),
+            "previousPosture": str(previous_stats.get("dominantPosture", "steady")),
+        },
+        "current": current_stats,
+        "previous": previous_stats,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 50))
+    cutoff = now_ms() - win
+    event_kind = "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == event_kind
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    buckets: dict[str, dict[str, Any]] = {}
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        command = str(commands[0]) if commands else f"mode:{mode}"
+        slot = buckets.setdefault(
+            command,
+            {"command": command, "count": 0, "critical": 0, "unstable": 0, "actions": 0, "modes": {}, "lastSeen": 0},
+        )
+        slot["count"] = int(slot.get("count", 0) or 0) + 1
+        slot["actions"] = int(slot.get("actions", 0) or 0) + actions
+        if severity == "high" or status in {"drift", "fail"}:
+            slot["critical"] = int(slot.get("critical", 0) or 0) + 1
+        if state == "unstable":
+            slot["unstable"] = int(slot.get("unstable", 0) or 0) + 1
+        mode_counts = slot.get("modes", {}) if isinstance(slot.get("modes"), dict) else {}
+        mode_counts[mode] = int(mode_counts.get(mode, 0) or 0) + 1
+        slot["modes"] = mode_counts
+        slot["lastSeen"] = max(int(slot.get("lastSeen", 0) or 0), int(event.get("createdAt", 0) or 0))
+    offenders: list[dict[str, Any]] = []
+    for item in buckets.values():
+        count = int(item.get("count", 0) or 0)
+        actions = int(item.get("actions", 0) or 0)
+        critical = int(item.get("critical", 0) or 0)
+        unstable = int(item.get("unstable", 0) or 0)
+        score = (critical * 3) + (unstable * 2) + count + int(actions / 3)
+        offenders.append(
+            {
+                "command": str(item.get("command", "-")),
+                "score": score,
+                "count": count,
+                "criticalRuns": critical,
+                "unstableRuns": unstable,
+                "avgActions": round(float(actions / count), 2) if count > 0 else 0.0,
+                "modes": item.get("modes", {}) if isinstance(item.get("modes"), dict) else {},
+                "lastSeen": int(item.get("lastSeen", 0) or 0),
+            }
+        )
+    offenders = sorted(
+        offenders,
+        key=lambda row: (
+            -int(row.get("score", 0) or 0),
+            -int(row.get("criticalRuns", 0) or 0),
+            -int(row.get("unstableRuns", 0) or 0),
+            -int(row.get("count", 0) or 0),
+            str(row.get("command", "")),
+        ),
+    )
+    selected = offenders[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": len(events),
+            "offenders": len(selected),
+            "criticalRuns": sum(int(row.get("criticalRuns", 0) or 0) for row in selected),
+            "unstableRuns": sum(int(row.get("unstableRuns", 0) or 0) for row in selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 20,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 20), 200))
+    cutoff = now_ms() - win
+    event_kind = "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == event_kind
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    events = sorted(events, key=lambda row: int(row.get("createdAt", 0) or 0), reverse=True)
+    apply_runs = 0
+    unstable_runs = 0
+    critical_runs = 0
+    items: list[dict[str, Any]] = []
+    for event in events[:max_items]:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        status = str(payload.get("status", "aligned"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        command = str(commands[0]) if commands else "-"
+        if mode == "apply":
+            apply_runs += 1
+        if state == "unstable":
+            unstable_runs += 1
+        if severity == "high":
+            critical_runs += 1
+        items.append(
+            {
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "state": state,
+                "severity": severity,
+                "status": status,
+                "actions": actions,
+                "command": command,
+            }
+        )
+    total = len(items)
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": total,
+            "applyRuns": apply_runs,
+            "dryRunRuns": max(0, total - apply_runs),
+            "unstableRuns": unstable_runs,
+            "criticalRuns": critical_runs,
+        },
+        "items": items,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    event_kind = "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run"
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == event_kind
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    matrix: dict[str, int] = {}
+    states: dict[str, int] = {}
+    severities: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        state = str(payload.get("state", "steady"))
+        severity = str(payload.get("severity", "low"))
+        status = str(payload.get("status", "aligned"))
+        key = f"{state}|{severity}|{status}"
+        matrix[key] = int(matrix.get(key, 0) or 0) + 1
+        states[state] = int(states.get(state, 0) or 0) + 1
+        severities[severity] = int(severities.get(severity, 0) or 0) + 1
+        statuses[status] = int(statuses.get(status, 0) or 0) + 1
+    rows = [
+        {"state": key.split("|")[0], "severity": key.split("|")[1], "status": key.split("|")[2], "count": count}
+        for key, count in matrix.items()
+    ]
+    rows = sorted(rows, key=lambda row: (-int(row.get("count", 0) or 0), str(row.get("state", "")), str(row.get("severity", "")), str(row.get("status", ""))))
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": len(events),
+            "cells": len(rows),
+            "stateCounts": states,
+            "severityCounts": severities,
+            "statusCounts": statuses,
+        },
+        "items": rows,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 30))
+    trend = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend_report(graph, window_ms=win)
+    offenders = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders_report(graph, window_ms=win, limit=max_items)
+    matrix = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix_report(graph, window_ms=win)
+    timeline = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline_report(graph, window_ms=win, limit=max_items)
+    trend_summary = trend.get("summary", {}) if isinstance(trend.get("summary"), dict) else {}
+    matrix_summary = matrix.get("summary", {}) if isinstance(matrix.get("summary"), dict) else {}
+    offender_items = offenders.get("items", []) if isinstance(offenders.get("items"), list) else []
+    timeline_items = timeline.get("items", []) if isinstance(timeline.get("items"), list) else []
+    guidance: list[dict[str, Any]] = []
+
+    direction = str(trend_summary.get("direction", "flat"))
+    current_posture = str(trend_summary.get("currentPosture", "steady"))
+    if direction == "worse" or current_posture in {"critical", "watch"}:
+        guidance.append(
+            {
+                "priority": "p1",
+                "reason": f"trend {direction} with posture {current_posture}",
+                "command": "run graph score autopilot policy alignment policy trend guidance policy guidance state guidance dry run window 24h limit 8",
+            }
+        )
+    top_offender = offender_items[0] if offender_items and isinstance(offender_items[0], dict) else None
+    if top_offender:
+        guidance.append(
+            {
+                "priority": "p1",
+                "reason": "top offender command is repeatedly unstable/critical",
+                "command": str(top_offender.get("command", "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state offenders window 24h limit 8")),
+            }
+        )
+    critical_runs = int((timeline.get("summary", {}) or {}).get("criticalRuns", 0) or 0)
+    if critical_runs > 0:
+        guidance.append(
+            {
+                "priority": "p2",
+                "reason": f"critical runs in timeline: {critical_runs}",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state timeline window 24h limit 20",
+            }
+        )
+    cells = int(matrix_summary.get("cells", 0) or 0)
+    if cells >= 3:
+        guidance.append(
+            {
+                "priority": "p2",
+                "reason": f"state matrix fragmentation across {cells} cells",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state matrix window 24h",
+            }
+        )
+    if not guidance:
+        guidance.append(
+            {
+                "priority": "p3",
+                "reason": "state guidance posture stable",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state trend window 24h",
+            }
+        )
+    guidance = guidance[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": direction,
+            "posture": current_posture,
+            "actions": len(guidance),
+            "offenders": int((offenders.get("summary", {}) or {}).get("offenders", 0) or 0),
+            "criticalRuns": critical_runs,
+            "matrixCells": cells,
+        },
+        "items": guidance,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_report(
+        graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    items = guidance.get("items", []) if isinstance(guidance.get("items"), list) else []
+    commands = [str(item.get("command", "")).strip() for item in items if isinstance(item, dict) and str(item.get("command", "")).strip()]
+    selected = commands[: max(1, min(int(limit or 8), 30))]
+    direction = str(summary.get("direction", "flat"))
+    posture = str(summary.get("posture", "steady"))
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run",
+            {
+                "mode": normalized_mode,
+                "direction": direction,
+                "posture": posture,
+                "actions": len(selected),
+                "commands": selected,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "direction": direction,
+            "posture": posture,
+            "actions": len(selected),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": selected,
+        "items": items[: len(selected)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        direction = str(payload.get("direction", "flat"))
+        posture = str(payload.get("posture", "steady"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "direction": direction,
+                "posture": posture,
+                "actions": actions,
+                "commands": [str(cmd) for cmd in commands[:4]],
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    apply_count = 0
+    dry_count = 0
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    actions_total = 0
+    command_counts: dict[str, int] = {}
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        direction = str(payload.get("direction", "flat"))
+        posture = str(payload.get("posture", "steady"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        actions_total += actions
+        for command in commands:
+            cmd = str(command).strip()
+            if cmd:
+                command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+    count = len(events)
+    top_commands = sorted(command_counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(float(actions_total / count), 2) if count > 0 else 0.0,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "topCommands": [{"command": cmd, "count": int(n or 0)} for cmd, n in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 10), 100))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    total = len(events)
+    apply_runs = 0
+    worse_runs = 0
+    critical_runs = 0
+    high_action_runs = 0
+    anomalies: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        direction = str(payload.get("direction", "flat"))
+        posture = str(payload.get("posture", "steady"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if direction == "worse":
+            worse_runs += 1
+        if posture == "critical":
+            critical_runs += 1
+        if actions >= 5:
+            high_action_runs += 1
+        if direction == "worse" and posture == "critical":
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "worse_critical_run",
+                    "message": f"Guidance run was worse/critical (actions {actions}).",
+                    "createdAt": created_at,
+                }
+            )
+    if total >= 3 and apply_runs / max(1, total) >= 0.7:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_burst",
+                "message": f"Guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and worse_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "worse_trend_window",
+                "message": f"Worse direction ratio elevated ({worse_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and critical_runs / max(1, total) >= 0.4:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "critical_posture_window",
+                "message": f"Critical posture ratio elevated ({critical_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and high_action_runs / max(1, total) >= 0.6:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "high_action_load",
+                "message": f"High-action guidance runs elevated ({high_action_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    selected = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "worseRuns": worse_runs,
+            "criticalRuns": critical_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history_report(
+        graph,
+        limit=limit,
+    )
+    metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics_report(
+        graph,
+        window_ms=win,
+    )
+    anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=limit,
+    )
+    guidance_summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    history_summary = history.get("summary", {}) if isinstance(history.get("summary"), dict) else {}
+    metrics_summary = metrics.get("summary", {}) if isinstance(metrics.get("summary"), dict) else {}
+    anomaly_summary = anomalies.get("summary", {}) if isinstance(anomalies.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "direction": str(guidance_summary.get("direction", "flat")),
+            "posture": str(guidance_summary.get("posture", "steady")),
+            "actions": int(guidance_summary.get("actions", 0) or 0),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "historyCount": int(history_summary.get("count", 0) or 0),
+        },
+        "guidance": guidance_summary,
+        "history": history_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "items": (guidance.get("items", []) if isinstance(guidance.get("items"), list) else [])[: max(1, min(int(limit or 8), 30))],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary_report(
+        graph,
+        window_ms=win,
+        limit=8,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    direction = str(summary.get("direction", "flat"))
+    posture = str(summary.get("posture", "steady"))
+    runs = int(summary.get("runs", 0) or 0)
+    anomalies = int(summary.get("anomalies", 0) or 0)
+    actions = int(summary.get("actions", 0) or 0)
+
+    state = "steady"
+    if posture in {"critical", "watch"} or direction == "worse":
+        state = "unstable" if posture == "critical" else "watch"
+    elif direction == "better" and anomalies == 0:
+        state = "improving"
+
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": state,
+            "posture": posture,
+            "direction": direction,
+            "runs": runs,
+            "anomalies": anomalies,
+            "actions": actions,
+        },
+        "state": {
+            "name": state,
+            "posture": posture,
+            "direction": direction,
+            "message": f"{state} | posture {posture} | direction {direction} | runs {runs} | anomalies {anomalies}",
+        },
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history_report(
+        graph,
+        limit=limit,
+    )
+    history_summary = history.get("summary", {}) if isinstance(history.get("summary"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    state_counts: dict[str, int] = {}
+    for item in (history.get("items", []) if isinstance(history.get("items"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction", "flat"))
+        posture = str(item.get("posture", "steady"))
+        state = "steady"
+        if posture in {"critical", "watch"} or direction == "worse":
+            state = "unstable" if posture == "critical" else "watch"
+        elif direction == "better":
+            state = "improving"
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(item.get("id", "")),
+                "createdAt": int(item.get("createdAt", 0) or 0),
+                "mode": str(item.get("mode", "dry_run")),
+                "state": state,
+                "posture": posture,
+                "direction": direction,
+                "actions": int(item.get("actions", 0) or 0),
+                "commands": [str(cmd) for cmd in (item.get("commands", []) if isinstance(item.get("commands"), list) else [])[:4]],
+            }
+        )
+    return {
+        "summary": {
+            "count": len(rows),
+            "totalCount": int(history_summary.get("count", len(rows)) or len(rows)),
+            "stateCounts": state_counts,
+            "directionCounts": history_summary.get("directionCounts", {}) if isinstance(history_summary.get("directionCounts"), dict) else {},
+            "postureCounts": history_summary.get("postureCounts", {}) if isinstance(history_summary.get("postureCounts"), dict) else {},
+        },
+        "items": rows,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    count = 0
+    apply_count = 0
+    dry_count = 0
+    action_total = 0
+    state_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run":
+            continue
+        if int(event.get("createdAt", 0) or 0) < cutoff:
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        direction = str(payload.get("direction", "flat"))
+        posture = str(payload.get("posture", "steady"))
+        state = "steady"
+        if posture in {"critical", "watch"} or direction == "worse":
+            state = "unstable" if posture == "critical" else "watch"
+        elif direction == "better":
+            state = "improving"
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        action_total += int(payload.get("actions", 0) or 0)
+        count += 1
+    avg_actions = float(action_total) / float(count) if count else 0.0
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": avg_actions,
+            "stateCounts": state_counts,
+        },
+        "items": [],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 10), 100))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    total = len(events)
+    apply_runs = 0
+    unstable_runs = 0
+    worse_runs = 0
+    high_action_runs = 0
+    anomalies: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        direction = str(payload.get("direction", "flat"))
+        posture = str(payload.get("posture", "steady"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        state = "steady"
+        if posture in {"critical", "watch"} or direction == "worse":
+            state = "unstable" if posture == "critical" else "watch"
+        elif direction == "better":
+            state = "improving"
+        if state in {"unstable", "watch"}:
+            unstable_runs += 1
+        if direction == "worse":
+            worse_runs += 1
+        if actions >= 5:
+            high_action_runs += 1
+        if state == "unstable" and actions >= 3:
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "unstable_high_action_run",
+                    "message": f"State run unstable with elevated actions ({actions}).",
+                    "createdAt": created_at,
+                }
+            )
+    if total >= 3 and unstable_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "unstable_window_ratio",
+                "message": f"Unstable/watch state ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and worse_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "worse_state_direction_window",
+                "message": f"Worse direction ratio elevated ({worse_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and apply_runs / max(1, total) >= 0.7:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "state_apply_burst",
+                "message": f"State guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and high_action_runs / max(1, total) >= 0.6:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "state_high_action_load",
+                "message": f"State guidance high-action runs elevated ({high_action_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    selected = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "unstableRuns": unstable_runs,
+            "worseRuns": worse_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 30))
+    state_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_report(
+        graph,
+        window_ms=win,
+    )
+    history_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history_report(
+        graph,
+        limit=max_items,
+    )
+    metrics_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics_report(
+        graph,
+        window_ms=win,
+    )
+    anomalies_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=max_items,
+    )
+    state_summary = state_report.get("summary", {}) if isinstance(state_report.get("summary"), dict) else {}
+    history_summary = history_report.get("summary", {}) if isinstance(history_report.get("summary"), dict) else {}
+    metrics_summary = metrics_report.get("summary", {}) if isinstance(metrics_report.get("summary"), dict) else {}
+    anomaly_summary = anomalies_report.get("summary", {}) if isinstance(anomalies_report.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": str(state_summary.get("state", "steady")),
+            "posture": str(state_summary.get("posture", "steady")),
+            "direction": str(state_summary.get("direction", "flat")),
+            "runs": int(metrics_summary.get("count", 0) or 0),
+            "anomalies": int(anomaly_summary.get("count", 0) or 0),
+            "avgActions": float(metrics_summary.get("avgActions", 0.0) or 0.0),
+            "historyCount": int(history_summary.get("count", 0) or 0),
+        },
+        "state": state_report.get("state", {}) if isinstance(state_report.get("state"), dict) else {},
+        "history": history_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomaly_summary,
+        "items": (history_report.get("items", []) if isinstance(history_report.get("items"), list) else [])[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary_report(
+        graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    history_items = summary_report.get("items", []) if isinstance(summary_report.get("items"), list) else []
+    commands: list[str] = []
+    for item in history_items:
+        if not isinstance(item, dict):
+            continue
+        for command in (item.get("commands", []) if isinstance(item.get("commands"), list) else []):
+            cmd = str(command).strip()
+            if cmd and cmd not in commands:
+                commands.append(cmd)
+            if len(commands) >= max(1, min(int(limit or 8), 30)):
+                break
+        if len(commands) >= max(1, min(int(limit or 8), 30)):
+            break
+    if not commands:
+        commands = [
+            "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state summary window 24h limit 8"
+        ]
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run",
+            {
+                "mode": normalized_mode,
+                "state": str(summary.get("state", "steady")),
+                "posture": str(summary.get("posture", "steady")),
+                "direction": str(summary.get("direction", "flat")),
+                "actions": len(commands),
+                "commands": commands,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "state": str(summary.get("state", "steady")),
+            "posture": str(summary.get("posture", "steady")),
+            "direction": str(summary.get("direction", "flat")),
+            "actions": len(commands),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": commands,
+        "items": history_items[: len(commands)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    state_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "state": state,
+                "posture": posture,
+                "direction": direction,
+                "actions": actions,
+                "commands": [str(cmd) for cmd in commands[:4]],
+            }
+        )
+    selected = list(reversed(rows[-max_items:]))
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "stateCounts": state_counts,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    count = 0
+    apply_count = 0
+    dry_count = 0
+    actions_total = 0
+    state_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run":
+            continue
+        if int(event.get("createdAt", 0) or 0) < cutoff:
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        actions_total += actions
+        for command in commands:
+            cmd = str(command).strip()
+            if cmd:
+                command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+        count += 1
+    top_commands = sorted(command_counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(float(actions_total / count), 2) if count > 0 else 0.0,
+            "stateCounts": state_counts,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "topCommands": [{"command": cmd, "count": int(n or 0)} for cmd, n in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 10), 100))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    total = len(events)
+    apply_runs = 0
+    unstable_runs = 0
+    worse_runs = 0
+    high_action_runs = 0
+    anomalies: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if state in {"unstable", "watch"}:
+            unstable_runs += 1
+        if direction == "worse":
+            worse_runs += 1
+        if actions >= 5:
+            high_action_runs += 1
+        if mode == "apply" and state == "unstable" and actions >= 3:
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "apply_unstable_run",
+                    "message": f"Applied run in unstable state with actions {actions}.",
+                    "createdAt": created_at,
+                }
+            )
+    if total >= 3 and apply_runs / max(1, total) >= 0.7:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "apply_run_burst",
+                "message": f"Apply run ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and unstable_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "unstable_run_ratio",
+                "message": f"Unstable/watch run ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and worse_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "worse_direction_run_ratio",
+                "message": f"Worse direction ratio elevated ({worse_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and high_action_runs / max(1, total) >= 0.6:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "high_action_run_ratio",
+                "message": f"High-action run ratio elevated ({high_action_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    selected = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "unstableRuns": unstable_runs,
+            "worseRuns": worse_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 30))
+    state_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_report(
+        graph,
+        window_ms=win,
+    )
+    run_history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history_report(
+        graph,
+        limit=max_items,
+    )
+    run_metrics = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics_report(
+        graph,
+        window_ms=win,
+    )
+    run_anomalies = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=max_items,
+    )
+    state_summary = state_report.get("summary", {}) if isinstance(state_report.get("summary"), dict) else {}
+    history_summary = run_history.get("summary", {}) if isinstance(run_history.get("summary"), dict) else {}
+    metrics_summary = run_metrics.get("summary", {}) if isinstance(run_metrics.get("summary"), dict) else {}
+    anomaly_summary = run_anomalies.get("summary", {}) if isinstance(run_anomalies.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": str(state_summary.get("state", "steady")),
+            "posture": str(state_summary.get("posture", "steady")),
+            "direction": str(state_summary.get("direction", "flat")),
+            "runCount": int(metrics_summary.get("count", 0) or 0),
+            "runAnomalies": int(anomaly_summary.get("count", 0) or 0),
+            "avgActions": float(metrics_summary.get("avgActions", 0.0) or 0.0),
+            "runHistoryCount": int(history_summary.get("count", 0) or 0),
+        },
+        "state": state_report.get("state", {}) if isinstance(state_report.get("state"), dict) else {},
+        "runHistory": history_summary,
+        "runMetrics": metrics_summary,
+        "runAnomalies": anomaly_summary,
+        "items": (run_history.get("items", []) if isinstance(run_history.get("items"), list) else [])[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary_report(
+        graph,
+        window_ms=win,
+        limit=8,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    state = str(summary.get("state", "steady"))
+    posture = str(summary.get("posture", "steady"))
+    direction = str(summary.get("direction", "flat"))
+    run_count = int(summary.get("runCount", 0) or 0)
+    anomalies = int(summary.get("runAnomalies", 0) or 0)
+    avg_actions = float(summary.get("avgActions", 0.0) or 0.0)
+    normalized = "steady"
+    if state in {"unstable", "watch"} or posture in {"critical", "watch"} or direction == "worse":
+        normalized = "unstable" if state == "unstable" or posture == "critical" else "watch"
+    elif direction == "better" and anomalies == 0:
+        normalized = "improving"
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": normalized,
+            "posture": posture,
+            "direction": direction,
+            "runCount": run_count,
+            "runAnomalies": anomalies,
+            "avgActions": avg_actions,
+        },
+        "state": {
+            "name": normalized,
+            "posture": posture,
+            "direction": direction,
+            "message": f"{normalized} | posture {posture} | direction {direction} | runs {run_count} | anomalies {anomalies}",
+        },
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    history = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history_report(
+        graph,
+        limit=limit,
+    )
+    history_summary = history.get("summary", {}) if isinstance(history.get("summary"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    state_counts: dict[str, int] = {}
+    for item in (history.get("items", []) if isinstance(history.get("items"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        state = str(item.get("state", "steady"))
+        posture = str(item.get("posture", "steady"))
+        direction = str(item.get("direction", "flat"))
+        normalized = "steady"
+        if state in {"unstable", "watch"} or posture in {"critical", "watch"} or direction == "worse":
+            normalized = "unstable" if state == "unstable" or posture == "critical" else "watch"
+        elif direction == "better":
+            normalized = "improving"
+        state_counts[normalized] = int(state_counts.get(normalized, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(item.get("id", "")),
+                "createdAt": int(item.get("createdAt", 0) or 0),
+                "mode": str(item.get("mode", "dry_run")),
+                "state": normalized,
+                "posture": posture,
+                "direction": direction,
+                "actions": int(item.get("actions", 0) or 0),
+                "commands": [str(cmd) for cmd in (item.get("commands", []) if isinstance(item.get("commands"), list) else [])[:4]],
+            }
+        )
+    return {
+        "summary": {
+            "count": len(rows),
+            "totalCount": int(history_summary.get("count", len(rows)) or len(rows)),
+            "stateCounts": state_counts,
+            "directionCounts": history_summary.get("directionCounts", {}) if isinstance(history_summary.get("directionCounts"), dict) else {},
+            "postureCounts": history_summary.get("postureCounts", {}) if isinstance(history_summary.get("postureCounts"), dict) else {},
+        },
+        "items": rows,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    count = 0
+    apply_count = 0
+    dry_count = 0
+    actions_total = 0
+    state_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run":
+            continue
+        if int(event.get("createdAt", 0) or 0) < cutoff:
+            continue
+        payload = event.get("payload", {}) if isinstance(payload := event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        normalized = "steady"
+        if state in {"unstable", "watch"} or posture in {"critical", "watch"} or direction == "worse":
+            normalized = "unstable" if state == "unstable" or posture == "critical" else "watch"
+        elif direction == "better":
+            normalized = "improving"
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[normalized] = int(state_counts.get(normalized, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        actions_total += actions
+        for command in commands:
+            cmd = str(command).strip()
+            if cmd:
+                command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+        count += 1
+    top_commands = sorted(command_counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(float(actions_total / count), 2) if count > 0 else 0.0,
+            "stateCounts": state_counts,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "topCommands": [{"command": cmd, "count": int(n or 0)} for cmd, n in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 10), 100))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    total = len(events)
+    apply_runs = 0
+    unstable_runs = 0
+    worse_runs = 0
+    high_action_runs = 0
+    anomalies: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        normalized = "steady"
+        if state in {"unstable", "watch"} or posture in {"critical", "watch"} or direction == "worse":
+            normalized = "unstable" if state == "unstable" or posture == "critical" else "watch"
+        elif direction == "better":
+            normalized = "improving"
+        if mode == "apply":
+            apply_runs += 1
+        if normalized in {"unstable", "watch"}:
+            unstable_runs += 1
+        if direction == "worse":
+            worse_runs += 1
+        if actions >= 5:
+            high_action_runs += 1
+        if mode == "apply" and normalized == "unstable" and actions >= 3:
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "run_state_apply_unstable",
+                    "message": f"Applied run-state unstable with actions {actions}.",
+                    "createdAt": created_at,
+                }
+            )
+    if total >= 3 and apply_runs / max(1, total) >= 0.7:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "run_state_apply_burst",
+                "message": f"Run-state apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and unstable_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_unstable_ratio",
+                "message": f"Run-state unstable/watch ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and worse_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_worse_ratio",
+                "message": f"Run-state worse direction ratio elevated ({worse_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and high_action_runs / max(1, total) >= 0.6:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_high_action_ratio",
+                "message": f"Run-state high-action ratio elevated ({high_action_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    selected = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "unstableRuns": unstable_runs,
+            "worseRuns": worse_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 30))
+    state_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_report(
+        graph,
+        window_ms=win,
+    )
+    history_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history_report(
+        graph,
+        limit=max_items,
+    )
+    metrics_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics_report(
+        graph,
+        window_ms=win,
+    )
+    anomalies_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies_report(
+        graph,
+        window_ms=win,
+        limit=max_items,
+    )
+    state_summary = state_report.get("summary", {}) if isinstance(state_report.get("summary"), dict) else {}
+    history_summary = history_report.get("summary", {}) if isinstance(history_report.get("summary"), dict) else {}
+    metrics_summary = metrics_report.get("summary", {}) if isinstance(metrics_report.get("summary"), dict) else {}
+    anomalies_summary = anomalies_report.get("summary", {}) if isinstance(anomalies_report.get("summary"), dict) else {}
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": str(state_summary.get("state", "steady")),
+            "posture": str(state_summary.get("posture", "steady")),
+            "direction": str(state_summary.get("direction", "flat")),
+            "runCount": int(state_summary.get("runCount", 0) or 0),
+            "runAnomalies": int(state_summary.get("runAnomalies", 0) or 0),
+            "avgActions": float(state_summary.get("avgActions", 0.0) or 0.0),
+            "historyCount": int(history_summary.get("count", 0) or 0),
+            "anomalyCount": int(anomalies_summary.get("count", 0) or 0),
+        },
+        "state": state_report.get("state", {}) if isinstance(state_report.get("state"), dict) else {},
+        "history": history_summary,
+        "metrics": metrics_summary,
+        "anomalies": anomalies_summary,
+        "items": (history_report.get("items", []) if isinstance(history_report.get("items"), list) else [])[:max_items],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 8), 30))
+    summary_report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary_report(
+        graph,
+        window_ms=win,
+        limit=max_items,
+    )
+    summary = summary_report.get("summary", {}) if isinstance(summary_report.get("summary"), dict) else {}
+    state = str(summary.get("state", "steady"))
+    posture = str(summary.get("posture", "steady"))
+    direction = str(summary.get("direction", "flat"))
+    run_count = int(summary.get("runCount", 0) or 0)
+    anomaly_count = int(summary.get("runAnomalies", 0) or 0)
+    avg_actions = float(summary.get("avgActions", 0.0) or 0.0)
+    guidance: list[dict[str, Any]] = []
+
+    if state in {"unstable", "watch"} or posture in {"critical", "watch"} or direction == "worse":
+        guidance.append(
+            {
+                "priority": "p1",
+                "reason": f"run-state {state} with posture {posture} and direction {direction}",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state anomalies window 24h limit 10",
+            }
+        )
+    if anomaly_count > 0:
+        guidance.append(
+            {
+                "priority": "p1",
+                "reason": f"run-state anomalies present ({anomaly_count})",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state summary window 24h limit 8",
+            }
+        )
+    if avg_actions >= 4.0:
+        guidance.append(
+            {
+                "priority": "p2",
+                "reason": f"avg actions elevated ({avg_actions:.2f})",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state metrics window 24h",
+            }
+        )
+    if run_count >= 3:
+        guidance.append(
+            {
+                "priority": "p2",
+                "reason": f"run-state history depth available ({run_count})",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state history limit 20",
+            }
+        )
+    if not guidance:
+        guidance.append(
+            {
+                "priority": "p3",
+                "reason": "run-state stable",
+                "command": "show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state window 24h",
+            }
+        )
+    selected = guidance[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "state": state,
+            "posture": posture,
+            "direction": direction,
+            "runCount": run_count,
+            "runAnomalies": anomaly_count,
+            "avgActions": avg_actions,
+            "actions": len(selected),
+        },
+        "items": selected,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_report(
+    graph: dict[str, Any],
+    mode: str = "dry_run",
+    window_ms: int = 86400000,
+    limit: int = 8,
+) -> dict[str, Any]:
+    normalized_mode = "apply" if str(mode).strip().lower() == "apply" else "dry_run"
+    guidance = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_report(
+        graph,
+        window_ms=window_ms,
+        limit=limit,
+    )
+    summary = guidance.get("summary", {}) if isinstance(guidance.get("summary"), dict) else {}
+    items = guidance.get("items", []) if isinstance(guidance.get("items"), list) else []
+    commands = [str(item.get("command", "")).strip() for item in items if isinstance(item, dict) and str(item.get("command", "")).strip()]
+    selected = commands[: max(1, min(int(limit or 8), 30))]
+    applied = normalized_mode == "apply"
+    if applied:
+        graph_add_event(
+            graph,
+            "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run",
+            {
+                "mode": normalized_mode,
+                "state": str(summary.get("state", "steady")),
+                "posture": str(summary.get("posture", "steady")),
+                "direction": str(summary.get("direction", "flat")),
+                "actions": len(selected),
+                "commands": selected,
+            },
+        )
+    return {
+        "summary": {
+            "mode": normalized_mode,
+            "state": str(summary.get("state", "steady")),
+            "posture": str(summary.get("posture", "steady")),
+            "direction": str(summary.get("direction", "flat")),
+            "actions": len(selected),
+            "applied": applied,
+            "windowMs": int(summary.get("windowMs", window_ms) or window_ms),
+        },
+        "commands": selected,
+        "items": items[: len(selected)],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history_report(
+    graph: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    max_items = max(1, min(int(limit or 20), 200))
+    rows: list[dict[str, Any]] = []
+    apply_count = 0
+    dry_count = 0
+    state_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run":
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        rows.append(
+            {
+                "id": str(event.get("id", "")),
+                "createdAt": int(event.get("createdAt", 0) or 0),
+                "mode": mode,
+                "state": state,
+                "posture": posture,
+                "direction": direction,
+                "actions": actions,
+                "commands": [str(cmd) for cmd in commands[:4]],
+            }
+        )
+    rows = sorted(rows, key=lambda row: int(row.get("createdAt", 0) or 0), reverse=True)[:max_items]
+    return {
+        "summary": {
+            "count": len(rows),
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "stateCounts": state_counts,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "items": rows,
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    cutoff = now_ms() - win
+    count = 0
+    apply_count = 0
+    dry_count = 0
+    actions_total = 0
+    state_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    posture_counts: dict[str, int] = {}
+    command_counts: dict[str, int] = {}
+    for event in graph.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind", "")).strip().lower() != "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run":
+            continue
+        if int(event.get("createdAt", 0) or 0) < cutoff:
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        commands = payload.get("commands", []) if isinstance(payload.get("commands"), list) else []
+        if mode == "apply":
+            apply_count += 1
+        else:
+            dry_count += 1
+        state_counts[state] = int(state_counts.get(state, 0) or 0) + 1
+        direction_counts[direction] = int(direction_counts.get(direction, 0) or 0) + 1
+        posture_counts[posture] = int(posture_counts.get(posture, 0) or 0) + 1
+        actions_total += actions
+        for command in commands:
+            cmd = str(command).strip()
+            if cmd:
+                command_counts[cmd] = int(command_counts.get(cmd, 0) or 0) + 1
+        count += 1
+    top_commands = sorted(command_counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+    return {
+        "summary": {
+            "windowMs": win,
+            "count": count,
+            "applyCount": apply_count,
+            "dryRunCount": dry_count,
+            "avgActions": round(float(actions_total / count), 2) if count > 0 else 0.0,
+            "stateCounts": state_counts,
+            "directionCounts": direction_counts,
+            "postureCounts": posture_counts,
+        },
+        "topCommands": [{"command": cmd, "count": int(n or 0)} for cmd, n in top_commands],
+    }
+
+
+def build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies_report(
+    graph: dict[str, Any],
+    window_ms: int = 86400000,
+    limit: int = 10,
+) -> dict[str, Any]:
+    win = max(60000, min(int(window_ms or 86400000), 7 * 24 * 60 * 60 * 1000))
+    max_items = max(1, min(int(limit or 10), 100))
+    cutoff = now_ms() - win
+    events = [
+        item
+        for item in graph.get("events", [])
+        if isinstance(item, dict)
+        and str(item.get("kind", "")).strip().lower() == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run"
+        and int(item.get("createdAt", 0) or 0) >= cutoff
+    ]
+    total = len(events)
+    apply_runs = 0
+    unstable_runs = 0
+    worse_runs = 0
+    high_action_runs = 0
+    anomalies: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        mode = str(payload.get("mode", "dry_run"))
+        state = str(payload.get("state", "steady"))
+        posture = str(payload.get("posture", "steady"))
+        direction = str(payload.get("direction", "flat"))
+        actions = int(payload.get("actions", 0) or 0)
+        created_at = int(event.get("createdAt", 0) or 0)
+        if mode == "apply":
+            apply_runs += 1
+        if state in {"unstable", "watch"} or posture in {"critical", "watch"}:
+            unstable_runs += 1
+        if direction == "worse":
+            worse_runs += 1
+        if actions >= 5:
+            high_action_runs += 1
+        if mode == "apply" and (state in {"unstable", "watch"} or posture in {"critical", "watch"}) and actions >= 3:
+            anomalies.append(
+                {
+                    "severity": "high",
+                    "code": "run_state_guidance_apply_unstable",
+                    "message": f"Applied run-state-guidance with unstable posture and actions {actions}.",
+                    "createdAt": created_at,
+                }
+            )
+    if total >= 3 and apply_runs / max(1, total) >= 0.7:
+        anomalies.append(
+            {
+                "severity": "high",
+                "code": "run_state_guidance_apply_burst",
+                "message": f"Run-state-guidance apply ratio elevated ({apply_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and unstable_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_guidance_unstable_ratio",
+                "message": f"Run-state-guidance unstable/watch ratio elevated ({unstable_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and worse_runs / max(1, total) >= 0.5:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_guidance_worse_ratio",
+                "message": f"Run-state-guidance worse direction ratio elevated ({worse_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    if total >= 3 and high_action_runs / max(1, total) >= 0.6:
+        anomalies.append(
+            {
+                "severity": "medium",
+                "code": "run_state_guidance_high_action_ratio",
+                "message": f"Run-state-guidance high-action ratio elevated ({high_action_runs}/{total}).",
+                "createdAt": now_ms(),
+            }
+        )
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    selected = sorted(
+        anomalies,
+        key=lambda item: (
+            severity_rank.get(str(item.get("severity", "low")), 2),
+            -int(item.get("createdAt", 0) or 0),
+            str(item.get("code", "")),
+        ),
+    )[:max_items]
+    return {
+        "summary": {
+            "windowMs": win,
+            "runs": total,
+            "applyRuns": apply_runs,
+            "unstableRuns": unstable_runs,
+            "worseRuns": worse_runs,
+            "highActionRuns": high_action_runs,
+            "count": len(selected),
+        },
+        "items": selected,
+    }
+
+
 def recent_relation_events(graph: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
     events = [e for e in graph.get("events", []) if str(e.get("kind", "")).startswith("link_")]
     return events[-limit:]
@@ -11284,6 +24114,31 @@ def find_job_by_selector(jobs: list[dict[str, Any]], selector: str) -> dict[str,
     if not sel:
         return None
     ordered = sorted(jobs, key=lambda x: int(x.get("createdAt", 0) or 0), reverse=True)
+    if sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < len(ordered):
+            return ordered[idx]
+    for job in ordered:
+        if str(job.get("id", "")).startswith(sel):
+            return job
+    return None
+
+
+def reminder_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for job in jobs:
+        kind = str(job.get("kind", "")).strip().lower()
+        if kind in {"remind_note", "remind_once"}:
+            out.append(job)
+    out.sort(key=lambda x: int(x.get("createdAt", 0) or 0), reverse=True)
+    return out
+
+
+def find_reminder_by_selector(jobs: list[dict[str, Any]], selector: str) -> dict[str, Any] | None:
+    sel = str(selector or "").strip()
+    if not sel:
+        return None
+    ordered = reminder_jobs(jobs)
     if sel.isdigit():
         idx = int(sel) - 1
         if 0 <= idx < len(ordered):
@@ -11632,6 +24487,1852 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             )
         return {"ok": True, "message": "Intent preview ready.", "previewLines": lines[:10]}
 
+    if kind == "graph_schema":
+        schema = build_graph_schema_payload(graph)
+        lines = [
+            f"entity kinds: {','.join(schema.get('entityKinds', [])) or 'none'}",
+            f"relation kinds: {','.join(schema.get('relationKinds', [])) or 'none'}",
+            f"entities/relations/events: {int((schema.get('counts') or {}).get('entities', 0) or 0)}/{int((schema.get('counts') or {}).get('relations', 0) or 0)}/{int((schema.get('counts') or {}).get('events', 0) or 0)}",
+        ]
+        for kind_name, count in sorted(((schema.get("counts") or {}).get("byKind", {}) or {}).items()):
+            lines.append(f"{str(kind_name)}: {int(count or 0)}")
+        return {"ok": True, "message": "Graph schema ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_health":
+        report = build_graph_health_report(graph)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        tasks = summary.get("tasks", {}) if isinstance(summary.get("tasks"), dict) else {}
+        lines = [
+            f"status: {str(summary.get('status', 'unknown'))}",
+            f"entities/relations: {int(summary.get('entities', 0) or 0)}/{int(summary.get('relations', 0) or 0)}",
+            f"isolated/dangling: {int(summary.get('isolatedEntities', 0) or 0)}/{int(summary.get('danglingRelations', 0) or 0)}",
+            f"tasks total/ready/blocked: {int(tasks.get('total', 0) or 0)}/{int(tasks.get('ready', 0) or 0)}/{int(tasks.get('blocked', 0) or 0)}",
+            f"depends_on edges: {int(summary.get('dependsOnEdges', 0) or 0)}",
+        ]
+        isolated = report.get("isolated", []) if isinstance(report.get("isolated"), list) else []
+        if isolated:
+            lines.append(f"isolated sample: {', '.join(str(item) for item in isolated[:4])}")
+        return {"ok": True, "message": "Graph health ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_components":
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_components(graph, relation=relation, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"components: {int(summary.get('components', 0) or 0)}",
+            f"largest: {int(summary.get('largest', 0) or 0)}",
+            f"singletons: {int(summary.get('singletons', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            sample = item.get("sample", []) if isinstance(item.get("sample"), list) else []
+            lines.append(f"c{int(item.get('index', 0) or 0)} size {int(item.get('size', 0) or 0)} | {', '.join(str(x) for x in sample[:2])}")
+        return {"ok": True, "message": "Graph components ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_hubs":
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_hubs(graph, relation=relation, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"entities: {int(summary.get('entities', 0) or 0)}",
+            f"hubs: {int(summary.get('hubs', 0) or 0)}",
+            f"max degree: {int(summary.get('maxDegree', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('label', '-'))} | deg {int(item.get('total', 0) or 0)} (in {int(item.get('in', 0) or 0)} / out {int(item.get('out', 0) or 0)})")
+        return {"ok": True, "message": "Graph hubs ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_events":
+        event_kind = str(payload.get("kind", "") or "").strip().lower()
+        limit = max(1, min(int(payload.get("limit", 50) or 50), 500))
+        report = build_graph_events_report(graph, kind=event_kind, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        kinds = summary.get("kinds", {}) if isinstance(summary.get("kinds"), dict) else {}
+        lines = [
+            f"count/returned: {int(summary.get('count', 0) or 0)}/{int(summary.get('returned', 0) or 0)}",
+            f"latest ts: {int(summary.get('latestTs', 0) or 0)}",
+        ]
+        if kinds:
+            top_kind = sorted(kinds.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:3]
+            lines.append("kinds: " + ", ".join(f"{str(k)}:{int(v or 0)}" for k, v in top_kind))
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[-4:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('kind', 'event'))} @{int(item.get('createdAt', 0) or 0)}")
+        return {"ok": True, "message": "Graph events ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_summary":
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_summary_report(graph, relation=relation, limit=limit)
+        schema = report.get("schema", {}) if isinstance(report.get("schema"), dict) else {}
+        health = report.get("health", {}) if isinstance(report.get("health"), dict) else {}
+        health_summary = health.get("summary", {}) if isinstance(health.get("summary"), dict) else {}
+        components = report.get("components", {}) if isinstance(report.get("components"), dict) else {}
+        components_summary = components.get("summary", {}) if isinstance(components.get("summary"), dict) else {}
+        hubs = report.get("hubs", {}) if isinstance(report.get("hubs"), dict) else {}
+        hubs_summary = hubs.get("summary", {}) if isinstance(hubs.get("summary"), dict) else {}
+        events = report.get("events", {}) if isinstance(report.get("events"), dict) else {}
+        events_summary = events.get("summary", {}) if isinstance(events.get("summary"), dict) else {}
+        lines = [
+            f"status: {str(health_summary.get('status', 'unknown'))}",
+            f"entities/relations/events: {int((schema.get('counts', {}) or {}).get('entities', 0) or 0)}/{int((schema.get('counts', {}) or {}).get('relations', 0) or 0)}/{int((schema.get('counts', {}) or {}).get('events', 0) or 0)}",
+            f"components/largest: {int(components_summary.get('components', 0) or 0)}/{int(components_summary.get('largest', 0) or 0)}",
+            f"hubs/max degree: {int(hubs_summary.get('hubs', 0) or 0)}/{int(hubs_summary.get('maxDegree', 0) or 0)}",
+            f"events count/latest: {int(events_summary.get('count', 0) or 0)}/{int(events_summary.get('latestTs', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_relation_matrix":
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        limit = max(1, min(int(payload.get("limit", 100) or 100), 500))
+        report = build_graph_relation_matrix(graph, relation=relation, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"rows: {int(summary.get('rows', 0) or 0)}",
+            f"relations total: {int(summary.get('relationsTotal', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('sourceKind', 'unknown'))}->{str(item.get('targetKind', 'unknown'))} {str(item.get('relation', ''))}: {int(item.get('count', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph relation matrix ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_anomalies":
+        limit = max(1, min(int(payload.get("limit", 50) or 50), 500))
+        report = build_graph_anomalies_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"status: {str(summary.get('status', 'unknown'))}",
+            f"count/returned: {int(summary.get('count', 0) or 0)}/{int(summary.get('returned', 0) or 0)}",
+        ]
+        severity = summary.get("severity", {}) if isinstance(summary.get("severity"), dict) else {}
+        if severity:
+            lines.append("severity: " + ", ".join(f"{str(k)}:{int(v or 0)}" for k, v in severity.items()))
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('type', 'anomaly'))} | {str(item.get('detail', '-'))}")
+        return {"ok": True, "message": "Graph anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_guidance":
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_guidance_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"status: {str(summary.get('status', 'unknown'))}",
+            f"guidance/anomalies: {int(summary.get('guidanceCount', 0) or 0)}/{int(summary.get('anomalyCount', 0) or 0)}",
+            f"top anomaly type: {str(summary.get('topAnomalyType', 'none'))}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score":
+        report = build_graph_score_report(graph)
+        signals = report.get("signals", {}) if isinstance(report.get("signals"), dict) else {}
+        severity = signals.get("severity", {}) if isinstance(signals.get("severity"), dict) else {}
+        lines = [
+            f"score/grade: {int(report.get('score', 0) or 0)}/{str(report.get('grade', 'F'))}",
+            f"status: {str(report.get('status', 'unknown'))}",
+            f"entities/relations: {int(signals.get('entities', 0) or 0)}/{int(signals.get('relations', 0) or 0)}",
+            f"isolated/dangling: {int(signals.get('isolatedEntities', 0) or 0)}/{int(signals.get('danglingRelations', 0) or 0)}",
+            f"anomalies severity h/m/l: {int(severity.get('high', 0) or 0)}/{int(severity.get('medium', 0) or 0)}/{int(severity.get('low', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph score ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_trend":
+        window_ms = max(60000, min(int(payload.get("windowMs", 3600000) or 3600000), 7 * 24 * 60 * 60 * 1000))
+        buckets = max(2, min(int(payload.get("buckets", 8) or 8), 48))
+        report = build_graph_score_trend_report(graph, window_ms=window_ms, buckets=buckets)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"current/last/first: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('lastScore', 0) or 0)}/{int(summary.get('firstScore', 0) or 0)}",
+            f"trend: {str(summary.get('trend', 'flat'))}",
+            f"window/buckets: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('buckets', buckets) or buckets)}",
+        ]
+        series = report.get("series", []) if isinstance(report.get("series"), list) else []
+        for item in series[-4:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"b{int(item.get('index', 0) or 0)} score {int(item.get('score', 0) or 0)} | events {int(item.get('events', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score trend ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_guidance":
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_guidance_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"score/trend: {int(summary.get('score', 0) or 0)}/{str(summary.get('trend', 'flat'))}",
+            f"anomalies: {int(summary.get('anomalies', 0) or 0)}",
+            f"guidance count: {int(summary.get('guidanceCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_alerts":
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_alerts_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"score/grade: {int(summary.get('score', 0) or 0)}/{str(summary.get('grade', 'F'))}",
+            f"trend: {str(summary.get('trend', 'flat'))}",
+            f"anomalies: {int(summary.get('anomalyCount', 0) or 0)}",
+            f"alerts: {int(summary.get('alertCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score alerts ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_alerts_history":
+        window_ms = max(60000, min(int(payload.get("windowMs", 3600000) or 3600000), 7 * 24 * 60 * 60 * 1000))
+        buckets = max(2, min(int(payload.get("buckets", 8) or 8), 48))
+        limit = max(1, min(int(payload.get("limit", 5) or 5), 20))
+        report = build_graph_score_alerts_history_report(graph, window_ms=window_ms, buckets=buckets, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"score/trend: {int(summary.get('currentScore', 0) or 0)}/{str(summary.get('trend', 'flat'))}",
+            f"alert signals/peak: {int(summary.get('totalAlertSignals', 0) or 0)}/{int(summary.get('peakAlertCount', 0) or 0)}",
+            f"window/buckets/returned: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('buckets', buckets) or buckets)}/{int(summary.get('returned', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"b{int(item.get('index', 0) or 0)} {str(item.get('severity', 'low'))} alerts {int(item.get('alertCount', 0) or 0)} | score {int(item.get('score', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score alerts history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_remediation":
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_remediation_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"score/trend: {int(summary.get('score', 0) or 0)}/{str(summary.get('trend', 'flat'))}",
+            f"alerts/signals: {int(summary.get('alerts', 0) or 0)}/{int(summary.get('alertSignals', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score remediation ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_forecast":
+        horizon_ms = max(60000, min(int(payload.get("horizonMs", 3600000) or 3600000), 7 * 24 * 60 * 60 * 1000))
+        step_buckets = max(2, min(int(payload.get("stepBuckets", 6) or 6), 24))
+        report = build_graph_score_forecast_report(graph, horizon_ms=horizon_ms, step_buckets=step_buckets)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"current/end: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('forecastEndScore', 0) or 0)}",
+            f"direction: {str(summary.get('direction', 'flat'))}",
+            f"horizon/steps: {int(summary.get('horizonMs', horizon_ms) or horizon_ms)}/{int(summary.get('steps', step_buckets) or step_buckets)}",
+            f"alert pressure: {int(summary.get('alertPressure', 0) or 0)}",
+        ]
+        for item in (report.get("forecast", []) if isinstance(report.get("forecast"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"s{int(item.get('step', 0) or 0)} {str(item.get('risk', 'low'))} | score {int(item.get('score', 0) or 0)}")
+        return {"ok": True, "message": "Graph score forecast ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_forecast_guidance":
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_forecast_guidance_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"current/end: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('forecastEndScore', 0) or 0)}",
+            f"direction/high risk steps: {str(summary.get('direction', 'flat'))}/{int(summary.get('highRiskSteps', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score forecast guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_guardrails":
+        warn_below = max(0, min(int(payload.get("warnBelow", 75) or 75), 100))
+        fail_below = max(0, min(int(payload.get("failBelow", 60) or 60), 100))
+        report = build_graph_score_guardrails_report(graph, warn_below=warn_below, fail_below=fail_below)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"status: {str(summary.get('status', 'pass'))}",
+            f"current/min forecast: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('forecastMinScore', 0) or 0)}",
+            f"warn/fail: {int(summary.get('warnBelow', warn_below) or warn_below)}/{int(summary.get('failBelow', fail_below) or fail_below)}",
+            f"breaches: {int(summary.get('breaches', 0) or 0)}",
+        ]
+        for item in (report.get("breaches", []) if isinstance(report.get("breaches"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"s{int(item.get('step', 0) or 0)} {str(item.get('risk', 'low'))} | score {int(item.get('score', 0) or 0)}")
+        return {"ok": True, "message": "Graph score guardrails ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_preview":
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_autopilot_preview_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"status: {str(summary.get('status', 'pass'))}",
+            f"current/min forecast: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('forecastMinScore', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot preview ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_run":
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        mode = "apply" if mode == "apply" else "dry_run"
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_autopilot_run_report(graph, mode=mode, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/status: {str(summary.get('mode', mode))}/{str(summary.get('status', 'pass'))}",
+            f"current/min forecast: {int(summary.get('currentScore', 0) or 0)}/{int(summary.get('forecastMinScore', 0) or 0)}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{str(summary.get('applied', False)).lower()}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('status', 'pass'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        status_counts = summary.get("statusCounts", {}) if isinstance(summary.get("statusCounts"), dict) else {}
+        if status_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(status_counts.items())]
+            lines.append(f"status counts: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/fail/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('failRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"guardrail/anomalies: {str(summary.get('guardrailStatus', 'pass'))}/{int(summary.get('anomalies', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        policy = report.get("policy", {}) if isinstance(report.get("policy"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"status/anomalies: {str(summary.get('status', 'pass'))}/{int(summary.get('anomalies', 0) or 0)}",
+            f"mode: {str(policy.get('mode', 'balanced'))}",
+            f"warn/fail: {int(policy.get('warnBelow', 75) or 75)}/{int(policy.get('failBelow', 60) or 60)}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_drift":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_drift_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"status/drift checks: {str(summary.get('status', 'aligned'))}/{int(summary.get('driftChecks', 0) or 0)}",
+            f"apply ratio/max: {float(summary.get('applyRatio', 0.0) or 0.0):.2f}/{float(summary.get('maxApplyRatio', 0.0) or 0.0):.2f}",
+            f"fail ratio: {float(summary.get('failRatio', 0.0) or 0.0):.2f}",
+        ]
+        for item in (report.get("checks", []) if isinstance(report.get("checks"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('name', '-'))} {str(item.get('actual', '-'))} vs {str(item.get('expected', '-'))} | ok={str(item.get('ok', False)).lower()}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy drift ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_actions":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 30))
+        report = build_graph_score_autopilot_policy_alignment_actions_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/status: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('status', 'aligned'))}",
+            f"mode/drift checks: {str(summary.get('mode', 'balanced'))}/{int(summary.get('driftChecks', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment actions ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_run":
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        mode = "apply" if mode == "apply" else "dry_run"
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 30))
+        report = build_graph_score_autopilot_policy_alignment_run_report(graph, mode=mode, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/status: {str(summary.get('mode', mode))}/{str(summary.get('status', 'aligned'))}",
+            f"drift checks: {int(summary.get('driftChecks', 0) or 0)}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{str(summary.get('applied', False)).lower()}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('status', 'aligned'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        status_counts = summary.get("statusCounts", {}) if isinstance(summary.get("statusCounts"), dict) else {}
+        if status_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(status_counts.items())]
+            lines.append(f"status counts: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/drift/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('driftRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"status/drift/anomalies: {str(summary.get('status', 'aligned'))}/{int(summary.get('driftChecks', 0) or 0)}/{int(summary.get('anomalies', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        policy = report.get("policy", {}) if isinstance(report.get("policy"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"status/drift/anomalies: {str(summary.get('status', 'aligned'))}/{int(summary.get('driftChecks', 0) or 0)}/{int(summary.get('anomalies', 0) or 0)}",
+            f"mode: {str(policy.get('mode', 'balanced'))}",
+            f"dry-run/max-apply: {str(policy.get('preferDryRun', True)).lower()}/{float(policy.get('maxApplyRatio', 0.0) or 0.0):.2f}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_drift":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_drift_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"status/drift checks: {str(summary.get('status', 'aligned'))}/{int(summary.get('driftChecks', 0) or 0)}",
+            f"apply ratio/max: {float(summary.get('applyRatio', 0.0) or 0.0):.2f}/{float(summary.get('maxApplyRatio', 0.0) or 0.0):.2f}",
+            f"avg actions/max: {float(summary.get('avgActions', 0.0) or 0.0):.2f}/{int(summary.get('maxActionsPerRun', 0) or 0)}",
+        ]
+        for item in (report.get("checks", []) if isinstance(report.get("checks"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('name', '-'))} {str(item.get('actual', '-'))} vs {str(item.get('expected', '-'))} | ok={str(item.get('ok', False)).lower()}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy drift ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/status: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('status', 'aligned'))}",
+            f"mode/drift checks: {str(summary.get('mode', 'balanced'))}/{int(summary.get('driftChecks', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_run":
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        mode = "apply" if mode == "apply" else "dry_run"
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_run_report(graph, mode=mode, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/status: {str(summary.get('mode', mode))}/{str(summary.get('status', 'aligned'))}",
+            f"drift checks: {int(summary.get('driftChecks', 0) or 0)}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{str(summary.get('applied', False)).lower()}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('status', 'aligned'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        status_counts = summary.get("statusCounts", {}) if isinstance(summary.get("statusCounts"), dict) else {}
+        if status_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(status_counts.items())]
+            lines.append(f"status counts: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/non-aligned/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('nonAlignedRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_summary_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"mode/status: {str(summary.get('mode', 'balanced'))}/{str(summary.get('status', 'aligned'))}",
+            f"drift/anomalies/actions: {int(summary.get('driftChecks', 0) or 0)}/{int(summary.get('anomalies', 0) or 0)}/{int(summary.get('guidanceActions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        current = report.get("current", {}) if isinstance(report.get("current"), dict) else {}
+        previous = report.get("previous", {}) if isinstance(report.get("previous"), dict) else {}
+        lines = [
+            f"window/direction: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('direction', 'flat'))}",
+            f"runs current/previous/delta: {int(summary.get('currentRuns', 0) or 0)}/{int(summary.get('previousRuns', 0) or 0)}/{int(summary.get('deltaRuns', 0) or 0)}",
+            f"non-aligned delta: {int(summary.get('deltaNonAlignedRuns', 0) or 0)}",
+            f"apply delta: {int(summary.get('deltaApplyRuns', 0) or 0)}",
+            f"avg actions current/previous/delta: {float(current.get('avgActions', 0.0) or 0.0):.2f}/{float(previous.get('avgActions', 0.0) or 0.0):.2f}/{float(summary.get('deltaAvgActions', 0.0) or 0.0):.2f}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        trend = report.get("trend", {}) if isinstance(report.get("trend"), dict) else {}
+        lines = [
+            f"window/direction: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('direction', 'flat'))}",
+            f"runs current/previous/delta: {int(trend.get('currentRuns', 0) or 0)}/{int(trend.get('previousRuns', 0) or 0)}/{int(trend.get('deltaRuns', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 6) or 6), 20))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/status/direction: {str(summary.get('mode', mode))}/{str(summary.get('status', 'aligned'))}/{str(summary.get('direction', 'flat'))}",
+            f"window/actions: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('actions', 0) or 0)}",
+            f"applied: {'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('status', 'aligned'))}/{str(item.get('direction', 'flat'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        status_counts = summary.get("statusCounts", {}) if isinstance(summary.get("statusCounts"), dict) else {}
+        if status_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(status_counts.items())]
+            lines.append(f"status counts: {' | '.join(parts)}")
+        direction_counts = summary.get("directionCounts", {}) if isinstance(summary.get("directionCounts"), dict) else {}
+        if direction_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(direction_counts.items())]
+            lines.append(f"direction counts: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/drift/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('driftRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_summary_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"direction/anomalies/actions: {str(summary.get('direction', 'flat'))}/{int(summary.get('anomalies', 0) or 0)}/{int(summary.get('guidanceActions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        policy = report.get("policy", {}) if isinstance(report.get("policy"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"mode/status: {str(policy.get('mode', 'balanced'))}/{str(summary.get('status', 'aligned'))}",
+            f"direction: {str(summary.get('direction', 'flat'))}",
+            f"dry-run preferred: {'yes' if bool(policy.get('dryRunPreferred', True)) else 'no'}",
+            f"apply cap/action cap/anomaly budget: {float(policy.get('applyRatioCap', 0.0) or 0.0):.2f}/{int(policy.get('actionCap', 0) or 0)}/{int(policy.get('anomalyBudget', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_drift_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"mode/status/drift checks: {str(summary.get('mode', 'balanced'))}/{str(summary.get('status', 'aligned'))}/{int(summary.get('driftChecks', 0) or 0)}",
+        ]
+        for item in (report.get("checks", []) if isinstance(report.get("checks"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{'ok' if bool(item.get('ok', False)) else 'drift'} {str(item.get('name', '-'))} | {str(item.get('message', '-'))}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy drift ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/status: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('status', 'aligned'))}",
+            f"mode/drift checks: {str(summary.get('mode', 'balanced'))}/{int(summary.get('driftChecks', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/status/policy: {str(summary.get('mode', mode))}/{str(summary.get('status', 'aligned'))}/{str(summary.get('policyMode', 'balanced'))}",
+            f"window/actions: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('actions', 0) or 0)}",
+            f"applied: {'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('status', 'aligned'))}/{str(item.get('policyMode', 'balanced'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        status_counts = summary.get("statusCounts", {}) if isinstance(summary.get("statusCounts"), dict) else {}
+        if status_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(status_counts.items())]
+            lines.append(f"status counts: {' | '.join(parts)}")
+        mode_counts = summary.get("policyModeCounts", {}) if isinstance(summary.get("policyModeCounts"), dict) else {}
+        if mode_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(mode_counts.items())]
+            lines.append(f"policy modes: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/drift/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('driftRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_summary_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"direction/mode/status: {str(summary.get('direction', 'flat'))}/{str(summary.get('mode', 'balanced'))}/{str(summary.get('status', 'aligned'))}",
+            f"drift/anomalies/actions: {int(summary.get('driftChecks', 0) or 0)}/{int(summary.get('anomalies', 0) or 0)}/{int(summary.get('guidanceActions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        state_payload = report.get("state", {}) if isinstance(report.get("state"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"state/severity: {str(summary.get('state', 'steady'))}/{str(summary.get('severity', 'low'))}",
+            f"mode/status/direction: {str(summary.get('mode', 'balanced'))}/{str(summary.get('status', 'aligned'))}/{str(summary.get('direction', 'flat'))}",
+            f"drift/anomalies/actions: {int(summary.get('driftChecks', 0) or 0)}/{int(summary.get('anomalies', 0) or 0)}/{int(summary.get('guidanceActions', 0) or 0)}",
+            str(state_payload.get("message", "")),
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        severity_counts = summary.get("severityCounts", {}) if isinstance(summary.get("severityCounts"), dict) else {}
+        if severity_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(severity_counts.items())]
+            lines.append(f"severity: {' | '.join(parts)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"unstable/flips: {int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('stateFlips', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_summary_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"state/severity/status: {str(summary.get('state', 'steady'))}/{str(summary.get('severity', 'low'))}/{str(summary.get('status', 'aligned'))}",
+            f"anomalies/flips/history: {int(summary.get('anomalies', 0) or 0)}/{int(summary.get('stateFlips', 0) or 0)}/{int(summary.get('historyCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('state', 'steady'))}/{str(item.get('severity', 'low'))} {str(item.get('status', 'aligned'))}/{str(item.get('policyMode', 'balanced'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/state: {int(summary.get('windowMs', window_ms) or window_ms)}/{str(summary.get('state', 'steady'))}",
+            f"severity/status/anomalies: {str(summary.get('severity', 'low'))}/{str(summary.get('status', 'aligned'))}/{int(summary.get('anomalies', 0) or 0)}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/state/severity: {str(summary.get('mode', mode))}/{str(summary.get('state', 'steady'))}/{str(summary.get('severity', 'low'))}",
+            f"status/actions: {str(summary.get('status', 'aligned'))}/{int(summary.get('actions', 0) or 0)}",
+            f"applied: {'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        else:
+            lines.append("states: none")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('severity', 'low'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_metrics_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        severity_counts = summary.get("severityCounts", {}) if isinstance(summary.get("severityCounts"), dict) else {}
+        if severity_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(severity_counts.items())]
+            lines.append(f"severity: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_anomalies_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/unstable/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_summary_report(graph, window_ms=window_ms, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"state/severity/status: {str(summary.get('state', 'steady'))}/{str(summary.get('severity', 'low'))}/{str(summary.get('status', 'aligned'))}",
+            f"anomalies/actions/history: {int(summary.get('anomalies', 0) or 0)}/{int(summary.get('guidanceActions', 0) or 0)}/{int(summary.get('historyCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        state_payload = report.get("state", {}) if isinstance(report.get("state"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"posture/state: {str(summary.get('posture', 'steady'))}/{str(summary.get('state', 'steady'))}",
+            f"severity/status/anomalies: {str(summary.get('severity', 'low'))}/{str(summary.get('status', 'aligned'))}/{int(summary.get('anomalies', 0) or 0)}",
+            f"actions: {int(summary.get('guidanceActions', 0) or 0)}",
+            str(state_payload.get("message", "")),
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_trend_report(graph, window_ms=window_ms)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        current = report.get("current", {}) if isinstance(report.get("current"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('currentRuns', 0) or 0)}",
+            f"direction/posture: {str(summary.get('direction', 'flat'))} | {str(summary.get('currentPosture', 'steady'))} vs {str(summary.get('previousPosture', 'steady'))}",
+            f"delta unstable/critical/actions: {int(summary.get('deltaUnstableRuns', 0) or 0)}/{int(summary.get('deltaCriticalRuns', 0) or 0)}/{float(summary.get('deltaAvgActions', 0.0) or 0.0):.2f}",
+            f"dominant state/severity: {str(current.get('dominantState', 'steady'))}/{str(current.get('dominantSeverity', 'low'))}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state trend ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 50))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_offenders_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"offenders/critical/unstable: {int(summary.get('offenders', 0) or 0)}/{int(summary.get('criticalRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"score {int(item.get('score', 0) or 0)} | c/u {int(item.get('criticalRuns', 0) or 0)}/{int(item.get('unstableRuns', 0) or 0)} | {str(item.get('command', '-'))}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state offenders ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_timeline_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"timeline count/apply/dry: {int(summary.get('count', 0) or 0)}/{int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('dryRunRuns', 0) or 0)}",
+            f"critical/unstable: {int(summary.get('criticalRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('severity', 'low'))}/{str(item.get('status', 'aligned'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state timeline ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_matrix_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"matrix runs/cells: {int(summary.get('runs', 0) or 0)}/{int(summary.get('cells', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        severity_counts = summary.get("severityCounts", {}) if isinstance(summary.get("severityCounts"), dict) else {}
+        if severity_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(severity_counts.items())]
+            lines.append(f"severity: {' | '.join(parts)}")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('state', 'steady'))}/{str(item.get('severity', 'low'))}/{str(item.get('status', 'aligned'))}: {int(item.get('count', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state matrix ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"direction/posture/actions: {str(summary.get('direction', 'flat'))}/{str(summary.get('posture', 'steady'))}/{int(summary.get('actions', 0) or 0)}",
+            f"offenders/critical/cells: {int(summary.get('offenders', 0) or 0)}/{int(summary.get('criticalRuns', 0) or 0)}/{int(summary.get('matrixCells', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/direction/posture: {str(summary.get('mode', mode))}/{str(summary.get('direction', 'flat'))}/{str(summary.get('posture', 'steady'))}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_history_report(
+            graph,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        direction_counts = summary.get("directionCounts", {}) if isinstance(summary.get("directionCounts"), dict) else {}
+        if direction_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(direction_counts.items())]
+            lines.append(f"direction: {' | '.join(parts)}")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('direction', 'flat'))}/{str(item.get('posture', 'steady'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_metrics_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        direction_counts = summary.get("directionCounts", {}) if isinstance(summary.get("directionCounts"), dict) else {}
+        if direction_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(direction_counts.items())]
+            lines.append(f"direction: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_anomalies_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/worse/critical/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('worseRuns', 0) or 0)}/{int(summary.get('criticalRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_summary_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"direction/posture/actions: {str(summary.get('direction', 'flat'))}/{str(summary.get('posture', 'steady'))}/{int(summary.get('actions', 0) or 0)}",
+            f"anomalies/history: {int(summary.get('anomalies', 0) or 0)}/{int(summary.get('historyCount', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[{str(item.get('priority', 'p3'))}] {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        state = report.get("state", {}) if isinstance(report.get("state"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"anomalies/actions: {int(summary.get('anomalies', 0) or 0)}/{int(summary.get('actions', 0) or 0)}",
+        ]
+        message = str(state.get("message", "") or "").strip()
+        if message:
+            lines.append(f"message: {message}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_history_report(
+            graph,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count/total: {int(summary.get('count', 0) or 0)}/{int(summary.get('totalCount', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        else:
+            lines.append("states: none")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('posture', 'steady'))}/{str(item.get('direction', 'flat'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_metrics_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_anomalies_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/unstable/worse/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('worseRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_summary_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"anomalies/avg-actions/history: {int(summary.get('anomalies', 0) or 0)}/{float(summary.get('avgActions', 0.0) or 0.0):.2f}/{int(summary.get('historyCount', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/state/posture/direction: {str(summary.get('mode', mode))}/{str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_history_report(
+            graph,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        else:
+            lines.append("states: none")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('posture', 'steady'))}/{str(item.get('direction', 'flat'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_metrics_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_anomalies_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/unstable/worse/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('worseRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_summary_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/run-count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runCount', 0) or 0)}",
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"run-anomalies/avg-actions/history: {int(summary.get('runAnomalies', 0) or 0)}/{float(summary.get('avgActions', 0.0) or 0.0):.2f}/{int(summary.get('runHistoryCount', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        state = report.get("state", {}) if isinstance(report.get("state"), dict) else {}
+        lines = [
+            f"window/run-count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runCount', 0) or 0)}",
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"run-anomalies/avg-actions: {int(summary.get('runAnomalies', 0) or 0)}/{float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        message = str(state.get("message", "") or "").strip()
+        if message:
+            lines.append(f"message: {message}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_history_report(
+            graph,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count/total: {int(summary.get('count', 0) or 0)}/{int(summary.get('totalCount', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('posture', 'steady'))}/{str(item.get('direction', 'flat'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_metrics_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_anomalies_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/unstable/worse/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('worseRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_summary_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/run-count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runCount', 0) or 0)}",
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"run-anomalies/avg-actions/history: {int(summary.get('runAnomalies', 0) or 0)}/{float(summary.get('avgActions', 0.0) or 0.0):.2f}/{int(summary.get('historyCount', 0) or 0)}",
+        ]
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state summary ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"state/posture/direction: {str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"runs/anomalies/avg-actions: {int(summary.get('runCount', 0) or 0)}/{int(summary.get('runAnomalies', 0) or 0)}/{float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+            f"actions: {int(summary.get('actions', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('priority', 'p3')).upper()} | {str(item.get('reason', '-'))} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 8) or 8), 30))
+        mode = str(payload.get("mode", "dry_run")).strip().lower()
+        if mode not in {"dry_run", "apply"}:
+            mode = "dry_run"
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_report(
+            graph,
+            mode=mode,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"mode/state/posture/direction: {str(summary.get('mode', mode))}/{str(summary.get('state', 'steady'))}/{str(summary.get('posture', 'steady'))}/{str(summary.get('direction', 'flat'))}",
+            f"actions/applied: {int(summary.get('actions', 0) or 0)}/{'yes' if bool(summary.get('applied', False)) else 'no'}",
+        ]
+        for command in (report.get("commands", []) if isinstance(report.get("commands"), list) else [])[:4]:
+            lines.append(f"cmd: {str(command)}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_history_report(
+            graph,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"count: {int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        else:
+            lines.append("states: none")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('mode', 'dry_run'))} {str(item.get('state', 'steady'))}/{str(item.get('posture', 'steady'))}/{str(item.get('direction', 'flat'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_metrics_report(
+            graph,
+            window_ms=window_ms,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/count: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('count', 0) or 0)}",
+            f"apply/dry: {int(summary.get('applyCount', 0) or 0)}/{int(summary.get('dryRunCount', 0) or 0)}",
+            f"avg actions: {float(summary.get('avgActions', 0.0) or 0.0):.2f}",
+        ]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        for item in (report.get("topCommands", []) if isinstance(report.get("topCommands"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"cmd x{int(item.get('count', 0) or 0)} | {str(item.get('command', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run metrics ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies":
+        window_ms = max(60000, min(int(payload.get("windowMs", 86400000) or 86400000), 7 * 24 * 60 * 60 * 1000))
+        limit = max(1, min(int(payload.get("limit", 10) or 10), 100))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_guidance_state_guidance_state_run_state_guidance_run_anomalies_report(
+            graph,
+            window_ms=window_ms,
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"window/runs: {int(summary.get('windowMs', window_ms) or window_ms)}/{int(summary.get('runs', 0) or 0)}",
+            f"apply/unstable/worse/high-action: {int(summary.get('applyRuns', 0) or 0)}/{int(summary.get('unstableRuns', 0) or 0)}/{int(summary.get('worseRuns', 0) or 0)}/{int(summary.get('highActionRuns', 0) or 0)}",
+            f"anomalies: {int(summary.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('severity', 'low'))} {str(item.get('code', '-'))} | {str(item.get('message', '-'))}")
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run anomalies ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = build_graph_score_autopilot_policy_alignment_policy_trend_guidance_policy_guidance_state_history_report(graph, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [f"count: {int(summary.get('count', 0) or 0)}"]
+        state_counts = summary.get("stateCounts", {}) if isinstance(summary.get("stateCounts"), dict) else {}
+        if state_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(state_counts.items())]
+            lines.append(f"states: {' | '.join(parts)}")
+        severity_counts = summary.get("severityCounts", {}) if isinstance(summary.get("severityCounts"), dict) else {}
+        if severity_counts:
+            parts = [f"{str(k)}={int(v or 0)}" for k, v in sorted(severity_counts.items())]
+            lines.append(f"severity: {' | '.join(parts)}")
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('state', 'steady'))}/{str(item.get('severity', 'low'))} {str(item.get('status', 'aligned'))}/{str(item.get('policyMode', 'balanced'))} | actions {int(item.get('actions', 0) or 0)}"
+            )
+        return {"ok": True, "message": "Graph score autopilot policy alignment policy trend guidance policy guidance state history ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_query":
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 200))
+        report = query_graph(
+            graph,
+            kind=normalize_entity_kind(str(payload.get("kind", "") or "")),
+            relation=str(payload.get("relation", "") or "").strip().lower(),
+            text_query=str(payload.get("q", "") or "").strip().lower(),
+            done=payload.get("done"),
+            limit=limit,
+        )
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"entities: {int(summary.get('entities', 0) or 0)}",
+            f"relations: {int(summary.get('relations', 0) or 0)}",
+        ]
+        for item in (report.get("entities", []) if isinstance(report.get("entities"), list) else [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('kind', 'entity'))} {str(item.get('id', ''))[:8]} {str(item.get('label', '-'))}")
+        if len(lines) <= 2:
+            lines.append("No graph matches for query.")
+        return {"ok": True, "message": "Graph query ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_neighborhood":
+        kind_norm = normalize_entity_kind(str(payload.get("kind", "") or ""))
+        selector = str(payload.get("selector", "")).strip()
+        if not kind_norm or not selector:
+            return {"ok": False, "message": "Graph neighborhood requires kind and selector."}
+        source = find_entity_by_kind_selector(graph, kind_norm, selector)
+        if not source:
+            return {"ok": False, "message": "Graph neighborhood source not found."}
+        depth = max(1, min(int(payload.get("depth", 1) or 1), 4))
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        limit = max(1, min(int(payload.get("limit", 40) or 40), 200))
+        report = build_graph_neighborhood(graph, source=source, depth=depth, relation=relation, limit=limit)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        lines = [
+            f"source: {str(summary.get('sourceLabel', graph_entity_label(source)))}",
+            f"depth: {int(summary.get('depth', depth) or depth)}",
+            f"nodes/edges: {int(summary.get('nodes', 0) or 0)}/{int(summary.get('edges', 0) or 0)}",
+        ]
+        for node in (report.get("nodes", []) if isinstance(report.get("nodes"), list) else [])[:5]:
+            if not isinstance(node, dict):
+                continue
+            marker = "*" if bool(node.get("isSource", False)) else "-"
+            lines.append(f"{marker} d{int(node.get('depth', 0) or 0)} {str(node.get('label', '-'))}")
+        return {"ok": True, "message": "Graph neighborhood ready.", "previewLines": lines[:10]}
+
+    if kind == "graph_path":
+        source_kind = normalize_entity_kind(str(payload.get("sourceKind", "") or ""))
+        target_kind = normalize_entity_kind(str(payload.get("targetKind", "") or ""))
+        source_selector = str(payload.get("sourceSelector", "")).strip()
+        target_selector = str(payload.get("targetSelector", "")).strip()
+        if not source_kind or not source_selector or not target_kind or not target_selector:
+            return {"ok": False, "message": "Graph path requires source/target kinds and selectors."}
+        source = find_entity_by_kind_selector(graph, source_kind, source_selector)
+        target = find_entity_by_kind_selector(graph, target_kind, target_selector)
+        if not source or not target:
+            return {"ok": False, "message": "Graph path source or target not found."}
+        relation = str(payload.get("relation", "") or "").strip().lower()
+        if relation and relation not in GRAPH_RELATION_KINDS:
+            return {"ok": False, "message": "Invalid relation kind."}
+        directed = bool(payload.get("directed", False))
+        report = build_graph_path(graph, source=source, target=target, relation=relation, directed=directed, limit=200)
+        summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+        if not bool(summary.get("pathFound", False)):
+            return {
+                "ok": True,
+                "message": "Graph path not found.",
+                "previewLines": [
+                    f"source: {str(summary.get('sourceLabel', '-'))}",
+                    f"target: {str(summary.get('targetLabel', '-'))}",
+                    "path: none",
+                ],
+            }
+        lines = [
+            f"source: {str(summary.get('sourceLabel', '-'))}",
+            f"target: {str(summary.get('targetLabel', '-'))}",
+            f"path length: {int(summary.get('pathLength', 0) or 0)}",
+            f"directed: {'yes' if bool(summary.get('directed', False)) else 'no'}",
+        ]
+        labels = [str(item.get("label", "-")) for item in (report.get("nodes", []) if isinstance(report.get("nodes"), list) else [])]
+        if labels:
+            lines.append(f"path: {' -> '.join(labels[:6])}")
+        return {"ok": True, "message": "Graph path ready.", "previewLines": lines[:10]}
+
     if kind == "policy_drill_confirm":
         return {
             "ok": False,
@@ -11760,6 +26461,89 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         )
         graph_add_event(graph, "schedule_remind_note", {"jobId": job["id"], "intervalMinutes": minutes})
         return {"ok": True, "message": f"Scheduled reminder every {minutes}m"}
+
+    if kind == "schedule_remind_once":
+        text = str(payload.get("text", "")).strip()
+        delay_ms = int(payload.get("delayMs", 0) or 0)
+        if not text:
+            return {"ok": False, "message": "Reminder text is empty."}
+        if delay_ms <= 0:
+            return {"ok": False, "message": "Reminder delay must be > 0."}
+        delay_ms = max(1000, min(delay_ms, 24 * 60 * 60 * 1000))
+        job = upsert_job(
+            session.jobs,
+            {
+                "kind": "remind_once",
+                "intervalMinutes": 0,
+                "intervalMs": 0,
+                "oneShot": True,
+                "text": text,
+                "nextRunAt": now_ms() + delay_ms,
+            },
+            dedupe_key=f"remind_once:{text.lower()}:{int(delay_ms)}",
+        )
+        job["nextRunAt"] = now_ms() + delay_ms
+        graph_add_event(graph, "schedule_remind_once", {"jobId": job["id"], "delayMs": delay_ms})
+        seconds = int(delay_ms // 1000)
+        return {"ok": True, "message": f"Scheduled one-shot reminder in {seconds}s"}
+
+    if kind == "list_reminders":
+        items = reminder_jobs(session.jobs)
+        if not items:
+            return {"ok": True, "message": "No reminders scheduled.", "previewLines": ["No active or paused reminders."]}
+        lines: list[str] = []
+        for idx, job in enumerate(items[:10], start=1):
+            reminder_kind = str(job.get("kind", "remind_note"))
+            reminder_type = "once" if reminder_kind == "remind_once" else "repeat"
+            active = "active" if bool(job.get("active", True)) else "paused"
+            text = str(job.get("text", "")).strip()[:80]
+            interval_mins = int(job.get("intervalMinutes", 0) or 0)
+            next_run_at = int(job.get("nextRunAt", 0) or 0)
+            timing = f"every {interval_mins}m" if interval_mins > 0 else f"at {next_run_at}"
+            lines.append(f"{idx}. {reminder_type} | {active} | {text} | {timing} | {str(job.get('id', ''))[:8]}")
+        return {"ok": True, "message": f"Reminders: {len(items)}", "previewLines": lines[:10]}
+
+    if kind == "reminder_status":
+        items = reminder_jobs(session.jobs)
+        active = sum(1 for item in items if bool(item.get("active", True)))
+        paused = max(0, len(items) - active)
+        recurring = sum(1 for item in items if str(item.get("kind", "")).strip().lower() == "remind_note")
+        one_shot = sum(1 for item in items if str(item.get("kind", "")).strip().lower() == "remind_once")
+        next_due = next_due_job_time(items)
+        lines = [
+            f"reminders: {len(items)} total",
+            f"active/paused: {active}/{paused}",
+            f"recurring/one-shot: {recurring}/{one_shot}",
+            f"next due: {int(next_due or 0)}",
+            "use: show reminders",
+        ]
+        return {"ok": True, "message": "Reminder status ready.", "previewLines": lines[:10]}
+
+    if kind == "cancel_reminder":
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        if not reminder:
+            return {"ok": False, "message": "Reminder not found."}
+        session.jobs[:] = [x for x in session.jobs if x.get("id") != reminder.get("id")]
+        graph_add_event(graph, "cancel_reminder", {"jobId": reminder.get("id"), "kind": reminder.get("kind", "remind_note")})
+        return {"ok": True, "message": f"Canceled reminder {str(reminder.get('id', ''))[:8]}"}
+
+    if kind == "pause_reminder":
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        if not reminder:
+            return {"ok": False, "message": "Reminder not found."}
+        reminder["active"] = False
+        graph_add_event(graph, "pause_reminder", {"jobId": reminder.get("id"), "kind": reminder.get("kind", "remind_note")})
+        return {"ok": True, "message": f"Paused reminder {str(reminder.get('id', ''))[:8]}"}
+
+    if kind == "resume_reminder":
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        if not reminder:
+            return {"ok": False, "message": "Reminder not found."}
+        reminder["active"] = True
+        interval_ms = int(reminder.get("intervalMs", 0) or 0)
+        reminder["nextRunAt"] = now_ms() + (interval_ms if interval_ms > 0 else 1000)
+        graph_add_event(graph, "resume_reminder", {"jobId": reminder.get("id"), "kind": reminder.get("kind", "remind_note")})
+        return {"ok": True, "message": f"Resumed reminder {str(reminder.get('id', ''))[:8]}"}
 
     if kind == "schedule_audit_open_tasks":
         minutes = int(payload.get("intervalMinutes", 0) or 0)
@@ -13760,7 +28544,25 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         rel = format_workspace_relpath(target)
         graph_add_event(graph, "list_files", {"path": rel, "count": len(items)})
         lines = items or ["(empty)"]
-        return {"ok": True, "message": f"Listed files: {rel}", "previewLines": lines[:10]}
+        typed_items: list[dict[str, Any]] = []
+        for raw in items:
+            name = str(raw or "")
+            typed_items.append(
+                {
+                    "name": name,
+                    "type": "dir" if name.endswith("/") else "file",
+                }
+            )
+        return {
+            "ok": True,
+            "message": f"Listed files: {rel}",
+            "previewLines": lines[:10],
+            "data": {
+                "path": rel,
+                "items": typed_items,
+                "count": len(typed_items),
+            },
+        }
 
     if kind == "read_file":
         target = resolve_workspace_path(str(payload.get("path", "")).strip())
@@ -13774,24 +28576,172 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         rel = format_workspace_relpath(target)
         lines = text.splitlines()[:10] if text else ["(empty file)"]
         graph_add_event(graph, "read_file", {"path": rel, "lines": len(lines)})
-        return {"ok": True, "message": f"Read file: {rel}", "previewLines": lines}
+        return {
+            "ok": True,
+            "message": f"Read file: {rel}",
+            "previewLines": lines,
+            "data": {
+                "path": rel,
+                "lineCount": len(lines),
+                "excerpt": "\n".join(lines),
+                "items": [{"name": rel, "type": "file"}],
+            },
+        }
 
     if kind == "fetch_url":
         url = str(payload.get("url", "")).strip()
-        try:
-            with httpx.Client(timeout=5.0, follow_redirects=True) as client:
-                resp = client.get(url)
-            content_type = str(resp.headers.get("content-type", "")).lower()
-            body = resp.text if "text" in content_type or "json" in content_type or not content_type else ""
-            preview = normalize_preview_lines(body)
-            graph_add_event(graph, "fetch_url", {"url": url[:160], "statusCode": int(resp.status_code)})
+        snapshot = web_fetch_snapshot(url)
+        if not bool(snapshot.get("ok", False)):
             return {
-                "ok": True,
-                "message": f"Fetched URL: {url} ({resp.status_code})",
-                "previewLines": preview or [f"status={resp.status_code}"],
+                "ok": False,
+                "op": "fetch_url",
+                "message": "URL fetch failed",
+                "previewLines": [f"error: {str(snapshot.get('error', 'web provider request failed'))}"],
             }
-        except Exception as exc:
-            return {"ok": False, "message": f"URL fetch failed: {str(exc)[:120]}"}
+        status_code = int(snapshot.get("statusCode", 0) or 0)
+        source = str(snapshot.get("source", "scaffold"))
+        title = str(snapshot.get("title", "")).strip()
+        excerpt = str(snapshot.get("excerpt", "")).strip()
+        favicon = str(snapshot.get("favicon", "")).strip()
+        thumbnail = str(snapshot.get("thumbnail", "")).strip()
+        graph_add_event(graph, "fetch_url", {"url": url[:160], "statusCode": status_code, "source": source})
+        preview_lines = [f"source: {source}"]
+        if title:
+            preview_lines.append(f"title: {title[:140]}")
+        if excerpt:
+            preview_lines.append(f"excerpt: {excerpt[:200]}")
+        return {
+            "ok": True,
+            "op": "fetch_url",
+            "message": f"Fetched: {title or url} ({status_code})",
+            "previewLines": preview_lines[:10],
+            "data": {"url": url, "title": title, "excerpt": excerpt, "favicon": favicon, "thumbnail": thumbnail, "source": source, "statusCode": status_code},
+        }
+
+    if kind == "web_summarize":
+        url = str(payload.get("url", "")).strip()
+        snapshot = web_fetch_snapshot(url)
+        if not bool(snapshot.get("ok", False)):
+            return {
+                "ok": False,
+                "op": "web_summarize",
+                "message": "Website summary unavailable: web provider unavailable",
+                "previewLines": [
+                    f"source: {str(snapshot.get('source', 'unknown'))}",
+                    f"error: {str(snapshot.get('error', 'web provider request failed'))}",
+                ],
+            }
+        source = str(snapshot.get("source", "scaffold"))
+        body = str(snapshot.get("body", ""))
+        lines = summarize_web_text(body)
+        graph_add_event(graph, "web_summarize", {"url": url[:160], "source": source})
+        return {
+            "ok": True,
+            "op": "web_summarize",
+            "message": f"Website summary ready for {url}",
+            "previewLines": [f"source: {source}", *lines][:10],
+            "data": {
+                "url": url,
+                "source": source,
+                "title": str(snapshot.get("title", "")),
+                "excerpt": str(snapshot.get("excerpt", "")),
+                "favicon": str(snapshot.get("favicon", "")),
+                "thumbnail": str(snapshot.get("thumbnail", "")),
+                "summary": lines,
+            },
+        }
+
+    if kind == "web_search":
+        query = str(payload.get("query", "")).strip()
+        snapshot = web_search_snapshot(query)
+        if not bool(snapshot.get("ok", False)):
+            return {"ok": False, "op": "web_search", "message": "Web search unavailable.", "previewLines": [str(snapshot.get("error", "query required"))]}
+        source = str(snapshot.get("source", "scaffold"))
+        items = snapshot.get("items", []) if isinstance(snapshot.get("items"), list) else []
+        qlower = query.lower()
+        site_target: dict[str, Any] | None = None
+        source_host = ""
+        site_routes = {
+            "instagram": ("Instagram", "https://www.instagram.com/"),
+            "youtube": ("YouTube", "https://www.youtube.com/"),
+            "reddit": ("Reddit", "https://www.reddit.com/"),
+            "x ": ("X", "https://x.com/"),
+            "twitter": ("X", "https://x.com/"),
+            "tiktok": ("TikTok", "https://www.tiktok.com/"),
+            "amazon": ("Amazon", "https://www.amazon.com/"),
+            "puma": ("Puma", "https://us.puma.com/us/en/men/shoes"),
+            "nike": ("Nike", "https://www.nike.com/w/mens-shoes-nik1zy7ok"),
+            "adidas": ("Adidas", "https://www.adidas.com/us/men-shoes"),
+            "new balance": ("New Balance", "https://www.newbalance.com/men/shoes/"),
+            "jordan": ("Jordan", "https://www.nike.com/w/jordan-shoes-37eefzy7ok"),
+        }
+        for token, (label, base_url) in site_routes.items():
+            if token in qlower:
+                if "instagram" in token:
+                    url = f"https://www.instagram.com/explore/search/keyword/?q={quote_plus(query)}"
+                elif "youtube" in token:
+                    url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+                elif "reddit" in token:
+                    url = f"https://www.reddit.com/search/?q={quote_plus(query)}"
+                elif "amazon" in token:
+                    url = f"https://www.amazon.com/s?k={quote_plus(query)}"
+                elif "puma" in token:
+                    url = f"https://us.puma.com/us/en/search?q={quote_plus(query)}"
+                elif "nike" in token:
+                    url = f"https://www.nike.com/w?q={quote_plus(query)}"
+                elif "adidas" in token:
+                    url = f"https://www.adidas.com/us/search?q={quote_plus(query)}"
+                elif "new balance" in token:
+                    url = f"https://www.newbalance.com/search/?q={quote_plus(query)}"
+                elif "jordan" in token:
+                    url = f"https://www.nike.com/w?q={quote_plus(query)}"
+                else:
+                    url = base_url
+                source_host = str(urlparse(url).netloc or "").lower()
+                site_target = {"label": f"Open {label}", "url": url, "mode": "direct", "host": source_host}
+                break
+        if site_target is None:
+            source_phrase_patterns = [
+                (r"\b(on|from|at)\s+instagram\b", ("Instagram", "https://www.instagram.com/explore/search/keyword/?q={q}")),
+                (r"\b(on|from|at)\s+youtube\b", ("YouTube", "https://www.youtube.com/results?search_query={q}")),
+                (r"\b(on|from|at)\s+reddit\b", ("Reddit", "https://www.reddit.com/search/?q={q}")),
+                (r"\b(on|from|at)\s+tiktok\b", ("TikTok", "https://www.tiktok.com/search?q={q}")),
+                (r"\b(on|from|at)\s+amazon\b", ("Amazon", "https://www.amazon.com/s?k={q}")),
+                (r"\b(on|from|at)\s+puma\b", ("Puma", "https://us.puma.com/us/en/search?q={q}")),
+                (r"\b(on|from|at)\s+nike\b", ("Nike", "https://www.nike.com/w?q={q}")),
+                (r"\b(on|from|at)\s+adidas\b", ("Adidas", "https://www.adidas.com/us/search?q={q}")),
+                (r"\b(on|from|at)\s+new\s*balance\b", ("New Balance", "https://www.newbalance.com/search/?q={q}")),
+            ]
+            for pattern, (label, template) in source_phrase_patterns:
+                if re.search(pattern, qlower):
+                    url = template.format(q=quote_plus(query))
+                    source_host = str(urlparse(url).netloc or "").lower()
+                    site_target = {"label": f"Open {label}", "url": url, "mode": "direct", "host": source_host}
+                    break
+        if site_target is None and items:
+            first_url = str((items[0] if isinstance(items[0], dict) else {}).get("url", "")).strip()
+            if first_url:
+                source_host = str(urlparse(first_url).netloc or "").lower()
+                site_target = {"label": "Open top result", "url": first_url, "mode": "assist", "host": source_host}
+        graph_add_event(graph, "web_search", {"query": query[:120], "source": source, "count": len(items)})
+        lines = [f"results: {len(items)} | source: {source}"]
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{str(item.get('title', '-'))} | {str(item.get('url', '-'))}")
+        if items:
+            first_url = str((items[0] if isinstance(items[0], dict) else {}).get("url", "")).strip()
+            if first_url:
+                lines.append(f"next: summarize website {first_url}")
+        if isinstance(site_target, dict):
+            lines.append(f"direct: {str(site_target.get('label', 'Open source'))} | {str(site_target.get('url', ''))}")
+        return {
+            "ok": True,
+            "op": "web_search",
+            "message": f"Web search ready for '{query}'",
+            "previewLines": lines[:10],
+            "data": {"query": query, "source": source, "items": items[:8], "sourceTarget": site_target},
+        }
 
     if kind == "list_audit":
         domain = str(payload.get("domain", "")).strip().lower() or None
@@ -13838,6 +28788,439 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 f"{'ok' if item.get('ok') else 'denied'} | {route.get('intentClass', 'unknown')} | {route.get('reason', 'default')} | {int(perf.get('totalMs', 0) or 0)}ms"
             )
         return {"ok": True, "message": f"Trace entries: {len(items)}", "previewLines": lines[:10]}
+
+    if kind == "list_connector_grants":
+        report = connector_grants_report()
+        lines = [
+            f"scopes granted/total: {int(report.get('granted', 0) or 0)}/{int(report.get('count', 0) or 0)}",
+        ]
+        for item in (report.get("items", []) if isinstance(report.get("items"), list) else [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            status = "granted" if bool(item.get("granted", False)) else "blocked"
+            scope = str(item.get("scope", ""))
+            expires_at = int(item.get("expiresAt", 0) or 0)
+            ttl = f" expires {expires_at}" if expires_at > 0 else ""
+            lines.append(f"{status} | {scope}{ttl}")
+        return {"ok": True, "message": "Connector grants ready.", "previewLines": lines[:10]}
+
+    if kind == "grant_connector_scope":
+        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        ttl_ms = max(0, int(payload.get("ttlMs", 0) or 0))
+        if scope not in connector_scope_catalog():
+            return {"ok": False, "message": "Unknown connector scope."}
+        item = connector_grant_scope(scope, ttl_ms=ttl_ms)
+        graph_add_event(graph, "grant_connector_scope", {"scope": scope, "ttlMs": ttl_ms})
+        suffix = f" for {ttl_ms}ms" if ttl_ms > 0 else ""
+        return {"ok": True, "message": f"Granted scope: {scope}{suffix}", "previewLines": [f"persisted: {'yes' if bool(item.get('persisted', False)) else 'no'}"]}
+
+    if kind == "revoke_connector_scope":
+        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        if scope not in connector_scope_catalog():
+            return {"ok": False, "message": "Unknown connector scope."}
+        item = connector_revoke_scope(scope)
+        graph_add_event(graph, "revoke_connector_scope", {"scope": scope, "revoked": bool(item.get("revoked", False))})
+        return {
+            "ok": True,
+            "message": f"Revoked scope: {scope}" if bool(item.get("revoked", False)) else f"Scope not granted: {scope}",
+            "previewLines": [f"persisted: {'yes' if bool(item.get('persisted', False)) else 'no'}"],
+        }
+
+    if kind == "location_status":
+        location = resolve_user_location_hint()
+        return {
+            "ok": True,
+            "message": f"Location context: {location}",
+            "previewLines": [
+                f"location: {location}",
+                "set env GENOME_HOME_LOCATION to override",
+                "or set vault secret: user.home.location",
+            ],
+        }
+
+    if kind == "shop_catalog_search":
+        query = str(payload.get("query", "")).strip()
+        category = str(payload.get("category", "")).strip().lower()
+        snapshot = shopping_catalog_snapshot(query=query, category=category)
+        items = snapshot.get("items", []) if isinstance(snapshot.get("items"), list) else []
+        source = str(snapshot.get("source", "scaffold"))
+        graph_add_event(graph, "shop_catalog_search", {"query": query[:120], "category": category[:24], "count": len(items), "source": source})
+        lines = [f"results: {len(items)} | source: {source}"]
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('title', '-'))} | {str(item.get('brand', '-'))} | ${float(item.get('priceUsd', 0.0) or 0.0):.2f}"
+            )
+        source_target = snapshot.get("sourceTarget") if isinstance(snapshot.get("sourceTarget"), dict) else None
+        if isinstance(source_target, dict):
+            lines.append(f"direct: {str(source_target.get('label', 'Open source'))} | {str(source_target.get('url', ''))}")
+        return {
+            "ok": True,
+            "message": f"Shopping options ready ({len(items)}).",
+            "previewLines": lines[:10],
+            "data": {
+                "query": query,
+                "category": category,
+                "source": source,
+                "items": items[:16],
+                "sourceTarget": source_target,
+            },
+        }
+
+    if kind == "weather_forecast":
+        location = normalize_weather_location(str(payload.get("location", "")))
+        snapshot = weather_read_snapshot(location)
+        if not bool(snapshot.get("ok", False)):
+            return {
+                "ok": False,
+                "message": f"Weather unavailable for {location}.",
+                "previewLines": [
+                    f"location: {location}",
+                    f"source: {str(snapshot.get('source', 'unknown'))}",
+                    f"error: {str(snapshot.get('error', 'provider unavailable'))}",
+                ],
+            }
+        temperature = float(snapshot.get("temperatureF", 0.0) or 0.0)
+        wind = float(snapshot.get("windMph", 0.0) or 0.0)
+        condition = str(snapshot.get("condition", "unknown"))
+        source = str(snapshot.get("source", "fallback"))
+        resolved = str(snapshot.get("location", location))
+        hourly = snapshot.get("hourly", []) if isinstance(snapshot.get("hourly"), list) else []
+        hourly_data: list[dict[str, Any]] = []
+        for item in hourly[:12]:
+            if not isinstance(item, dict):
+                continue
+            hourly_data.append(
+                {
+                    "hourOffset": int(item.get("hourOffset", 0) or 0),
+                    "hourLabel": str(item.get("hourLabel", ""))[:16],
+                    "tempF": float(item.get("tempF", 0.0) or 0.0),
+                    "windMph": float(item.get("windMph", 0.0) or 0.0),
+                    "precipChance": int(item.get("precipChance", 0) or 0),
+                    "condition": str(item.get("condition", condition))[:40],
+                }
+            )
+        graph_add_event(graph, "weather_forecast", {"location": resolved[:80], "source": source})
+        lines = [
+            f"location: {resolved}",
+            f"condition: {condition}",
+            f"temperature: {temperature:.1f}F",
+            f"wind: {wind:.1f} mph",
+            f"source: {source}",
+        ]
+        weather_url = f"https://weather.com/weather/today/l/{quote_plus(resolved)}"
+        source_target = {"label": f"Open forecast for {resolved}", "url": weather_url, "mode": "assist"}
+        lines.append(f"direct: {source_target['label']} | {source_target['url']}")
+        return {
+            "ok": True,
+            "message": f"Weather ready for {resolved}",
+            "previewLines": lines[:10],
+            "data": {
+                "location": resolved,
+                "condition": condition,
+                "temperatureF": float(temperature),
+                "windMph": float(wind),
+                "source": source,
+                "forecast": hourly_data,
+                "sourceTarget": source_target,
+            },
+        }
+
+    if kind == "mcp_tool_call":
+        # Direct MCP tool invocation (routed explicitly via intent parser).
+        # Most MCP calls go through the fallback in /api/turn; this handles explicit ops.
+        server_id = str(payload.get("serverId", "")).strip()
+        tool_name = str(payload.get("toolName", "")).strip()
+        tool_args = payload.get("arguments", {}) if isinstance(payload.get("arguments"), dict) else {}
+        server = MCP_SERVER_REGISTRY.get(server_id, {}) if server_id else {}
+        server_name = str(server.get("name", server_id)).strip()
+        if not server_id or not tool_name:
+            return {"ok": False, "message": "MCP server or tool not specified.", "previewLines": ["mcp: missing server or tool"]}
+        import asyncio as _asyncio
+        try:
+            result = _asyncio.get_event_loop().run_until_complete(
+                _call_mcp_stdio_tool(server_id, tool_name, tool_args, timeout=10.0)
+            )
+        except Exception as exc:
+            return {"ok": False, "message": f"MCP tool error: {str(exc)[:120]}", "previewLines": [str(exc)[:120]]}
+        content = result.get("content", [])
+        text_lines = [item["text"] for item in content if item.get("type") == "text"]
+        return {
+            "ok": not result.get("isError", False),
+            "message": f"MCP: {server_name} / {tool_name}",
+            "previewLines": text_lines[:6] or [f"mcp: {server_name} → {tool_name}"],
+            "data": {"serverName": server_name, "toolName": tool_name, "content": content},
+        }
+
+    if kind == "contacts_lookup":
+        query = str(payload.get("query", "")).strip()
+        snapshot = contacts_lookup_snapshot(query=query)
+        items = snapshot.get("items", []) if isinstance(snapshot.get("items"), list) else []
+        source = str(snapshot.get("source", "scaffold"))
+        graph_add_event(graph, "contacts_lookup", {"query": query[:80], "count": len(items), "source": source})
+        lines = [f"results: {len(items)} | source: {source}"]
+        for item in items[:8]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{str(item.get('name', '-'))} | {str(item.get('phone', '-'))} | {str(item.get('label', ''))}"
+            )
+        if not items:
+            lines.append("No contacts matched. Try: show contacts")
+        return {
+            "ok": True,
+            "message": "Contacts ready.",
+            "previewLines": lines[:10],
+            "data": {
+                "items": [item for item in items if isinstance(item, dict)],
+                "source": source,
+                "query": query,
+            },
+        }
+
+    if kind == "telephony_status":
+        granted = connector_scope_granted("telephony.call.start")
+        contacts_granted = connector_scope_granted("contacts.read")
+        lines = [
+            f"scope telephony.call.start: {'granted' if granted else 'blocked'}",
+            f"scope contacts.read: {'granted' if contacts_granted else 'blocked'}",
+            "device support desktop/mobile: partial/full",
+            "fallback: handoff_to_mobile",
+            "use: confirm call <target>",
+        ]
+        return {
+            "ok": True,
+            "message": "Telephony status ready.",
+            "previewLines": lines[:10],
+            "data": {
+                "mode": "status",
+                "steps": lines[2:],
+                "grants": {
+                    "telephony.call.start": bool(granted),
+                    "contacts.read": bool(contacts_granted),
+                },
+            },
+        }
+
+    if kind == "telephony_call_start":
+        input_target = str(payload.get("target", "")).strip()
+        if not input_target:
+            return {"ok": False, "message": "Call target is required."}
+        resolved_target = input_target
+        contact = None
+        if not looks_like_phone_target(input_target):
+            contact = resolve_contact_target(input_target)
+            if not isinstance(contact, dict):
+                return {
+                    "ok": False,
+                    "message": f"Contact not found: {input_target}",
+                    "previewLines": [f"try: find contact {input_target}"],
+                }
+            resolved_target = str(contact.get("phone", "")).strip() or input_target
+        force_handoff = bool(payload.get("forceHandoff", False))
+        mode = "handoff_to_mobile" if force_handoff else "bridge_prepare"
+        graph_add_event(
+            graph,
+            "telephony_call_start",
+            {
+                "target": resolved_target[:80],
+                "mode": mode,
+                "contactName": str((contact or {}).get("name", ""))[:80],
+            },
+        )
+        lines = [
+            f"target: {resolved_target}",
+            "connector: telephony.bridge",
+            f"mode: {mode}",
+            "next: start handoff",
+            "next: open this same session on mobile and claim token",
+        ]
+        if isinstance(contact, dict) and str(contact.get("name", "")).strip():
+            lines.insert(1, f"contact: {str(contact.get('name', '')).strip()} ({str(contact.get('label', '')).strip()})")
+        return {
+            "ok": True,
+            "message": f"Call prepared for {resolved_target}. Continue on mobile.",
+            "previewLines": lines[:10],
+            "data": {
+                "target": resolved_target,
+                "mode": mode,
+                "contactName": str((contact or {}).get("name", "")),
+                "steps": lines[2:],
+            },
+        }
+
+    if kind == "banking_status":
+        mode = normalize_connector_service_mode(BANKING_PROVIDER_MODE, default="scaffold")
+        lines = [
+            f"scope bank.account.balance.read: {'granted' if connector_scope_granted('bank.account.balance.read') else 'blocked'}",
+            f"scope bank.transaction.read: {'granted' if connector_scope_granted('bank.transaction.read') else 'blocked'}",
+            f"provider: oauth ({mode})",
+            "use: show bank balance",
+        ]
+        return {"ok": True, "message": "Banking status ready.", "previewLines": lines[:10]}
+
+    if kind == "banking_balance_read":
+        bal = banking_balance_snapshot()
+        if not bool(bal.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Bank balance unavailable.",
+                "previewLines": [f"source: {str(bal.get('source', 'unknown'))}", f"error: {str(bal.get('error', 'provider unavailable'))}"],
+            }
+        graph_add_event(graph, "banking_balance_read", {"source": str(bal.get("source", "mock")), "currency": str(bal.get("currency", "USD"))})
+        lines = [
+            f"available: ${float(bal.get('available', 0.0) or 0.0):,.2f}",
+            f"ledger: ${float(bal.get('ledger', 0.0) or 0.0):,.2f}",
+            f"currency: {str(bal.get('currency', 'USD'))}",
+            f"as of: {str(bal.get('asOf', '-'))}",
+            f"source: {str(bal.get('source', 'mock'))}",
+        ]
+        return {
+            "ok": True,
+            "message": "Bank balance ready.",
+            "previewLines": lines[:10],
+            "data": {
+                "available": float(bal.get("available", 0.0) or 0.0),
+                "ledger": float(bal.get("ledger", 0.0) or 0.0),
+                "currency": str(bal.get("currency", "USD")),
+                "asOf": str(bal.get("asOf", "")),
+                "source": str(bal.get("source", "mock")),
+            },
+        }
+
+    if kind == "banking_transactions_read":
+        limit = max(1, min(int(payload.get("limit", 5) or 5), 20))
+        tx = banking_transactions_snapshot(limit=limit)
+        if not bool(tx.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Recent transactions unavailable.",
+                "previewLines": [f"source: {str(tx.get('source', 'unknown'))}", f"error: {str(tx.get('error', 'provider unavailable'))}"],
+            }
+        items = tx.get("items", []) if isinstance(tx.get("items"), list) else []
+        source = str(tx.get("source", "mock"))
+        graph_add_event(graph, "banking_transactions_read", {"source": source, "count": len(items)})
+        lines = [f"transactions: {len(items)} (source {source})"]
+        for item in items:
+            amount = float(item.get("amount", 0.0) or 0.0)
+            lines.append(f"{str(item.get('date', '-'))} | {str(item.get('merchant', '-'))} | ${amount:,.2f}")
+        return {
+            "ok": True,
+            "message": "Recent transactions ready.",
+            "previewLines": lines[:10],
+            "data": {
+                "items": [item for item in items if isinstance(item, dict)],
+                "source": source,
+                "limit": int(limit),
+            },
+        }
+
+    if kind == "contacts_status":
+        lines = [
+            f"scope contacts.read: {'granted' if connector_scope_granted('contacts.read') else 'blocked'}",
+            "provider: contacts.local (scaffold)",
+            f"seeded contacts: {len(MOCK_CONTACTS)}",
+            "use: show contacts",
+            "use: find contact <name>",
+        ]
+        return {"ok": True, "message": "Contacts status ready.", "previewLines": lines[:10]}
+
+    if kind == "social_status":
+        mode = normalize_connector_service_mode(SOCIAL_PROVIDER_MODE, default="scaffold")
+        lines = [
+            f"scope social.feed.read: {'granted' if connector_scope_granted('social.feed.read') else 'blocked'}",
+            f"scope social.message.send: {'granted' if connector_scope_granted('social.message.send') else 'blocked'}",
+            f"provider: web_session ({mode})",
+            "use: show social feed",
+        ]
+        return {"ok": True, "message": "Social status ready.", "previewLines": lines[:10]}
+
+    if kind == "web_status":
+        mode = normalize_connector_service_mode(WEB_PROVIDER_MODE, default="scaffold")
+        lines = [
+            f"scope web.page.read: {'granted' if connector_scope_granted('web.page.read') else 'blocked'}",
+            f"provider: web.fetch ({mode})",
+            "use: search web <query>",
+            "use: summarize website <url>",
+        ]
+        return {"ok": True, "message": "Web status ready.", "previewLines": lines[:10]}
+
+    if kind == "social_feed_read":
+        feed = social_feed_snapshot()
+        if not bool(feed.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Social feed unavailable.",
+                "previewLines": [f"source: {str(feed.get('source', 'unknown'))}", f"error: {str(feed.get('error', 'provider unavailable'))}"],
+            }
+        items = feed.get("items", []) if isinstance(feed.get("items"), list) else []
+        source = str(feed.get("source", "mock"))
+        graph_add_event(graph, "social_feed_read", {"source": source, "count": len(items)})
+        lines = [f"feed items: {len(items)} (source {source})"]
+        for item in items[:5]:
+            lines.append(f"{str(item.get('author', '-'))} | {str(item.get('summary', '-'))} | {str(item.get('age', '-'))}")
+        return {
+            "ok": True,
+            "message": "Social feed ready.",
+            "previewLines": lines[:10],
+            "data": {
+                "items": [item for item in items if isinstance(item, dict)],
+                "source": source,
+            },
+        }
+
+    if kind == "social_message_send":
+        text = str(payload.get("text", "")).strip()
+        sent = social_send_snapshot(text)
+        if not bool(sent.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Social message unavailable.",
+                "previewLines": [f"source: {str(sent.get('source', 'unknown'))}", f"error: {str(sent.get('error', 'provider unavailable'))}"],
+            }
+        source = str(sent.get("source", "mock"))
+        graph_add_event(graph, "social_message_send", {"source": source, "chars": len(text)})
+        lines = [
+            f"message: {str(sent.get('message', text))[:120]}",
+            f"delivery: {str(sent.get('delivery', 'queued'))} ({source})",
+            "provider: social.web_session",
+            f"source: {source}",
+        ]
+        return {
+            "ok": True,
+            "message": "Social message queued.",
+            "previewLines": lines[:10],
+            "data": {
+                "message": str(sent.get("message", text))[:280],
+                "delivery": str(sent.get("delivery", "queued")),
+                "source": source,
+            },
+        }
+
+    if kind == "list_connectors":
+        manifests = list_connector_manifests()
+        device = normalize_connector_device(str(payload.get("device", "") or ""))
+        summary = connector_summary(manifests)
+        if not manifests:
+            return {"ok": True, "message": "No connectors registered.", "previewLines": ["No connector manifests available."]}
+        device_counts = connector_device_counts(manifests, device) if device else None
+        lines = [
+            f"connectors/domains/scopes: {int(summary.get('count', 0) or 0)}/{int(summary.get('domains', 0) or 0)}/{int(summary.get('scopes', 0) or 0)}",
+            f"mobile full/partial/unsupported: {int(summary.get('mobileFull', 0) or 0)}/{int(summary.get('mobilePartial', 0) or 0)}/{int(summary.get('mobileUnsupported', 0) or 0)}",
+        ]
+        if device and isinstance(device_counts, dict):
+            lines.append(
+                f"{device} full/partial/unsupported: {int(device_counts.get('full', 0) or 0)}/{int(device_counts.get('partial', 0) or 0)}/{int(device_counts.get('unsupported', 0) or 0)}"
+            )
+        for item in manifests[:8]:
+            connector_id = str(item.get("id", "connector"))
+            domain = str(item.get("domain", "unknown"))
+            provider = str(item.get("provider", "unknown"))
+            scopes = item.get("scopes", []) if isinstance(item.get("scopes"), list) else []
+            lines.append(f"{connector_id} | {domain} | {provider} | scopes {len(scopes)}")
+        suffix = f" ({device})" if device else ""
+        return {"ok": True, "message": f"Connectors: {int(summary.get('count', 0) or 0)} registered{suffix}", "previewLines": lines[:10]}
 
     if kind == "trace_summary":
         limit = max(1, min(int(payload.get("limit", 200) or 200), 500))
@@ -14068,7 +29451,12 @@ def build_local_plan(envelope: dict[str, Any], graph: dict[str, Any], execution:
         "layout": {"columns": 2, "density": envelope["uiIntent"]["density"]},
         "suggestions": build_suggestions(domains, graph, jobs),
         "blocks": blocks,
-        "trace": {"planVersion": "py-local-v1", "focusDomains": domains, "mode": envelope["uiIntent"]["mode"]},
+        "trace": {
+            "planVersion": "py-local-v1",
+            "focusDomains": domains,
+            "mode": envelope["uiIntent"]["mode"],
+            "graphSnapshot": build_plan_graph_snapshot(graph),
+        },
     }
 
 
@@ -14090,6 +29478,108 @@ def build_suggestions(domains: list[str], graph: dict[str, Any], jobs: list[dict
         out.append("read file README.md")
     if "web" in domains:
         out.append("fetch url https://example.com")
+    if "graph" in domains:
+        out.append("show graph summary")
+        out.append("show graph relation matrix")
+        out.append("show graph anomalies limit 20")
+        out.append("show graph guidance limit 8")
+        out.append("show graph score")
+        out.append("show graph score trend window 1h buckets 8")
+        out.append("show graph score guidance limit 6")
+        out.append("show graph score alerts limit 10")
+        out.append("show graph score alerts history window 1h buckets 8 limit 5")
+        out.append("show graph score remediation limit 6")
+        out.append("show graph score forecast horizon 1h steps 6")
+        out.append("show graph score forecast guidance limit 6")
+        out.append("show graph score guardrails warn below 75 fail below 60")
+        out.append("show graph score autopilot preview limit 6")
+        out.append("run graph score autopilot dry run limit 6")
+        out.append("show graph score autopilot history limit 20")
+        out.append("show graph score autopilot metrics window 24h")
+        out.append("show graph score autopilot anomalies window 24h limit 10")
+        out.append("show graph score autopilot guidance window 24h limit 8")
+        out.append("show graph score autopilot policy window 24h")
+        out.append("show graph score autopilot policy drift window 24h")
+        out.append("show graph score autopilot policy alignment actions window 24h limit 6")
+        out.append("run graph score autopilot policy alignment dry run window 24h limit 6")
+        out.append("show graph score autopilot policy alignment history limit 20")
+        out.append("show graph score autopilot policy alignment metrics window 24h")
+        out.append("show graph score autopilot policy alignment anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment guidance window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy window 24h")
+        out.append("show graph score autopilot policy alignment policy drift window 24h")
+        out.append("show graph score autopilot policy alignment policy guidance window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy history limit 20")
+        out.append("show graph score autopilot policy alignment policy metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance window 24h limit 6")
+        out.append("run graph score autopilot policy alignment policy trend guidance dry run window 24h limit 6")
+        out.append("show graph score autopilot policy alignment policy trend guidance history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy drift window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy trend guidance policy guidance dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy trend guidance policy guidance state guidance dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state trend window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state offenders window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state timeline window 24h limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state matrix window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state summary window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state summary window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance window 24h limit 8")
+        out.append("run graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance dry run window 24h limit 8")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run history limit 20")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run metrics window 24h")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state guidance state guidance state run state guidance run anomalies window 24h limit 10")
+        out.append("show graph score autopilot policy alignment policy trend guidance policy guidance state history limit 20")
+        out.append("show graph health")
+        out.append("show graph components")
+        out.append("show graph hubs")
+        out.append("show graph events limit 20")
+        out.append("show graph schema")
+        out.append("show graph kind task limit 5")
+        out.append("show graph neighborhood for task 1 depth 2")
+        out.append("show graph path task 1 to task 2")
+        out.append("show graph relation depends_on")
     if memory["tasks"] and memory["notes"]:
         out.append("link task 1 references note 1")
     if memory["tasks"]:
@@ -14101,8 +29591,44 @@ def build_suggestions(domains: list[str], graph: dict[str, Any], jobs: list[dict
     if jobs:
         out.append("list jobs")
         out.append("pause job 1")
+        out.append("show reminders")
+        out.append("show reminder status")
+        out.append("pause reminder 1")
+        out.append("resume reminder 1")
+        out.append("cancel reminder 1")
+    out.append("remind me to stretch in 10m")
     out.append("show dead letters")
     out.append("show runtime health")
+    out.append("show connectors")
+    out.append("show connector grants")
+    out.append("grant connector scope web.page.read")
+    out.append("search web local-first generative os")
+    out.append("fetch url https://example.com")
+    out.append("open website https://example.com")
+    out.append("summarize website https://example.com")
+    out.append("grant connector scope contacts.read")
+    out.append("show contacts status")
+    out.append("show contacts")
+    out.append("find contact mike")
+    out.append("grant weather forecast")
+    out.append("grant connector scope weather.forecast.read")
+    out.append("revoke connector scope weather.forecast.read")
+    out.append("show weather in Seattle")
+    out.append("what's the weather where i am")
+    out.append("where am i")
+    out.append("show telephony status")
+    out.append("grant connector scope telephony.call.start")
+    out.append("confirm call 5550100")
+    out.append("handoff call 5550100 to mobile")
+    out.append("show banking status")
+    out.append("grant connector scope bank.account.balance.read")
+    out.append("show bank balance")
+    out.append("show recent transactions")
+    out.append("show social status")
+    out.append("grant connector scope social.feed.read")
+    out.append("show social feed")
+    out.append("grant connector scope social.message.send")
+    out.append("confirm send social message hello from genome os")
     out.append("show presence")
     out.append("prune presence all")
     out.append("show continuity")
@@ -14258,6 +29784,35 @@ class UIPlan(BaseModel):
 UI_PLAN_MODEL = UIPlan
 
 
+def build_plan_graph_snapshot(
+    graph: dict[str, Any], entity_limit: int = 32, relation_limit: int = 80, event_limit: int = 40
+) -> dict[str, Any]:
+    entities = list((graph or {}).get("entities", []) or [])
+    relations = list((graph or {}).get("relations", []) or [])
+    events = list((graph or {}).get("events", []) or [])
+    return {
+        "entities": entities[-max(1, int(entity_limit)) :],
+        "relations": relations[-max(1, int(relation_limit)) :],
+        "events": events[-max(1, int(event_limit)) :],
+        "counts": graph_counts(graph or make_empty_graph()),
+    }
+
+
+def enrich_plan_trace(plan: dict[str, Any], graph: dict[str, Any], route: dict[str, Any] | None = None) -> dict[str, Any]:
+    out = dict(plan or {})
+    trace = out.get("trace")
+    if not isinstance(trace, dict):
+        trace = {}
+    else:
+        trace = dict(trace)
+    trace["graphSnapshot"] = build_plan_graph_snapshot(graph)
+    if isinstance(route, dict):
+        trace.setdefault("routeTarget", str(route.get("target", "")))
+        trace.setdefault("routeReason", str(route.get("reason", "")))
+    out["trace"] = trace
+    return out
+
+
 def resolve_workspace_path(raw_path: str) -> pathlib.Path | None:
     value = str(raw_path or ".").strip().strip("\"'")
     if not value:
@@ -14359,7 +29914,7 @@ def fmt_date(ts: Any) -> str:
 
 
 def now_ms() -> int:
-    return int(datetime.utcnow().timestamp() * 1000)
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
 def summarize_graph(graph: dict[str, Any]) -> dict[str, Any]:
