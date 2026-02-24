@@ -1988,6 +1988,14 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
     def brand_live_search_snapshot(brand_key: str, brand_host: str, text_query: str, limit: int = 12) -> list[dict[str, Any]]:
         if not brand_key or not brand_host:
             return []
+        fallback_images = [
+            str(item.get("imageUrl", "")).strip()
+            for item in MOCK_SHOP_ITEMS
+            if isinstance(item, dict)
+            and normalize_token(str(item.get("brand", ""))) == brand_key
+            and (not c or str(item.get("category", "")).strip().lower() == c)
+            and str(item.get("imageUrl", "")).strip()
+        ]
         search_query = f"site:{brand_host} {str(text_query or brand_key).strip()}"
         snapshot = web_search_snapshot(search_query)
         if not bool(snapshot.get("ok", False)):
@@ -2012,6 +2020,7 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
             row_title = str(row.get("title", "")).strip() or f"{brand_name} result {idx + 1}"
             row_thumb = str(row.get("thumbnail", "")).strip()
             row_favicon = str(row.get("favicon", "")).strip()
+            visual = row_thumb or (fallback_images[idx % len(fallback_images)] if fallback_images else row_favicon)
             mapped.append(
                 {
                     "id": f"live-{brand_key}-{idx + 1}",
@@ -2019,7 +2028,7 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
                     "category": c or "shoes",
                     "brand": brand_name,
                     "priceUsd": stable_price_from_url(row_url),
-                    "imageUrl": row_thumb or row_favicon,
+                    "imageUrl": visual,
                     "url": row_url,
                     "sourceHost": row_host,
                 }

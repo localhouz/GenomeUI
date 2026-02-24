@@ -6177,6 +6177,26 @@ Notes:
 - implementation in `backend/main.py`
 - test coverage in `tests/unit/test_connectors.py` (`test_shopping_catalog_direct_brand_merges_live_web_hits`)
 
+---
+
+## T297 - Brand-Live Visual Backfill for Sparse Web Results
+Status: done
+Track: I (connector realism)
+Priority: P1
+Dependencies: T296
+
+Deliverables:
+- fallback image enrichment for direct-brand live results when web thumbnails are missing
+- deterministic mapping of sparse live results to brand-matched visual assets
+
+Acceptance:
+- direct brand intents keep visual catalog quality even when live web payload lacks media fields
+- unit coverage verifies image backfill path
+
+Notes:
+- implementation in `backend/main.py`
+- test coverage in `tests/unit/test_connectors.py` (`test_shopping_catalog_direct_brand_backfills_images_when_live_has_no_thumbnails`)
+
 ## Suggested Execution Order
 1. T3
 2. T4

@@ -475,6 +475,38 @@ class ConnectorUnitTests(unittest.TestCase):
         finally:
             main.web_search_snapshot = original
 
+    def test_shopping_catalog_direct_brand_backfills_images_when_live_has_no_thumbnails(self) -> None:
+        original = main.web_search_snapshot
+        try:
+            def fake_snapshot(query: str) -> dict:
+                return {
+                    "ok": True,
+                    "source": "duckduckgo",
+                    "query": query,
+                    "items": [
+                        {
+                            "title": "Nike Vomero Product Page",
+                            "url": "https://www.nike.com/t/vomero-running-shoes-xyz987",
+                            "snippet": "Comfortable trainer.",
+                            "host": "nike.com",
+                            "favicon": "",
+                            "thumbnail": "",
+                        }
+                    ],
+                }
+
+            main.web_search_snapshot = fake_snapshot
+            snap = main.shopping_catalog_snapshot("show me nike running shoes for men size 8.5", category="shoes")
+            self.assertTrue(bool(snap.get("ok", False)))
+            items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+            self.assertGreaterEqual(len(items), 1)
+            first = items[0] if isinstance(items[0], dict) else {}
+            image_url = str(first.get("imageUrl", "")).strip().lower()
+            self.assertTrue(image_url.startswith("http"))
+            self.assertNotEqual(image_url, "")
+        finally:
+            main.web_search_snapshot = original
+
     def test_web_search_phrase_source_route_instagram(self) -> None:
         session = main.ensure_session("ut_web_phrase_ig")
         result = main.run_operation(session, {"type": "web_search", "payload": {"query": "show me running tips on instagram"}})
