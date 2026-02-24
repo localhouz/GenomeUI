@@ -434,6 +434,47 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertEqual(str(target.get("mode", "")), "direct")
         self.assertIn("nike.com", str(target.get("url", "")).lower())
 
+    def test_shopping_catalog_direct_brand_merges_live_web_hits(self) -> None:
+        original = main.web_search_snapshot
+        try:
+            def fake_snapshot(query: str) -> dict:
+                self.assertIn("site:nike.com", str(query).lower())
+                return {
+                    "ok": True,
+                    "source": "duckduckgo",
+                    "query": query,
+                    "items": [
+                        {
+                            "title": "Nike Pegasus 41 Road Running Shoes",
+                            "url": "https://www.nike.com/t/pegasus-41-road-running-shoes-abc123",
+                            "snippet": "Responsive ride for daily miles.",
+                            "host": "nike.com",
+                            "favicon": "https://www.nike.com/favicon.ico",
+                            "thumbnail": "https://static.nike.com/a/images/pegasus-41.jpg",
+                        },
+                        {
+                            "title": "Off host result",
+                            "url": "https://example.com/off-host",
+                            "snippet": "should be filtered by host",
+                            "host": "example.com",
+                            "favicon": "https://example.com/favicon.ico",
+                            "thumbnail": "https://example.com/thumb.jpg",
+                        },
+                    ],
+                }
+
+            main.web_search_snapshot = fake_snapshot
+            snap = main.shopping_catalog_snapshot("show me nike running shoes for men size 8.5", category="shoes")
+            self.assertTrue(bool(snap.get("ok", False)))
+            self.assertEqual(str(snap.get("source", "")), "brand-live")
+            items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+            self.assertGreaterEqual(len(items), 1)
+            urls = [str(item.get("url", "")) for item in items if isinstance(item, dict)]
+            self.assertTrue(any("pegasus-41-road-running-shoes" in url for url in urls))
+            self.assertTrue(all("nike.com" in str(item.get("sourceHost", "")).lower() for item in items if isinstance(item, dict)))
+        finally:
+            main.web_search_snapshot = original
+
     def test_web_search_phrase_source_route_instagram(self) -> None:
         session = main.ensure_session("ut_web_phrase_ig")
         result = main.run_operation(session, {"type": "web_search", "payload": {"query": "show me running tips on instagram"}})

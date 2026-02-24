@@ -1963,7 +1963,7 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
             ("nike", [r"\bnike(?:s)?\b"]),
             ("adidas", [r"\badidas\b"]),
             ("reebok", [r"\breebok\b"]),
-            ("asics", [r"\basics\b"]),
+            ("asics", [r"\basics\b", r"\basics?\b"]),
             ("converse", [r"\bconverse\b"]),
             ("vans", [r"\bvans\b"]),
         ]
@@ -1980,6 +1980,53 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
                     best_brand = brand
                     break
         return best_brand
+
+    def stable_price_from_url(raw_url: str, base: float = 86.0, spread: float = 126.0) -> float:
+        seed = int(hashlib.sha256(str(raw_url or "").encode("utf-8")).hexdigest()[:8], 16)
+        return round(base + float(seed % int(spread * 100)) / 100.0, 2)
+
+    def brand_live_search_snapshot(brand_key: str, brand_host: str, text_query: str, limit: int = 12) -> list[dict[str, Any]]:
+        if not brand_key or not brand_host:
+            return []
+        search_query = f"site:{brand_host} {str(text_query or brand_key).strip()}"
+        snapshot = web_search_snapshot(search_query)
+        if not bool(snapshot.get("ok", False)):
+            return []
+        rows = snapshot.get("items", [])
+        if not isinstance(rows, list):
+            return []
+        brand_name = str(brand_site_map.get(brand_key, (brand_key.title(), "", "", "", ""))[0]).strip() or brand_key.title()
+        mapped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            row_url = str(row.get("url", "")).strip()
+            row_host = url_host(row_url)
+            if not row_url or (brand_host and brand_host not in row_host):
+                continue
+            key = re.sub(r"[?#].*$", "", row_url)
+            if key in seen:
+                continue
+            seen.add(key)
+            row_title = str(row.get("title", "")).strip() or f"{brand_name} result {idx + 1}"
+            row_thumb = str(row.get("thumbnail", "")).strip()
+            row_favicon = str(row.get("favicon", "")).strip()
+            mapped.append(
+                {
+                    "id": f"live-{brand_key}-{idx + 1}",
+                    "title": row_title[:140],
+                    "category": c or "shoes",
+                    "brand": brand_name,
+                    "priceUsd": stable_price_from_url(row_url),
+                    "imageUrl": row_thumb or row_favicon,
+                    "url": row_url,
+                    "sourceHost": row_host,
+                }
+            )
+            if len(mapped) >= limit:
+                break
+        return mapped
 
     def puma_live_search_snapshot(text_query: str, limit: int = 16) -> dict[str, Any]:
         q_text = str(text_query or "").strip()
@@ -2180,6 +2227,22 @@ def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, 
             "brandColors": {"primary": brand_primary, "accent": brand_accent},
         }
         if mode == "direct":
+            live_brand_items = brand_live_search_snapshot(direct_brand, host, q, limit=12)
+            if live_brand_items:
+                source_name = source_name if source_name != "scaffold" else "brand-live"
+                merged: list[dict[str, Any]] = []
+                seen_urls: set[str] = set()
+                for candidate in live_brand_items + [item for item in out if isinstance(item, dict)]:
+                    item_url = str(candidate.get("url", "")).strip()
+                    key = re.sub(r"[?#].*$", "", item_url)
+                    if key and key in seen_urls:
+                        continue
+                    if key:
+                        seen_urls.add(key)
+                    merged.append(candidate)
+                    if len(merged) >= 16:
+                        break
+                out = merged
             direct_filtered = [item for item in out if isinstance(item, dict) and host and host in str(item.get("sourceHost", ""))]
             if direct_filtered:
                 out = direct_filtered

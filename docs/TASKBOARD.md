@@ -6156,6 +6156,27 @@ Acceptance:
 Notes:
 - implementation in `scripts/ci-local.ps1`, `package.json`, `README.md`
 
+---
+
+## T296 - Brand-Live Shopping Result Enrichment
+Status: done
+Track: I (connector realism)
+Priority: P1
+Dependencies: T295
+
+Deliverables:
+- direct brand shopping intents merge host-filtered live web hits into catalog results
+- deterministic synthetic price generation for live web-derived product cards
+- unit coverage for live-hit merge path with mocked web search payload
+
+Acceptance:
+- direct brand intent (e.g. Nike + size + gender) can surface live brand-domain product links first
+- off-host web hits are filtered out of direct-brand result set
+
+Notes:
+- implementation in `backend/main.py`
+- test coverage in `tests/unit/test_connectors.py` (`test_shopping_catalog_direct_brand_merges_live_web_hits`)
+
 ## Suggested Execution Order
 1. T3
 2. T4
