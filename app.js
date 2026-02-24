@@ -147,7 +147,8 @@ const UIEngine = {
             isApplyingLocalTurn: false,
             syncTransport: 'idle',
             networkOnline: true,
-            reconnectAttempts: 0
+            reconnectAttempts: 0,
+            locationHint: ''
         },
         history: [],
         intentHistory: [],
@@ -168,6 +169,7 @@ const UIEngine = {
 
     async init() {
         this.loadState();
+        this.primeRelativeLocationContext().catch(() => { });
         this.setupElectronChrome();
         this.setupUXChrome();
         this.setConnectivity(typeof navigator?.onLine === 'boolean' ? navigator.onLine : true);
@@ -175,6 +177,63 @@ const UIEngine = {
         this.updateShortcutHint();
         await this.runBootSequence();
         this.showToast('Surface ready. Press ? for command help.', 'info', 3000);
+    },
+
+    async primeRelativeLocationContext() {
+        if (String(this.state.session.locationHint || '').trim()) return;
+        const hint = await this.detectBrowserLocationHint();
+        const normalized = String(hint || '').trim();
+        if (!normalized) return;
+        this.state.session.locationHint = normalized;
+        this.saveState();
+        await this.persistHomeLocationHint(normalized).catch(() => { });
+    },
+
+    async detectBrowserLocationHint() {
+        if (typeof navigator === 'undefined' || !navigator.geolocation) return '';
+        try {
+            const position = await new Promise((resolve, reject) => {
+                navigator.geolocation.getCurrentPosition(resolve, reject, {
+                    enableHighAccuracy: false,
+                    timeout: 4500,
+                    maximumAge: 300000
+                });
+            });
+            const lat = Number(position?.coords?.latitude || 0);
+            const lon = Number(position?.coords?.longitude || 0);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return '';
+            try {
+                const response = await fetch(
+                    `https://geocoding-api.open-meteo.com/v1/reverse?latitude=${encodeURIComponent(String(lat))}&longitude=${encodeURIComponent(String(lon))}&language=en&format=json`
+                );
+                if (response.ok) {
+                    const payload = await response.json();
+                    const hit = Array.isArray(payload?.results) && payload.results.length ? payload.results[0] : null;
+                    if (hit && typeof hit === 'object') {
+                        const name = String(hit.name || '').trim();
+                        const region = String(hit.admin1 || '').trim();
+                        const country = String(hit.country || hit.country_code || '').trim();
+                        const parts = [name, region, country].filter(Boolean);
+                        if (parts.length) return parts.join(', ');
+                    }
+                }
+            } catch {
+                // Ignore reverse geocode errors and fall back to coordinates.
+            }
+            return `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
+        } catch {
+            return '';
+        }
+    },
+
+    async persistHomeLocationHint(hint) {
+        const value = String(hint || '').trim();
+        if (!value) return;
+        await fetch('/api/connectors/secrets', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'user.home.location', value })
+        });
     },
 
     setupElectronChrome() {
@@ -1378,13 +1437,14 @@ const UIEngine = {
     },
 
     sceneDomainToIntent(domain) {
+        const locationHint = this.resolveIntentLocationHint();
         const byDomain = {
             tasks: 'show tasks',
             expenses: 'show expenses',
             notes: 'show notes',
             graph: 'show graph summary',
             files: 'show files',
-            weather: "what's the weather where i am",
+            weather: locationHint ? `show weather in ${locationHint}` : "what's the weather where i am",
             location: 'where am i',
             shopping: 'show me running shoes',
             webdeck: 'open example.com',
@@ -1746,12 +1806,15 @@ const UIEngine = {
         const blockedCode = String(blocked?.policy?.code || '');
         const blockedReason = String(blocked?.policy?.reason || blocked?.message || '');
         const tryCommand = this.extractTryCommand(blockedReason);
+        const locationHint = this.resolveIntentLocationHint();
+        const locationWeatherCommand = locationHint ? `weather in ${locationHint}` : "weather today where i am";
+        const locationWeatherLabel = locationHint ? 'weather in home location' : locationWeatherCommand;
         if (latest?.ok && latest?.op === 'weather_forecast') {
             return [
                 'status: weather connector active',
                 { text: "what's the weather where i am", command: "what's the weather where i am" },
-                { text: 'weather in Seattle', command: 'weather in Seattle' },
-                { text: 'weather in New York', command: 'weather in New York' },
+                { text: 'weather tomorrow where i am', command: 'weather tomorrow where i am' },
+                { text: locationWeatherLabel, command: locationWeatherCommand },
                 { text: 'where am i', command: 'where am i' }
             ];
         }
@@ -1759,8 +1822,8 @@ const UIEngine = {
             return [
                 'status: location context active',
                 { text: "what's the weather where i am", command: "what's the weather where i am" },
-                { text: 'weather in Tulsa, Oklahoma', command: 'weather in Tulsa, Oklahoma' },
-                { text: 'weather in Seattle', command: 'weather in Seattle' },
+                { text: locationWeatherLabel, command: locationWeatherCommand },
+                { text: 'weather tomorrow where i am', command: 'weather tomorrow where i am' },
                 { text: 'show connector grants', command: 'show connector grants' }
             ];
         }
@@ -1804,11 +1867,26 @@ const UIEngine = {
         }
         return [
             { text: "what's the weather where i am", command: "what's the weather where i am" },
-            { text: 'weather in Tulsa, Oklahoma', command: 'weather in Tulsa, Oklahoma' },
+            { text: locationWeatherLabel, command: locationWeatherCommand },
             { text: 'where am i', command: 'where am i' },
             { text: 'show connector grants', command: 'show connector grants' },
             { text: 'show me new shoes', command: 'show me new shoes' }
         ];
+    },
+
+    resolveIntentLocationHint() {
+        const execution = this.state.session.lastExecution;
+        const toolResults = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
+        const data = (latest?.data && typeof latest.data === 'object') ? latest.data : {};
+        const info = Array.isArray(latest?.previewLines) ? this.parsePreviewMap(latest.previewLines) : {};
+        const fromData = String(data.location || '').trim();
+        if (fromData) return fromData;
+        const fromInfo = String(info.location || '').trim();
+        if (fromInfo) return fromInfo;
+        const fromSession = String(this.state.session.locationHint || '').trim();
+        if (fromSession) return fromSession;
+        return '';
     },
 
     buildLiveEventItems() {
@@ -2375,7 +2453,8 @@ const UIEngine = {
                         ? 'sun'
                         : 'cloud';
             const location = String(info.location || '').trim() || String(this.state.session.lastIntent || '').trim();
-            const heroImage = this.weatherHeroImageUrl(condition);
+            const heroImage = this.weatherHeroImageUrl(condition, location);
+            const visualContext = this.weatherVisualContext(location);
             const forecastItems = this.buildWeatherForecastPoints(info).slice(0, 5);
             const forecastStrip = forecastItems.map((p) => {
                 const precip = Number(p.precip || 0);
@@ -2415,6 +2494,7 @@ const UIEngine = {
                     <div class="scene-chip-row">
                         <div class="scene-chip">live intent render</div>
                         <div class="scene-chip">${escapeHtml(location)}</div>
+                        <div class="scene-chip">${escapeHtml(visualContext)}</div>
                         ${weatherTargetUrl ? `<a class="scene-chip scene-chip-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
                     </div>
                     <div class="weather-forecast-strip">${forecastStrip}</div>
@@ -4429,6 +4509,7 @@ const UIEngine = {
             this.state.session.handoff = parsed.handoff || this.state.session.handoff;
             this.state.session.presence = parsed.presence || this.state.session.presence;
             this.state.session.revision = Number(parsed.revision || 0);
+            this.state.session.locationHint = String(parsed.locationHint || '').trim();
             this.state.runtimeEvents = Array.isArray(parsed.runtimeEvents)
                 ? parsed.runtimeEvents.filter((item) => item && typeof item === 'object').slice(-8)
                 : [];
@@ -4454,6 +4535,7 @@ const UIEngine = {
             handoff: this.state.session.handoff,
             presence: this.state.session.presence,
             revision: this.state.session.revision,
+            locationHint: this.state.session.locationHint,
             runtimeEvents: this.state.runtimeEvents,
             uiPrefs: {
                 webdeckMode: this.state.webdeck.mode
@@ -4488,18 +4570,44 @@ const UIEngine = {
         this.shortcutHint.innerText = 'Alt+1..9 run | Alt+<-/-> history | Alt+Shift+<-/-> scenes | Alt+M webdeck mode | Ctrl/Cmd+K focus';
     },
 
-    weatherHeroImageUrl(condition) {
+    weatherVisualContext(location) {
+        const lower = String(location || '').toLowerCase();
+        if (/\b(tulsa|oklahoma|okc|kansas|wichita|plains|prairie)\b/.test(lower)) return 'terrain: plains + urban';
+        if (/\b(new york|nyc|manhattan|brooklyn|queens|jersey)\b/.test(lower)) return 'terrain: dense urban';
+        if (/\b(seattle|portland|pnw|pacific northwest)\b/.test(lower)) return 'terrain: coastal + evergreen';
+        if (/\b(denver|boulder|aspen|rocky|alps|mountain)\b/.test(lower)) return 'terrain: mountain';
+        return 'terrain: local context';
+    },
+
+    weatherHeroImageUrl(condition, location) {
         const lower = String(condition || '').toLowerCase();
+        const locale = String(location || '').toLowerCase();
+        const plainsLike = /\b(tulsa|oklahoma|okc|kansas|wichita|plains|prairie)\b/.test(locale);
+        const urbanLike = /\b(new york|nyc|manhattan|brooklyn|queens|jersey|chicago|dallas|houston)\b/.test(locale);
         if (lower.includes('rain') || lower.includes('storm')) {
             return 'https://images.unsplash.com/photo-1519692933481-e162a57d6721?auto=format&fit=crop&w=1800&q=80';
         }
         if (lower.includes('snow')) {
-            return 'https://images.unsplash.com/photo-1483664852095-d6cc6870702d?auto=format&fit=crop&w=1800&q=80';
+            return plainsLike
+                ? 'https://images.unsplash.com/photo-1542601098-8fc114e148e2?auto=format&fit=crop&w=1800&q=80'
+                : 'https://images.unsplash.com/photo-1483664852095-d6cc6870702d?auto=format&fit=crop&w=1800&q=80';
         }
         if (lower.includes('sun') || lower.includes('clear')) {
+            if (plainsLike) {
+                return 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1800&q=80';
+            }
+            if (urbanLike) {
+                return 'https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=1800&q=80';
+            }
             return 'https://images.unsplash.com/photo-1502303756762-a0f4a7f5f0a0?auto=format&fit=crop&w=1800&q=80';
         }
-        return 'https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?auto=format&fit=crop&w=1800&q=80';
+        if (plainsLike) {
+            return 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1800&q=80';
+        }
+        if (urbanLike) {
+            return 'https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=1800&q=80';
+        }
+        return 'https://images.unsplash.com/photo-1499346030926-9a72daac6c63?auto=format&fit=crop&w=1800&q=80';
     },
 };
 

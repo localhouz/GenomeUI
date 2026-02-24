@@ -6197,6 +6197,28 @@ Notes:
 - implementation in `backend/main.py`
 - test coverage in `tests/unit/test_connectors.py` (`test_shopping_catalog_direct_brand_backfills_images_when_live_has_no_thumbnails`)
 
+---
+
+## T298 - Relative Weather Intent + Location-Aware Atmosphere
+Status: done
+Track: J (intent UX correctness)
+Priority: P1
+Dependencies: T297
+
+Deliverables:
+- weather/location actions use relative prompts instead of fixed-city suggestions
+- backend home-location fallback switched to non-hardcoded location resolution with legacy placeholder normalization
+- weather visual selection includes location context to avoid non-local terrain defaults
+
+Acceptance:
+- weather quick actions avoid hardcoded city prompts (`New York`, `Seattle`)
+- `show weather` routes to current/home context (`__current__`) instead of fixed city
+- weather scene exposes location-driven visual context chip and non-mountain default for plains locales
+
+Notes:
+- implementation in `app.js`, `backend/main.py` (browser hint pickup + `user.home.location` persistence support)
+- tests: `tests/unit/test_connectors.py`, `tests/ui/weather-relative.spec.js`
+
 ## Suggested Execution Order
 1. T3
 2. T4

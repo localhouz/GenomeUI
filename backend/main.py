@@ -63,6 +63,8 @@ _WEB_SEARCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _WEB_SEARCH_CACHE_TTL_S = 300.0
 _WEB_PREVIEW_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 _WEB_PREVIEW_CACHE_TTL_S = 600.0
+_AUTO_LOCATION_HINT_CACHE: tuple[float, str] = (0.0, "")
+_AUTO_LOCATION_HINT_TTL_S = 1800.0
 _SHOP_LIVE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _SHOP_LIVE_CACHE_TTL_S = 240.0
 # Running stdio subprocesses keyed by server_id
@@ -1367,7 +1369,7 @@ def weather_fallback_hourly(location: str, base_temp_f: float, condition: str, b
 def weather_mock_snapshot(location: str) -> dict[str, Any]:
     query = str(location or "").strip()
     if not query:
-        query = "New York"
+        query = resolve_user_location_hint()
     key = query.lower()
     hit = MOCK_WEATHER_DATA.get(key)
     if hit is None:
@@ -2345,7 +2347,7 @@ def resolve_contact_target(query: str) -> dict[str, str] | None:
 def weather_read_snapshot(location: str, provider_mode: str | None = None) -> dict[str, Any]:
     query = str(location or "").strip()
     if not query:
-        query = "New York"
+        query = resolve_user_location_hint()
     mode = normalize_connector_provider_mode(provider_mode or CONNECTOR_PROVIDER_MODE)
     if mode == "mock":
         return weather_mock_snapshot(query)
@@ -2903,7 +2905,7 @@ async def get_connector_contracts() -> dict[str, Any]:
 
 
 @app.get("/api/connectors/mock/weather")
-async def get_mock_weather(location: str = Query(default="Seattle")) -> dict[str, Any]:
+async def get_mock_weather(location: str = Query(default="")) -> dict[str, Any]:
     snapshot = weather_mock_snapshot(location)
     return {"ok": True, "item": snapshot}
 
@@ -2936,18 +2938,18 @@ async def get_mock_contacts(query: str = Query(default="")) -> dict[str, Any]:
 @app.get("/api/connectors/secrets")
 async def get_connector_secrets() -> dict[str, Any]:
     async with CONNECTOR_VAULT_LOCK:
-        items = connector_secret_status(["banking.api.token", "social.api.token"])
+        items = connector_secret_status(["banking.api.token", "social.api.token", "user.home.location"])
     return {"ok": True, "items": items}
 
 
 @app.post("/api/connectors/secrets")
 async def set_connector_secret(body: ConnectorSecretBody) -> dict[str, Any]:
     key = str(body.key or "").strip().lower()
-    if key not in {"banking.api.token", "social.api.token"}:
+    if key not in {"banking.api.token", "social.api.token", "user.home.location"}:
         raise HTTPException(status_code=400, detail="unsupported connector secret key")
     async with CONNECTOR_VAULT_LOCK:
         item = connector_secret_set(key, body.value)
-        items = connector_secret_status(["banking.api.token", "social.api.token"])
+        items = connector_secret_status(["banking.api.token", "social.api.token", "user.home.location"])
     return {"ok": True, "item": item, "items": items}
 
 
@@ -16606,7 +16608,7 @@ def parse_commands(text: str) -> list[dict[str, Any]]:
             lambda m: {
                 "type": "weather_forecast",
                 "domain": "weather",
-                "payload": {"location": str(m.group(2) or "New York").strip()},
+                "payload": {"location": str(m.group(2) or "__current__").strip()},
             },
         ),
         (
@@ -16883,9 +16885,38 @@ def resolve_user_location_hint() -> str:
     if env_location:
         return env_location
     secret_location = str(connector_secret_get("user.home.location") or "").strip()
-    if secret_location:
+    if secret_location and secret_location.lower() not in {"new york", "new york, us"}:
         return secret_location
-    return "New York"
+    auto_hint = resolve_auto_location_hint()
+    if auto_hint:
+        return auto_hint
+    return "Local Area"
+
+
+def resolve_auto_location_hint() -> str:
+    global _AUTO_LOCATION_HINT_CACHE
+    now = _time.monotonic()
+    cached_at, cached_value = _AUTO_LOCATION_HINT_CACHE
+    if cached_value and (now - float(cached_at)) < _AUTO_LOCATION_HINT_TTL_S:
+        return cached_value
+    try:
+        with httpx.Client(timeout=2.5, follow_redirects=True) as client:
+            resp = client.get("https://ipapi.co/json/", headers={"User-Agent": "GenomeUI/1.0 (location hint)"})
+        if int(resp.status_code) != 200:
+            return ""
+        data = resp.json() if "json" in str(resp.headers.get("content-type", "")).lower() else {}
+        if not isinstance(data, dict):
+            return ""
+        city = str(data.get("city", "")).strip()
+        region = str(data.get("region", "")).strip()
+        country = str(data.get("country_name", "") or data.get("country_code", "")).strip()
+        parts = [part for part in [city, region, country] if part]
+        hint = ", ".join(parts[:3]).strip()
+        if hint:
+            _AUTO_LOCATION_HINT_CACHE = (now, hint)
+        return hint
+    except Exception:
+        return ""
 
 
 def normalize_weather_location(raw: str) -> str:
@@ -29881,7 +29912,7 @@ def build_suggestions(domains: list[str], graph: dict[str, Any], jobs: list[dict
     out.append("grant weather forecast")
     out.append("grant connector scope weather.forecast.read")
     out.append("revoke connector scope weather.forecast.read")
-    out.append("show weather in Seattle")
+    out.append("show weather where i am")
     out.append("what's the weather where i am")
     out.append("where am i")
     out.append("show telephony status")
@@ -30215,3 +30246,4 @@ def to_json(value: Any) -> str:
 def json_loads(value: str) -> Any:
     import json
     return json.loads(value)
+

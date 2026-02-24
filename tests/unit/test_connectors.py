@@ -327,6 +327,34 @@ class ConnectorUnitTests(unittest.TestCase):
         payload = op.get("payload", {}) if isinstance(op.get("payload"), dict) else {}
         self.assertEqual(str(payload.get("location", "")), "__current__")
 
+    def test_intent_parses_show_weather_without_city_as_current(self) -> None:
+        envelope = main.compile_intent_envelope("show weather")
+        writes = (envelope.get("stateIntent", {}) or {}).get("writeOperations", [])
+        self.assertGreaterEqual(len(writes), 1)
+        op = writes[0] if isinstance(writes[0], dict) else {}
+        self.assertEqual(str(op.get("type", "")), "weather_forecast")
+        payload = op.get("payload", {}) if isinstance(op.get("payload"), dict) else {}
+        self.assertEqual(str(payload.get("location", "")), "__current__")
+
+    def test_resolve_user_location_hint_uses_neutral_non_hardcoded_fallback(self) -> None:
+        prev_home = os.environ.pop("GENOME_HOME_LOCATION", None)
+        prev_default = os.environ.pop("GENOME_DEFAULT_LOCATION", None)
+        prev_secret = main.connector_secret_get("user.home.location")
+        try:
+            if isinstance(main.CONNECTOR_VAULT, dict):
+                main.CONNECTOR_VAULT.pop("user.home.location", None)
+            hint = str(main.resolve_user_location_hint() or "").strip()
+            self.assertNotEqual(hint.lower(), "new york")
+            self.assertNotEqual(hint.lower(), "new york, us")
+            self.assertGreaterEqual(len(hint), 3)
+        finally:
+            if prev_home is not None:
+                os.environ["GENOME_HOME_LOCATION"] = prev_home
+            if prev_default is not None:
+                os.environ["GENOME_DEFAULT_LOCATION"] = prev_default
+            if prev_secret:
+                main.connector_secret_set("user.home.location", prev_secret)
+
     def test_intent_parses_where_am_i(self) -> None:
         envelope = main.compile_intent_envelope("where am i")
         writes = (envelope.get("stateIntent", {}) or {}).get("writeOperations", [])
