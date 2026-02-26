@@ -679,19 +679,19 @@ main {
 }
 
 .scene-weather.theme-rain {
-    background: linear-gradient(180deg, rgba(95, 123, 160, 0.14), rgba(30, 48, 74, 0.02));
+    background: linear-gradient(175deg, #1a2a3a 0%, #2c4258 35%, #3d5a72 65%, #1e3448 100%);
 }
 
 .scene-weather.theme-cloud {
-    background: linear-gradient(180deg, rgba(112, 132, 148, 0.12), rgba(42, 58, 70, 0.02));
+    background: linear-gradient(175deg, #2e3740 0%, #404f5a 35%, #556270 65%, #2a343d 100%);
 }
 
 .scene-weather.theme-sun {
-    background: linear-gradient(180deg, rgba(255, 201, 121, 0.16), rgba(255, 159, 85, 0.04));
+    background: linear-gradient(175deg, #0a1628 0%, #1a3a5c 30%, #2d6a8a 60%, #e8890a 100%);
 }
 
 .scene-weather.theme-snow {
-    background: linear-gradient(180deg, rgba(188, 211, 236, 0.15), rgba(132, 163, 190, 0.04));
+    background: linear-gradient(175deg, #1c2a38 0%, #2e4258 35%, #7090b0 70%, #a8c4dc 100%);
 }
 
 .weather-glyph {
@@ -806,6 +806,93 @@ main {
     font-family: var(--font-mono);
     font-size: 10px;
     opacity: 0.92;
+}
+
+.wfc-icon {
+    margin-top: 5px;
+    font-size: 15px;
+    line-height: 1;
+}
+
+.wfc-bar {
+    margin-top: 6px;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.wfc-bar-fill {
+    height: 100%;
+    background: rgba(140, 200, 255, 0.62);
+    border-radius: 2px;
+    min-width: 2px;
+}
+
+.weather-forecast-card.wet .wfc-bar-fill {
+    background: rgba(100, 170, 255, 0.82);
+}
+
+.weather-forecast-card.dry .wfc-bar-fill {
+    background: rgba(255, 210, 100, 0.52);
+}
+
+/* ── Weather hero: temp / condition / meta ─────────────────────────── */
+.weather-hero {
+    position: absolute;
+    left: clamp(16px, 3vw, 28px);
+    top: clamp(48px, 13%, 88px);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    pointer-events: none;
+}
+
+.weather-hero-temp {
+    font-size: clamp(52px, 7.5vw, 84px);
+    font-weight: 800;
+    line-height: 1;
+    color: rgba(244, 250, 255, 0.97);
+    letter-spacing: -0.025em;
+    text-shadow: 0 2px 28px rgba(0, 0, 0, 0.46), 0 1px 4px rgba(0, 0, 0, 0.30);
+}
+
+.weather-hero-cond {
+    font-size: clamp(13px, 1.7vw, 18px);
+    font-weight: 500;
+    color: rgba(222, 238, 255, 0.88);
+    text-transform: lowercase;
+    letter-spacing: 0.01em;
+    text-shadow: 0 1px 10px rgba(0, 0, 0, 0.38);
+    margin-top: 2px;
+}
+
+.weather-hero-meta {
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: rgba(196, 216, 240, 0.74);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    pointer-events: auto;
+}
+
+.wh-sep {
+    opacity: 0.45;
+}
+
+.wh-link {
+    color: rgba(138, 196, 255, 0.80);
+    text-decoration: none;
+    border-bottom: 1px solid rgba(138, 196, 255, 0.28);
+}
+
+.wh-link:hover {
+    color: rgba(172, 218, 255, 0.96);
+    border-bottom-color: rgba(172, 218, 255, 0.5);
 }
 
 .glyph-rain::before,
@@ -1931,6 +2018,26 @@ main {
 
 .scene-domain {
     background: linear-gradient(180deg, rgba(24, 35, 52, 0.08), rgba(24, 35, 52, 0.02));
+}
+
+/* Canvas overlay: sits behind domain HTML content */
+.scene-domain .scene-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.domain-grid,
+.expense-panel,
+.notes-masonry,
+.tasks-shell,
+.expenses-shell,
+.notes-shell {
+    position: relative;
+    z-index: 2;
 }
 
 .tasks-shell {
@@ -3946,4 +4053,144 @@ body.network-offline #command-bar .input-container {
     object-fit: contain;
     background: rgba(0, 0, 0, 0.3);
     border: 1px solid rgba(56, 189, 248, 0.12);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHONE LAYOUT — max-width: 600px
+   Command bar fixed to bottom. Scene fills full viewport.
+   Right rail hidden. Input at thumb reach.
+═══════════════════════════════════════════════════════════ */
+@media (max-width: 600px) {
+    body { overflow: hidden; height: 100dvh; }
+
+    main {
+        display: flex;
+        flex-direction: column;
+        height: 100dvh;
+        padding-bottom: 0;
+    }
+
+    #surface {
+        flex: 1;
+        overflow: hidden;
+        min-height: 0;
+    }
+
+    .workspace {
+        grid-template-columns: 1fr;
+        height: 100%;
+    }
+
+    .workspace-side { display: none !important; }
+
+    .workspace-main { height: 100%; overflow: hidden; }
+    .surface-core { height: 100%; border-radius: 0; }
+    .scene { border-radius: 0; }
+
+    /* Command bar: fixed to bottom, full width, safe-area aware */
+    #command-bar {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        width: 100%;
+        z-index: 200;
+        padding: 8px 10px max(env(safe-area-inset-bottom, 0px), 8px) 10px;
+        background: rgba(10, 14, 20, 0.96);
+        backdrop-filter: blur(16px);
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 0;
+    }
+
+    /* 16px prevents iOS auto-zoom on input focus */
+    #intent-input {
+        font-size: 16px;
+        padding: 12px 14px;
+        height: 48px;
+    }
+
+    .status { display: none; }
+
+    .core-intent {
+        font-size: clamp(22px, 8vw, 36px);
+        line-height: 1.15;
+    }
+    .core-summary { font-size: 13px; }
+
+    .scene-chip-row { gap: 5px; }
+    .scene-chip { font-size: 9px; padding: 2px 7px; }
+
+    /* Shopping: single column, no rail */
+    .scene-shopping-stage .shop-stage-body {
+        grid-template-columns: 1fr;
+        right: 0;
+    }
+    .scene-shopping-stage .shop-stage-rail { display: none; }
+    .scene-shopping-stage .shop-brand-bar {
+        font-size: 12px;
+        padding: 4px 12px;
+    }
+
+    /* Webdeck: full bleed */
+    .webdeck {
+        left: 0; right: 0; top: 0; bottom: 0;
+        border-radius: 0;
+        border: none;
+    }
+    .webdeck-results { grid-template-columns: 1fr !important; }
+
+    /* Graph: hide heavy SVG on small screen */
+    .scene-graph .graph-svg { display: none; }
+    .scene-graph .scene-chip-row {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+    }
+
+    /* Domain canvas: hide on phone for performance */
+    .scene-domain .scene-canvas { display: none; }
+    .domain-grid { grid-template-columns: 1fr; }
+
+    /* Weather */
+    .scene-weather .weather-radar { display: none; }
+    .scene-weather .weather-forecast-strip {
+        grid-template-columns: repeat(3, 1fr);
+    }
+
+    /* MCP: dim canvas on phone */
+    .scene-mcp .mcp-canvas { opacity: 0.3; }
+
+    #boot-sequence { align-items: center; text-align: center; }
+
+    /* Phone suggestion chips shown above command bar */
+    .phone-suggestions {
+        display: flex !important;
+        flex-wrap: nowrap;
+        gap: 6px;
+        overflow-x: auto;
+        scrollbar-width: none;
+        padding: 6px 10px 0;
+        position: fixed;
+        bottom: 68px;
+        left: 0; right: 0;
+        z-index: 199;
+        background: transparent;
+    }
+    .phone-suggestion-chip {
+        flex-shrink: 0;
+        white-space: nowrap;
+        font-size: 12px;
+        font-family: var(--font-mono);
+        padding: 6px 12px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 20px;
+        background: rgba(20, 25, 35, 0.85);
+        color: rgba(255, 255, 255, 0.78);
+        cursor: pointer;
+        backdrop-filter: blur(8px);
+    }
+    .phone-suggestion-chip:active { opacity: 0.65; }
+
+    * { min-width: 0; }
 }

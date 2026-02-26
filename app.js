@@ -180,11 +180,18 @@ const UIEngine = {
     },
 
     async primeRelativeLocationContext() {
-        if (String(this.state.session.locationHint || '').trim()) return;
+        // Always try GPS — it's more accurate than IP geolocation.
+        // Only skip re-detection if we already have clean GPS COORDINATES (lat,lon format).
+        // If hint is a verbose city string (e.g. "Tulsa, Oklahoma, United States" from old nominatim
+        // data), it will fail open-meteo geocoding → fallback. Force re-detection in that case.
+        const existing = String(this.state.session.locationHint || '').trim();
+        const isCoords = /^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$/.test(existing);
+        if (existing && isCoords && this.state.session._locationHintFromGPS) return;
         const hint = await this.detectBrowserLocationHint();
         const normalized = String(hint || '').trim();
         if (!normalized) return;
         this.state.session.locationHint = normalized;
+        this.state.session._locationHintFromGPS = true;
         this.saveState();
         await this.persistHomeLocationHint(normalized).catch(() => { });
     },
@@ -202,25 +209,9 @@ const UIEngine = {
             const lat = Number(position?.coords?.latitude || 0);
             const lon = Number(position?.coords?.longitude || 0);
             if (!Number.isFinite(lat) || !Number.isFinite(lon)) return '';
-            try {
-                const response = await fetch(
-                    `https://geocoding-api.open-meteo.com/v1/reverse?latitude=${encodeURIComponent(String(lat))}&longitude=${encodeURIComponent(String(lon))}&language=en&format=json`
-                );
-                if (response.ok) {
-                    const payload = await response.json();
-                    const hit = Array.isArray(payload?.results) && payload.results.length ? payload.results[0] : null;
-                    if (hit && typeof hit === 'object') {
-                        const name = String(hit.name || '').trim();
-                        const region = String(hit.admin1 || '').trim();
-                        const country = String(hit.country || hit.country_code || '').trim();
-                        const parts = [name, region, country].filter(Boolean);
-                        if (parts.length) return parts.join(', ');
-                    }
-                }
-            } catch {
-                // Ignore reverse geocode errors and fall back to coordinates.
-            }
-            return `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
+            // Return raw coordinates — backend uses them directly with open-meteo,
+            // skipping geocoding. More accurate and never fails due to city name formatting.
+            return `${lat.toFixed(4)},${lon.toFixed(4)}`;
         } catch {
             return '';
         }
@@ -943,7 +934,9 @@ const UIEngine = {
 
         window.addEventListener('resize', () => {
             this.updateShortcutHint();
-        });
+            const el = document.getElementById('phone-suggestions');
+            if (el) el.style.display = window.innerWidth > 600 ? 'none' : '';
+        }, { passive: true });
 
         window.addEventListener('offline', () => {
             this.state.session.syncTransport = 'poll';
@@ -1292,6 +1285,7 @@ const UIEngine = {
         this.decorateQuickCommandTargets();
         this.applySceneEntryMotion();
         this.activateSceneGraphics();
+        this._renderPhoneSuggestions(Array.isArray(plan?.suggestions) ? plan.suggestions : []);
         this.maybePrefetchGraphSnapshot(core);
     },
 
@@ -1309,6 +1303,26 @@ const UIEngine = {
             const suffix = `Alt+${index}`;
             node.setAttribute('title', baseTitle ? `${baseTitle} | ${suffix}` : suffix);
         });
+    },
+
+    _renderPhoneSuggestions(suggestions) {
+        if (window.innerWidth > 600) {
+            const el = document.getElementById('phone-suggestions');
+            if (el) el.style.display = 'none';
+            return;
+        }
+        let el = document.getElementById('phone-suggestions');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'phone-suggestions';
+            el.className = 'phone-suggestions';
+            document.body.appendChild(el);
+        }
+        el.style.display = '';
+        const chips = (Array.isArray(suggestions) ? suggestions : []).slice(0, 4);
+        el.innerHTML = chips.map((s) =>
+            `<button class="phone-suggestion-chip" data-command="${escapeAttr(String(s))}">${escapeHtml(String(s).slice(0, 36))}</button>`
+        ).join('');
     },
 
     applySceneEntryMotion() {
@@ -1438,13 +1452,16 @@ const UIEngine = {
 
     sceneDomainToIntent(domain) {
         const locationHint = this.resolveIntentLocationHint();
+        // For weather, GPS coords in session.locationHint always win over last-execution location.
+        const weatherHint = String(this.state.session.locationHint || '').trim() || locationHint;
+        console.log('[weather-debug] sceneDomainToIntent domain=', domain, 'locationHint=', locationHint, 'session.locationHint=', this.state.session.locationHint, 'weatherHint=', weatherHint, '_fromGPS=', this.state.session._locationHintFromGPS);
         const byDomain = {
             tasks: 'show tasks',
             expenses: 'show expenses',
             notes: 'show notes',
             graph: 'show graph summary',
             files: 'show files',
-            weather: locationHint ? `show weather in ${locationHint}` : "what's the weather where i am",
+            weather: weatherHint ? `show weather in ${weatherHint}` : "what's the weather where i am",
             location: 'where am i',
             shopping: 'show me running shoes',
             webdeck: 'open example.com',
@@ -1485,21 +1502,35 @@ const UIEngine = {
         return out;
     },
 
-    switchToSceneDomain(domain) {
+    async switchToSceneDomain(domain) {
         const target = String(domain || '').trim().toLowerCase();
         if (!target) return;
-        let matchIndex = -1;
-        for (let i = this.state.history.length - 1; i >= 0; i -= 1) {
-            const entry = this.state.history[i];
-            const entryDomain = this.inferHistoryEntryDomain(entry);
-            if (entryDomain === target) {
-                matchIndex = i;
-                break;
+        // Weather is time-sensitive — never restore stale history, always fetch fresh.
+        if (target !== 'weather') {
+            let matchIndex = -1;
+            for (let i = this.state.history.length - 1; i >= 0; i -= 1) {
+                const entry = this.state.history[i];
+                const entryDomain = this.inferHistoryEntryDomain(entry);
+                if (entryDomain === target) { matchIndex = i; break; }
+            }
+            if (matchIndex >= 0) {
+                this.restoreFromHistory(matchIndex);
+                return;
             }
         }
-        if (matchIndex >= 0) {
-            this.restoreFromHistory(matchIndex);
-            return;
+        // For weather: ensure we have clean GPS coordinates, not a stale verbose city name.
+        if (target === 'weather') {
+            const hint = String(this.state.session.locationHint || '').trim();
+            const isCoords = /^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$/.test(hint);
+            console.log('[weather-debug] switchToSceneDomain weather check: hint=', hint, 'isCoords=', isCoords, '_fromGPS=', this.state.session._locationHintFromGPS);
+            if (!hint || !isCoords) {
+                // Missing or non-coordinate hint — clear it and re-detect via GPS.
+                this.state.session.locationHint = '';
+                this.state.session._locationHintFromGPS = false;
+                console.log('[weather-debug] clearing stale hint, re-detecting GPS...');
+                await this.primeRelativeLocationContext().catch(() => {});
+                console.log('[weather-debug] after GPS detect: session.locationHint=', this.state.session.locationHint);
+            }
         }
         this.handleIntent(this.sceneDomainToIntent(target));
     },
@@ -2445,41 +2476,39 @@ const UIEngine = {
         if (core.kind === 'weather') {
             const info = core.info || {};
             const condition = String(info.condition || '').toLowerCase();
-            const icon = condition.includes('rain')
-                ? 'rain'
-                : condition.includes('snow')
-                    ? 'snow'
-                    : condition.includes('sun') || condition.includes('clear')
-                        ? 'sun'
-                        : 'cloud';
             const location = String(info.location || '').trim() || String(this.state.session.lastIntent || '').trim();
-            const heroImage = this.weatherHeroImageUrl(condition, location);
-            const visualContext = this.weatherVisualContext(location);
             const forecastItems = this.buildWeatherForecastPoints(info).slice(0, 5);
             const forecastStrip = forecastItems.map((p) => {
                 const precip = Number(p.precip || 0);
                 const wet = precip >= 45 ? 'wet' : precip >= 20 ? 'mixed' : 'dry';
+                const cardIcon = this.conditionIcon(p.condition);
                 return `
                     <div class="weather-forecast-card ${wet}">
                         <div class="wfc-time">${escapeHtml(String(p.hour || ''))}</div>
+                        <div class="wfc-icon">${cardIcon}</div>
                         <div class="wfc-temp">${escapeHtml(String(Math.round(Number(p.temp || 0))))}F</div>
-                        <div class="wfc-precip">${escapeHtml(String(precip))}% rain</div>
+                        <div class="wfc-bar"><div class="wfc-bar-fill" style="width:${Math.min(100, precip)}%"></div></div>
                     </div>
                 `;
             }).join('');
-            const temperature = Number(String(info.temperature || '').replace(/[^0-9.-]/g, '')) || 60;
+            const temperature = Number(info.temperatureF || String(info.temperature || '').replace(/[^0-9.-]/g, '')) || 60;
+            const windMph = Number(info.windMph || 0);
             const weatherTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
             const weatherTargetUrl = String(weatherTarget?.url || '').trim();
             const weatherTargetLabel = String(weatherTarget?.label || 'open weather source').trim();
             return `
                 <div class="scene scene-weather ${escapeAttr(core.theme || '')}">
-                    <img class="weather-hero-image" src="${escapeAttr(heroImage)}" alt="Weather visual" loading="lazy" />
                     <div class="weather-hero-tint"></div>
                     <canvas
                         class="scene-canvas weather-canvas"
                         data-scene="weather"
                         data-condition="${escapeAttr(condition)}"
                         data-temp="${escapeAttr(String(temperature))}"
+                        data-wind="${escapeAttr(String(windMph))}"
+                        data-hour="${escapeAttr(String(info.localHour ?? -1))}"
+                        data-sunrise="${escapeAttr(String(info.sunriseHour ?? 6))}"
+                        data-sunset="${escapeAttr(String(info.sunsetHour ?? 19))}"
+                        data-terrain="${escapeAttr(this.locationTerrain(location))}"
                     ></canvas>
                     <div class="weather-radar" aria-hidden="true">
                         <div class="radar-ring ring-1"></div>
@@ -2490,12 +2519,15 @@ const UIEngine = {
                     <div class="scene-orb orb-a"></div>
                     <div class="scene-orb orb-b"></div>
                     <div class="scene-grid"></div>
-                    <div class="weather-glyph glyph-${escapeAttr(icon)}"></div>
-                    <div class="scene-chip-row">
-                        <div class="scene-chip">live intent render</div>
-                        <div class="scene-chip">${escapeHtml(location)}</div>
-                        <div class="scene-chip">${escapeHtml(visualContext)}</div>
-                        ${weatherTargetUrl ? `<a class="scene-chip scene-chip-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                    <div class="weather-hero">
+                        <div class="weather-hero-temp">${escapeHtml(String(Math.round(temperature)))}°</div>
+                        <div class="weather-hero-cond">${escapeHtml(condition)}</div>
+                        <div class="weather-hero-meta">
+                            <span>${escapeHtml(String(Math.round(windMph)))} mph</span>
+                            <span class="wh-sep">·</span>
+                            <span>${escapeHtml(location)}</span>
+                            ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                        </div>
                     </div>
                     <div class="weather-forecast-strip">${forecastStrip}</div>
                 </div>
@@ -3287,15 +3319,81 @@ const UIEngine = {
 
     makeWeatherRenderer(canvas) {
         const condition = String(canvas.dataset.condition || '').toLowerCase();
-        const temp = Number(canvas.dataset.temp || 60);
-        const isRain = condition.includes('rain') || condition.includes('storm');
-        const isSnow = condition.includes('snow');
-        const isSun = condition.includes('sun') || condition.includes('clear');
-        const droplets = Array.from({ length: 90 }, (_, i) => ({
-            x: (i * 37) % 997 / 997,
-            y: (i * 83) % 991 / 991,
-            v: 0.5 + ((i * 17) % 100) / 100
+        const temp      = Number(canvas.dataset.temp    || 62);
+        const wind      = Number(canvas.dataset.wind    || 0);
+        const hour      = Number(canvas.dataset.hour    ?? -1);
+        const sunrise   = Number(canvas.dataset.sunrise ?? 6);
+        const sunset    = Number(canvas.dataset.sunset  ?? 19);
+        const terrain   = String(canvas.dataset.terrain || 'hills');
+
+        const isRain  = condition.includes('rain') || condition.includes('drizzle') || condition.includes('shower');
+        const isStorm = condition.includes('storm') || condition.includes('thunder');
+        const isSnow  = condition.includes('snow') || condition.includes('sleet') || condition.includes('ice');
+        const isSun   = condition.includes('sun') || condition.includes('clear');
+        const isFog   = condition.includes('fog') || condition.includes('haze') || condition.includes('mist');
+
+        // Time-of-day phase at the location.
+        // If backend didn't return hour (-1), fall back to browser local time.
+        const localHour = hour >= 0 ? hour : new Date().getHours();
+        const isNight   = localHour < sunrise - 1 || localHour >= sunset + 1;
+        const isDawn    = !isNight && localHour >= sunrise - 1 && localHour < sunrise + 1;
+        const isDusk    = !isNight && localHour >= sunset - 1 && localHour < sunset + 1.5;
+        const isGolden  = !isNight && !isDusk && localHour >= sunset - 2.5 && localHour < sunset - 1;
+
+        // Seeded star field (consistent, not random per frame)
+        const stars = Array.from({ length: 80 }, (_, i) => ({
+            x: ((i * 1973 + 83) % 9973) / 9973,
+            y: ((i * 2741 + 17) % 9871) / 9871 * 0.72, // keep stars in upper 72%
+            r: 0.5 + ((i * 137) % 10) / 10 * 1.2,
+            twinkle: (i * 0.17) % (Math.PI * 2),
         }));
+
+        // 0 = freezing (32F), 1 = hot (100F+)
+        const warmth = Math.max(0, Math.min(1, (temp - 32) / 68));
+        // Rain tilt: straight down at calm, ~35° at 20+ mph
+        const rainAngle = Math.min(0.62, wind * 0.031);
+
+        // Angled rain streaks
+        const droplets = Array.from({ length: 130 }, (_, i) => ({
+            x: (i * 37.3) % 1,
+            y: ((i * 83.7) % 991) / 991,
+            v: 0.38 + ((i * 17) % 100) / 100,
+            len: 0.016 + ((i * 11) % 100) / 5500,
+        }));
+
+        // Parallax snow: near / mid / far layers
+        const snowLayers = [
+            Array.from({ length: 28 }, (_, i) => ({ x: (i * 0.618) % 1, y: (i * 0.38) % 1, sz: 3.5 + (i % 3) * 0.8, sp: 0.0011, dr: i * 0.28 })),
+            Array.from({ length: 48 }, (_, i) => ({ x: (i * 0.382) % 1, y: (i * 0.23) % 1, sz: 2.0,                   sp: 0.00065, dr: i * 0.18 })),
+            Array.from({ length: 72 }, (_, i) => ({ x: (i * 0.236) % 1, y: (i * 0.17) % 1, sz: 1.1,                   sp: 0.00032, dr: i * 0.10 })),
+        ];
+
+        // Drifting cloud blobs
+        const clouds = Array.from({ length: 5 }, (_, i) => ({
+            x: 0.08 + (i * 0.22) % 1.1,
+            y: 0.05 + (i * 0.09) % 0.26,
+            rw: 0.18 + (i * 0.07) % 0.16,
+            rh: 0.055 + (i * 0.022) % 0.048,
+            sp: 0.000055 + i * 0.000025,
+            a: (isStorm)        ? 0.50 + (i * 0.06) % 0.16
+             : (isRain)         ? 0.40 + (i * 0.06) % 0.18
+             : (isFog)          ? 0.68 + (i * 0.08) % 0.14
+             : (!isSun)         ? 0.28 + (i * 0.06) % 0.16
+             :                    0.08 + (i * 0.04) % 0.08,
+        }));
+
+        const rayCount = 14;
+        let flash = 0;
+        let flashCooldown = 5 + Math.random() * 7;
+
+        const drawCloud = (ctx, cx, cy, rw, rh, alpha) => {
+            ctx.fillStyle = `rgba(220, 230, 242, ${alpha})`;
+            ctx.beginPath(); ctx.ellipse(cx,            cy,            rw,        rh,        0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(cx - rw * 0.38, cy - rh * 0.34, rw * 0.54, rh * 0.72, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(cx + rw * 0.34, cy - rh * 0.28, rw * 0.50, rh * 0.68, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(cx + rw * 0.07, cy - rh * 0.52, rw * 0.40, rh * 0.66, 0, 0, Math.PI * 2); ctx.fill();
+        };
+
         let t = 0;
         return () => {
             const ctx = canvas.getContext('2d');
@@ -3305,68 +3403,323 @@ const UIEngine = {
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
 
+            // ── Sky gradient (time-of-day × condition) ────────────────────────
             const sky = ctx.createLinearGradient(0, 0, 0, h);
-            if (isRain) {
-                sky.addColorStop(0, 'rgba(79, 113, 156, 0.32)');
-                sky.addColorStop(1, 'rgba(50, 70, 98, 0.08)');
+            if (isNight) {
+                sky.addColorStop(0,   'rgba(2, 5, 16, 0.96)');
+                sky.addColorStop(0.6, 'rgba(8, 12, 28, 0.65)');
+                sky.addColorStop(1,   'rgba(14, 18, 40, 0.28)');
+            } else if (isDawn) {
+                sky.addColorStop(0,   'rgba(8, 10, 30, 0.82)');
+                sky.addColorStop(0.5, 'rgba(90, 38, 18, 0.42)');
+                sky.addColorStop(1,   'rgba(224, 104, 36, 0.16)');
+            } else if (isDusk) {
+                sky.addColorStop(0,   'rgba(14, 10, 30, 0.76)');
+                sky.addColorStop(0.42,'rgba(115, 40, 16, 0.48)');
+                sky.addColorStop(1,   'rgba(245, 72, 18, 0.18)');
+            } else if (isGolden) {
+                sky.addColorStop(0,   'rgba(18, 22, 50, 0.62)');
+                sky.addColorStop(0.58,'rgba(188, 92, 20, 0.30)');
+                sky.addColorStop(1,   'rgba(255, 155, 38, 0.12)');
+            } else if (isStorm) {
+                sky.addColorStop(0, 'rgba(12, 22, 38, 0.75)');
+                sky.addColorStop(1, 'rgba(28, 44, 64, 0.18)');
+            } else if (isRain) {
+                sky.addColorStop(0, 'rgba(22, 40, 62, 0.62)');
+                sky.addColorStop(1, 'rgba(36, 56, 80, 0.14)');
             } else if (isSnow) {
-                sky.addColorStop(0, 'rgba(180, 204, 231, 0.28)');
-                sky.addColorStop(1, 'rgba(129, 162, 196, 0.08)');
+                sky.addColorStop(0, 'rgba(125, 160, 200, 0.50)');
+                sky.addColorStop(1, 'rgba(92, 128, 170, 0.10)');
             } else if (isSun) {
-                sky.addColorStop(0, 'rgba(255, 192, 95, 0.32)');
-                sky.addColorStop(1, 'rgba(255, 152, 86, 0.08)');
+                const r0 = Math.round(18 + warmth * 30), g0 = Math.round(30 + warmth * 18), b0 = Math.round(82 - warmth * 44);
+                sky.addColorStop(0,    `rgba(${r0}, ${g0}, ${b0}, 0.56)`);
+                sky.addColorStop(0.55, `rgba(${Math.round(155 + warmth * 65)}, ${Math.round(85 + warmth * 35)}, ${Math.round(26 + warmth * 10)}, 0.22)`);
+                sky.addColorStop(1,    'rgba(255, 162, 48, 0.06)');
+            } else if (isFog) {
+                sky.addColorStop(0, 'rgba(152, 166, 178, 0.62)');
+                sky.addColorStop(1, 'rgba(192, 204, 210, 0.16)');
             } else {
-                sky.addColorStop(0, 'rgba(138, 155, 170, 0.24)');
-                sky.addColorStop(1, 'rgba(90, 109, 126, 0.08)');
+                sky.addColorStop(0, 'rgba(48, 62, 78, 0.54)');
+                sky.addColorStop(1, 'rgba(74, 92, 108, 0.12)');
             }
             ctx.fillStyle = sky;
             ctx.fillRect(0, 0, w, h);
 
-            const sunX = w * 0.78;
-            const sunY = h * 0.22;
-            const sunR = Math.max(24, Math.min(44, (w + h) * 0.03));
-            if (isSun || !isRain) {
-                const halo = ctx.createRadialGradient(sunX, sunY, 8, sunX, sunY, sunR * 2.4);
-                halo.addColorStop(0, 'rgba(255, 232, 170, 0.62)');
-                halo.addColorStop(1, 'rgba(255, 232, 170, 0)');
-                ctx.fillStyle = halo;
-                ctx.beginPath();
-                ctx.arc(sunX, sunY, sunR * 2.4, 0, Math.PI * 2);
-                ctx.fill();
+            // ── Night: stars + moon ───────────────────────────────────────────
+            if (isNight) {
+                const starA = (isRain || isSnow || isStorm) ? 0.22 : 0.88;
+                stars.forEach((s) => {
+                    const twink = 0.58 + Math.sin(t * 1.35 + s.twinkle) * 0.32;
+                    ctx.fillStyle = `rgba(230, 240, 255, ${(starA * twink).toFixed(2)})`;
+                    ctx.beginPath(); ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2); ctx.fill();
+                });
+                // Moon: disk + crescent shadow + soft halo
+                const moonX = w * 0.78, moonY = h * 0.17;
+                const moonR = Math.max(10, Math.min(22, (w + h) * 0.014));
+                const mHalo = ctx.createRadialGradient(moonX, moonY, moonR, moonX, moonY, moonR * 3.8);
+                mHalo.addColorStop(0, 'rgba(210, 228, 255, 0.26)');
+                mHalo.addColorStop(1, 'rgba(180, 210, 255, 0)');
+                ctx.fillStyle = mHalo;
+                ctx.beginPath(); ctx.arc(moonX, moonY, moonR * 3.8, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = 'rgba(238, 246, 255, 0.93)';
+                ctx.beginPath(); ctx.arc(moonX, moonY, moonR, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = 'rgba(6, 10, 24, 0.76)';
+                ctx.beginPath(); ctx.arc(moonX - moonR * 0.33, moonY - moonR * 0.04, moonR * 0.86, 0, Math.PI * 2); ctx.fill();
             }
 
-            ctx.strokeStyle = 'rgba(16, 29, 48, 0.08)';
+            // ── Dawn / dusk / golden: horizon glow ───────────────────────────
+            if (isDawn || isDusk || isGolden) {
+                const hr = isDusk ? { r: 242, g: 62, b: 18 } : isDawn ? { r: 250, g: 112, b: 48 } : { r: 255, g: 148, b: 36 };
+                const ha = isDusk ? 0.54 : isDawn ? 0.46 : 0.36;
+                const glow = ctx.createRadialGradient(w * 0.5, h * 0.72, 0, w * 0.5, h * 0.72, w * 0.68);
+                glow.addColorStop(0,   `rgba(${hr.r}, ${hr.g}, ${hr.b}, ${ha})`);
+                glow.addColorStop(0.42,`rgba(${hr.r}, ${hr.g}, ${hr.b}, ${ha * 0.38})`);
+                glow.addColorStop(1,   `rgba(${hr.r}, ${hr.g}, ${hr.b}, 0)`);
+                ctx.fillStyle = glow;
+                ctx.fillRect(0, 0, w, h);
+            }
+
+            // ── Sun: atmospheric halo + rotating crepuscular rays ─────────────
+            if (!isNight && (isSun || (!isRain && !isStorm && !isSnow && !isFog))) {
+                const sunX = w * 0.75, sunY = h * 0.19;
+                const sunR = Math.max(16, Math.min(34, (w + h) * 0.022));
+
+                const halo = ctx.createRadialGradient(sunX, sunY, sunR, sunX, sunY, sunR * 4.4);
+                halo.addColorStop(0,    `rgba(255, 218, 128, ${isSun ? 0.50 + warmth * 0.12 : 0.10})`);
+                halo.addColorStop(0.42, `rgba(255, 170, 68,  ${isSun ? 0.18 + warmth * 0.08 : 0.04})`);
+                halo.addColorStop(1,    'rgba(255, 138, 24, 0)');
+                ctx.fillStyle = halo;
+                ctx.beginPath(); ctx.arc(sunX, sunY, sunR * 4.4, 0, Math.PI * 2); ctx.fill();
+
+                if (isSun) {
+                    ctx.save();
+                    ctx.translate(sunX, sunY);
+                    ctx.rotate(t * 0.030);
+                    for (let r = 0; r < rayCount; r++) {
+                        const a = (r / rayCount) * Math.PI * 2;
+                        const pulse = 0.50 + Math.sin(t * 0.70 + r * 0.84) * 0.16;
+                        const rLen = sunR * (5.0 + Math.sin(t * 0.48 + r * 1.18) * 1.5);
+                        const rWid = sunR * 0.30;
+                        const rg = ctx.createLinearGradient(0, 0, Math.cos(a) * rLen, Math.sin(a) * rLen);
+                        rg.addColorStop(0,    `rgba(255, 240, 172, ${pulse * 0.44})`);
+                        rg.addColorStop(0.44, `rgba(255, 206, 96,  ${pulse * 0.14})`);
+                        rg.addColorStop(1,    'rgba(255, 172, 44, 0)');
+                        ctx.fillStyle = rg;
+                        const perp = a + Math.PI / 2;
+                        ctx.beginPath();
+                        ctx.moveTo(0, 0);
+                        ctx.lineTo( Math.cos(perp) * rWid * 0.5,  Math.sin(perp) * rWid * 0.5);
+                        ctx.lineTo( Math.cos(a) * rLen,            Math.sin(a) * rLen);
+                        ctx.lineTo(-Math.cos(perp) * rWid * 0.5, -Math.sin(perp) * rWid * 0.5);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                    ctx.restore();
+
+                    const disk = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, sunR);
+                    disk.addColorStop(0,    'rgba(255, 254, 232, 0.97)');
+                    disk.addColorStop(0.62, 'rgba(255, 228, 136, 0.90)');
+                    disk.addColorStop(1,    'rgba(255, 188, 60,  0.75)');
+                    ctx.fillStyle = disk;
+                    ctx.beginPath(); ctx.arc(sunX, sunY, sunR, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+
+            // ── Drifting cloud blobs ──────────────────────────────────────────
+            clouds.forEach((c) => {
+                c.x += c.sp;
+                if (c.x > 1.28) c.x = -0.28;
+                drawCloud(ctx, c.x * w, c.y * h, c.rw * w, c.rh * h, c.a);
+            });
+
+            // ── Fog veil ──────────────────────────────────────────────────────
+            if (isFog) {
+                const fogY = h * 0.44;
+                const fg = ctx.createLinearGradient(0, fogY, 0, h);
+                fg.addColorStop(0,   'rgba(182, 194, 202, 0)');
+                fg.addColorStop(0.5, `rgba(182, 194, 202, ${0.28 + Math.sin(t * 0.38) * 0.06})`);
+                fg.addColorStop(1,   'rgba(188, 198, 204, 0.44)');
+                ctx.fillStyle = fg;
+                ctx.fillRect(0, fogY, w, h - fogY);
+            }
+
+            // ── Wind-angled rain streaks ──────────────────────────────────────
+            if (isRain || isStorm) {
+                const intensity = isStorm ? 1.75 : 1.0;
+                ctx.strokeStyle = `rgba(192, 222, 255, ${0.34 * intensity})`;
+                ctx.lineWidth = isStorm ? 1.5 : 0.85;
+                droplets.forEach((d) => {
+                    d.y += (0.0025 + d.v * 0.0023) * intensity;
+                    d.x += Math.tan(rainAngle) * 0.0012 * d.v * intensity;
+                    if (d.y > 1.06) { d.y = -0.09; }
+                    if (d.x > 1.12) d.x -= 1.22; else if (d.x < -0.12) d.x += 1.22;
+                    const px = d.x * w, py = d.y * h;
+                    const dx = Math.sin(rainAngle) * d.len * h * 1.7;
+                    const dy = Math.cos(rainAngle) * d.len * h * 1.7;
+                    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + dx, py + dy); ctx.stroke();
+                });
+                // Splash dots at the low horizon
+                const splashY = h * 0.74;
+                ctx.fillStyle = 'rgba(214, 236, 255, 0.20)';
+                for (let i = 0; i < 22; i++) {
+                    const sx = ((i * 127 + Math.floor(t * 10) * 61) % (w * 10)) / 10;
+                    const jy = Math.sin(t * 14 + i * 2.7) * 3;
+                    ctx.beginPath(); ctx.arc(sx % w, splashY + jy, 1.5, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+
+            // ── Lightning flash (storm only) ──────────────────────────────────
+            if (isStorm) {
+                flashCooldown -= 0.016;
+                if (flash > 0) {
+                    ctx.fillStyle = `rgba(222, 238, 255, ${flash * 0.30})`;
+                    ctx.fillRect(0, 0, w, h);
+                    flash = Math.max(0, flash - 0.13);
+                }
+                if (flashCooldown <= 0) { flash = 1.0; flashCooldown = 4.5 + Math.random() * 8; }
+            }
+
+            // ── Parallax snow ─────────────────────────────────────────────────
+            if (isSnow) {
+                snowLayers.forEach((layer, li) => {
+                    const alpha = 0.78 - li * 0.20;
+                    layer.forEach((f) => {
+                        f.y += f.sp;
+                        f.x += Math.sin(t * 0.54 + f.dr) * 0.00027;
+                        if (f.y > 1.05) { f.y = -0.05; f.x = Math.random(); }
+                        const px = ((f.x * w) % w + w) % w;
+                        ctx.fillStyle = `rgba(236, 246, 255, ${alpha})`;
+                        ctx.beginPath(); ctx.arc(px, f.y * h, f.sz, 0, Math.PI * 2); ctx.fill();
+                    });
+                });
+            }
+
+            // ── Horizon shimmer ───────────────────────────────────────────────
             ctx.lineWidth = 1;
-            const horizon = h * 0.63;
-            for (let i = 0; i < 4; i += 1) {
+            ctx.strokeStyle = isSun
+                ? `rgba(255, 208, 106, ${0.08 + warmth * 0.04})`
+                : (isRain || isStorm) ? 'rgba(18, 32, 52, 0.09)'
+                : 'rgba(20, 32, 48, 0.07)';
+            const horizonY = h * 0.63;
+            for (let i = 0; i < 3; i++) {
                 ctx.beginPath();
-                for (let x = 0; x <= w; x += 8) {
-                    const y = horizon + i * 12 + Math.sin((x * 0.02) + (t * (0.8 + i * 0.1))) * (4 + i);
-                    if (x === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
+                for (let x = 0; x <= w; x += 6) {
+                    const y = horizonY + i * 13 + Math.sin(x * 0.017 + t * (0.56 + i * 0.07)) * (3 + i * 1.4);
+                    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
                 }
                 ctx.stroke();
             }
 
-            if (isRain || isSnow) {
-                ctx.strokeStyle = isSnow ? 'rgba(232, 244, 255, 0.46)' : 'rgba(178, 214, 255, 0.46)';
-                ctx.lineWidth = isSnow ? 1.2 : 1;
-                droplets.forEach((d) => {
-                    d.y += (isSnow ? 0.0014 : 0.0034) * d.v;
-                    if (d.y > 1.04) d.y = -0.06;
-                    const x = d.x * w + (isSnow ? Math.sin(t * 2 + d.x * 9) * 5 : -10);
-                    const y = d.y * h;
-                    ctx.beginPath();
-                    ctx.moveTo(x, y);
-                    ctx.lineTo(x + (isSnow ? 1 : 3), y + (isSnow ? 2 : 10));
-                    ctx.stroke();
-                });
-            }
+            // ── Terrain silhouette (drawn last — sits in front of weather) ───
+            (function() {
+                const groundY = h * 0.74;
+                ctx.fillStyle = isNight           ? 'rgba(3, 6, 16, 0.95)'
+                              : (isDawn || isDusk) ? 'rgba(8, 10, 22, 0.86)'
+                              : 'rgba(10, 14, 26, 0.72)';
+                ctx.beginPath();
+                ctx.moveTo(0, h);
+                if (terrain === 'mountains') {
+                    ctx.lineTo(0, groundY + h * 0.04);
+                    ctx.lineTo(w * 0.08, groundY - h * 0.07);
+                    ctx.lineTo(w * 0.18, groundY + h * 0.01);
+                    ctx.lineTo(w * 0.30, groundY - h * 0.21);
+                    ctx.lineTo(w * 0.42, groundY + h * 0.01);
+                    ctx.lineTo(w * 0.53, groundY - h * 0.15);
+                    ctx.lineTo(w * 0.64, groundY + h * 0.02);
+                    ctx.lineTo(w * 0.74, groundY - h * 0.10);
+                    ctx.lineTo(w * 0.87, groundY + h * 0.01);
+                    ctx.lineTo(w, groundY - h * 0.04);
+                } else if (terrain === 'desert') {
+                    const b = groundY + h * 0.02;
+                    ctx.lineTo(0, b);
+                    ctx.lineTo(w * 0.14, b + h * 0.01);
+                    ctx.lineTo(w * 0.19, b - h * 0.09); ctx.lineTo(w * 0.33, b - h * 0.09); ctx.lineTo(w * 0.37, b + h * 0.01);
+                    ctx.lineTo(w * 0.50, b + h * 0.02);
+                    ctx.lineTo(w * 0.56, b - h * 0.13); ctx.lineTo(w * 0.69, b - h * 0.13); ctx.lineTo(w * 0.73, b + h * 0.01);
+                    ctx.lineTo(w, b);
+                } else if (terrain === 'coast') {
+                    const b = groundY + h * 0.05;
+                    ctx.lineTo(0, b);
+                    ctx.bezierCurveTo(w * 0.28, b - h * 0.012, w * 0.58, b + h * 0.010, w, b - h * 0.005);
+                } else if (terrain === 'city') {
+                    const b = groundY;
+                    const blds = [
+                        [0.03,0.06,0.13],[0.10,0.05,0.22],[0.16,0.07,0.15],[0.24,0.04,0.28],
+                        [0.29,0.06,0.17],[0.36,0.05,0.11],[0.42,0.08,0.24],[0.51,0.05,0.14],
+                        [0.57,0.07,0.18],[0.65,0.04,0.26],[0.70,0.06,0.12],[0.77,0.05,0.20],
+                        [0.83,0.07,0.15],[0.91,0.09,0.10],
+                    ];
+                    ctx.lineTo(0, b);
+                    blds.forEach(([bx, bw, bh]) => {
+                        ctx.lineTo(bx * w, b); ctx.lineTo(bx * w, b - bh * h);
+                        ctx.lineTo((bx + bw) * w, b - bh * h); ctx.lineTo((bx + bw) * w, b);
+                    });
+                    ctx.lineTo(w, b);
+                } else if (terrain === 'plains') {
+                    const b = groundY + h * 0.03;
+                    ctx.lineTo(0, b);
+                    // Water tower silhouette
+                    ctx.lineTo(w * 0.10, b); ctx.lineTo(w * 0.10, b - h * 0.08);
+                    ctx.lineTo(w * 0.113, b - h * 0.08); ctx.lineTo(w * 0.113, b - h * 0.13);
+                    ctx.lineTo(w * 0.142, b - h * 0.13); ctx.lineTo(w * 0.142, b - h * 0.08);
+                    ctx.lineTo(w * 0.155, b - h * 0.08); ctx.lineTo(w * 0.155, b);
+                    ctx.lineTo(w * 0.80, b + h * 0.005);
+                    // Grain elevator
+                    ctx.lineTo(w * 0.82, b); ctx.lineTo(w * 0.82, b - h * 0.07);
+                    ctx.lineTo(w * 0.85, b - h * 0.07); ctx.lineTo(w * 0.85, b - h * 0.11);
+                    ctx.lineTo(w * 0.875, b - h * 0.11); ctx.lineTo(w * 0.875, b);
+                    ctx.lineTo(w, b + h * 0.01);
+                } else {
+                    // hills / default
+                    const b = groundY + h * 0.03;
+                    ctx.lineTo(0, b + h * 0.02);
+                    ctx.bezierCurveTo(w * 0.18, b - h * 0.03, w * 0.30, b + h * 0.01, w * 0.44, b - h * 0.07);
+                    ctx.bezierCurveTo(w * 0.58, b - h * 0.15, w * 0.72, b - h * 0.02, w * 0.86, b - h * 0.09);
+                    ctx.bezierCurveTo(w * 0.93, b - h * 0.13, w * 0.97, b - h * 0.04, w, b);
+                }
+                ctx.lineTo(w, h); ctx.closePath(); ctx.fill();
 
-            const label = `${Math.round(temp)}F`;
-            ctx.fillStyle = 'rgba(18, 26, 38, 0.72)';
-            ctx.font = "600 12px 'IBM Plex Mono', monospace";
-            ctx.fillText(label, 16, 24);
+                // Mountain snow caps
+                if (terrain === 'mountains') {
+                    ctx.fillStyle = 'rgba(232, 242, 255, 0.72)';
+                    [[w * 0.30, groundY - h * 0.21, h * 0.058], [w * 0.53, groundY - h * 0.15, h * 0.040], [w * 0.08, groundY - h * 0.07, h * 0.024]]
+                        .forEach(([px, py, ph]) => {
+                            ctx.beginPath();
+                            ctx.moveTo(px - ph * 0.88, py + ph * 0.58);
+                            ctx.lineTo(px, py - ph * 0.04);
+                            ctx.lineTo(px + ph * 0.88, py + ph * 0.58);
+                            ctx.closePath(); ctx.fill();
+                        });
+                }
+                // City night windows
+                if (terrain === 'city' && isNight) {
+                    ctx.fillStyle = 'rgba(255, 236, 148, 0.72)';
+                    for (let i = 0; i < 55; i++) {
+                        const wx2 = (((i * 1973 + 83) % 9973) / 9973) * w;
+                        const wy  = groundY - (((i * 2741 + 17) % 9871) / 9871) * groundY * 0.28;
+                        if (wy > h * 0.10 && wy < groundY - h * 0.01) ctx.fillRect(wx2, wy, 3, 4);
+                    }
+                }
+                // Coastal water shimmer
+                if (terrain === 'coast') {
+                    ctx.strokeStyle = 'rgba(140, 202, 245, 0.20)';
+                    ctx.lineWidth = 1;
+                    for (let i = 0; i < 5; i++) {
+                        const wy = groundY + h * 0.06 + i * h * 0.04;
+                        ctx.beginPath();
+                        for (let x = 0; x <= w; x += 8) {
+                            const y = wy + Math.sin(x * 0.025 + t * 0.78 + i * 1.2) * 3;
+                            if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                        }
+                        ctx.stroke();
+                    }
+                }
+            })();
+
+            // ── Temp readout ──────────────────────────────────────────────────
+            ctx.fillStyle = isSun ? `rgba(255, 244, 192, ${0.76 + warmth * 0.14})` : 'rgba(216, 232, 252, 0.76)';
+            ctx.font = "700 12px 'IBM Plex Mono', monospace";
+            ctx.fillText(`${Math.round(temp)}F`, 14, 24);
         };
     },
 
@@ -3917,6 +4270,18 @@ const UIEngine = {
                 ctx.stroke();
             }
         };
+    },
+
+    conditionIcon(condition) {
+        const c = String(condition || '').toLowerCase();
+        if (c.includes('thunder') || c.includes('storm')) return '⛈';
+        if (c.includes('rain') || c.includes('drizzle') || c.includes('shower')) return '🌧';
+        if (c.includes('snow') || c.includes('sleet') || c.includes('ice')) return '❄';
+        if (c.includes('fog') || c.includes('haze') || c.includes('mist')) return '🌫';
+        if (c.includes('overcast')) return '☁';
+        if (c.includes('cloud')) return '⛅';
+        if (c.includes('clear') || c.includes('sun')) return '☀';
+        return '🌤';
     },
 
     weatherSeed(text) {
@@ -4470,6 +4835,7 @@ const UIEngine = {
         this.state.session.lastIntent = entry.intent;
         this.state.session.lastEnvelope = entry.envelope;
         this.state.session.lastKernelTrace = entry.kernelTrace || null;
+        this.state.session.lastExecution = entry.executionSnapshot || null;
 
         const plan = UIPlanSchema.normalize(entry.plan || UIPlanner.build(entry.envelope, this.state.memory, { ok: true, message: 'History restore' }));
         this.render(plan, entry.envelope, this.state.session.lastKernelTrace);
@@ -4579,35 +4945,46 @@ const UIEngine = {
         return 'terrain: local context';
     },
 
+    locationTerrain(location) {
+        const l = String(location || '').toLowerCase();
+        if (/\b(tulsa|oklahoma|okc|kansas|wichita|nebraska|iowa|south dakota|north dakota|amarillo|lubbock|abilene|springfield|topeka|lincoln)\b/.test(l)) return 'plains';
+        if (/\b(miami|fort lauderdale|jacksonville|charleston|savannah|galveston|corpus christi|virginia beach|long island|cape cod|malibu|santa barbara|san diego|santa monica|honolulu|waikiki)\b/.test(l)) return 'coast';
+        if (/\b(los angeles|la|san francisco|sf|seattle|portland|boston|new york|nyc|manhattan|chicago|houston|dallas|atlanta|philadelphia|detroit|phoenix|san jose)\b/.test(l)) return 'city';
+        if (/\b(denver|boulder|aspen|vail|breckenridge|salt lake|reno|flagstaff|asheville|missoula|bozeman|jackson hole|tahoe|colorado springs|fort collins)\b/.test(l)) return 'mountains';
+        if (/\b(las vegas|phoenix|tucson|albuquerque|santa fe|el paso|palm springs|scottsdale|yuma|sedona|moab|st george)\b/.test(l)) return 'desert';
+        return 'hills';
+    },
+
     weatherHeroImageUrl(condition, location) {
         const lower = String(condition || '').toLowerCase();
         const locale = String(location || '').toLowerCase();
-        const plainsLike = /\b(tulsa|oklahoma|okc|kansas|wichita|plains|prairie)\b/.test(locale);
         const urbanLike = /\b(new york|nyc|manhattan|brooklyn|queens|jersey|chicago|dallas|houston)\b/.test(locale);
-        if (lower.includes('rain') || lower.includes('storm')) {
-            return 'https://images.unsplash.com/photo-1519692933481-e162a57d6721?auto=format&fit=crop&w=1800&q=80';
+        // Picsum seeds: consistent image per condition, 1800×900, no auth required
+        if (lower.includes('storm') || lower.includes('thunder')) {
+            return 'https://picsum.photos/seed/storm-dark/1800/900';
         }
-        if (lower.includes('snow')) {
-            return plainsLike
-                ? 'https://images.unsplash.com/photo-1542601098-8fc114e148e2?auto=format&fit=crop&w=1800&q=80'
-                : 'https://images.unsplash.com/photo-1483664852095-d6cc6870702d?auto=format&fit=crop&w=1800&q=80';
+        if (lower.includes('rain') || lower.includes('drizzle') || lower.includes('shower')) {
+            return 'https://picsum.photos/seed/rain-city/1800/900';
         }
-        if (lower.includes('sun') || lower.includes('clear')) {
-            if (plainsLike) {
-                return 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1800&q=80';
-            }
-            if (urbanLike) {
-                return 'https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=1800&q=80';
-            }
-            return 'https://images.unsplash.com/photo-1502303756762-a0f4a7f5f0a0?auto=format&fit=crop&w=1800&q=80';
+        if (lower.includes('snow') || lower.includes('blizzard') || lower.includes('sleet')) {
+            return 'https://picsum.photos/seed/snow-winter/1800/900';
         }
-        if (plainsLike) {
-            return 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1800&q=80';
+        if (lower.includes('fog') || lower.includes('mist') || lower.includes('haze')) {
+            return 'https://picsum.photos/seed/fog-morning/1800/900';
         }
-        if (urbanLike) {
-            return 'https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=1800&q=80';
+        if (lower.includes('clear') || lower.includes('sun') || lower.includes('mainly clear')) {
+            return urbanLike
+                ? 'https://picsum.photos/seed/clear-urban/1800/900'
+                : 'https://picsum.photos/seed/clear-sky/1800/900';
         }
-        return 'https://images.unsplash.com/photo-1499346030926-9a72daac6c63?auto=format&fit=crop&w=1800&q=80';
+        if (lower.includes('partly') || lower.includes('mostly')) {
+            return 'https://picsum.photos/seed/partly-cloudy/1800/900';
+        }
+        if (lower.includes('overcast') || lower.includes('cloud')) {
+            return 'https://picsum.photos/seed/overcast-sky/1800/900';
+        }
+        // Default: atmospheric landscape
+        return 'https://picsum.photos/seed/weather-default/1800/900';
     },
 };
 

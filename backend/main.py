@@ -2344,6 +2344,8 @@ def resolve_contact_target(query: str) -> dict[str, str] | None:
     }
 
 
+_COORD_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$")
+
 def weather_read_snapshot(location: str, provider_mode: str | None = None) -> dict[str, Any]:
     query = str(location or "").strip()
     if not query:
@@ -2353,20 +2355,52 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
         return weather_mock_snapshot(query)
     try:
         with httpx.Client(timeout=5.0, follow_redirects=True) as client:
-            geo = client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": query, "count": 1, "language": "en", "format": "json"},
-            )
-            geo.raise_for_status()
-            geo_json = geo.json()
-            results = geo_json.get("results", []) if isinstance(geo_json, dict) else []
-            if not results or not isinstance(results[0], dict):
-                return weather_fallback_snapshot(query)
-            hit = results[0]
-            lat = float(hit.get("latitude", 0.0) or 0.0)
-            lon = float(hit.get("longitude", 0.0) or 0.0)
-            name = str(hit.get("name", query) or query)
-            country = str(hit.get("country_code", "") or "")
+            # If query is raw "lat,lon" coordinates, skip forward-geocoding entirely.
+            coord_match = _COORD_RE.match(query)
+            if coord_match:
+                lat = float(coord_match.group(1))
+                lon = float(coord_match.group(2))
+                # Reverse-geocode for a human-readable city name (best effort, 2 s timeout).
+                name = f"{lat:.4f},{lon:.4f}"
+                country = ""
+                try:
+                    rev = client.get(
+                        "https://nominatim.openstreetmap.org/reverse",
+                        params={"lat": lat, "lon": lon, "format": "json", "zoom": 10},
+                        headers={"User-Agent": "GenomeUI/1.0 (weather location display)"},
+                        timeout=2.0,
+                    )
+                    if rev.status_code == 200:
+                        rev_json = rev.json()
+                        addr = (rev_json.get("address", {}) if isinstance(rev_json, dict) else {}) or {}
+                        city = (
+                            addr.get("city") or addr.get("town") or addr.get("village")
+                            or addr.get("county") or ""
+                        )
+                        # Use ISO 3166-2 state code (e.g. "US-OK" → "OK")
+                        iso_state = str(addr.get("ISO3166-2-lvl4", "") or "")
+                        state_code = iso_state.split("-")[-1] if "-" in iso_state else iso_state
+                        if city and state_code:
+                            name = f"{city}, {state_code}"
+                        elif city:
+                            name = city
+                except Exception:
+                    pass  # keep raw coords as fallback display name
+            else:
+                geo = client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": query, "count": 1, "language": "en", "format": "json"},
+                )
+                geo.raise_for_status()
+                geo_json = geo.json()
+                results = geo_json.get("results", []) if isinstance(geo_json, dict) else []
+                if not results or not isinstance(results[0], dict):
+                    return weather_fallback_snapshot(query)
+                hit = results[0]
+                lat = float(hit.get("latitude", 0.0) or 0.0)
+                lon = float(hit.get("longitude", 0.0) or 0.0)
+                name = str(hit.get("name", query) or query)
+                country = str(hit.get("country_code", "") or "")
             wx = client.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
@@ -2374,6 +2408,7 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                     "longitude": lon,
                     "current": "temperature_2m,wind_speed_10m,weather_code",
                     "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,weather_code",
+                    "daily": "sunrise,sunset",
                     "temperature_unit": "fahrenheit",
                     "wind_speed_unit": "mph",
                     "timezone": "auto",
@@ -2385,7 +2420,8 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
             wx_json = wx_payload if isinstance(wx_payload, dict) else {}
             current = wx_json.get("current", {}) if isinstance(wx_json, dict) else {}
             hourly = wx_json.get("hourly", {}) if isinstance(wx_json, dict) else {}
-            code = int(current.get("weather_code", -1) or -1)
+            _raw_code = current.get("weather_code")
+            code = int(_raw_code) if _raw_code is not None else -1
             code_map = {
                 0: "clear",
                 1: "mainly clear",
@@ -2394,12 +2430,27 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                 45: "fog",
                 48: "rime fog",
                 51: "light drizzle",
+                53: "moderate drizzle",
+                55: "dense drizzle",
+                56: "freezing drizzle",
+                57: "heavy freezing drizzle",
                 61: "light rain",
                 63: "rain",
                 65: "heavy rain",
-                71: "snow",
+                66: "freezing rain",
+                67: "heavy freezing rain",
+                71: "light snow",
+                73: "snow",
+                75: "heavy snow",
+                77: "snow grains",
                 80: "rain showers",
+                81: "moderate rain showers",
+                82: "heavy rain showers",
+                85: "snow showers",
+                86: "heavy snow showers",
                 95: "thunderstorm",
+                96: "thunderstorm with hail",
+                99: "thunderstorm with heavy hail",
             }
             hourly_times = hourly.get("time", []) if isinstance(hourly, dict) and isinstance(hourly.get("time"), list) else []
             hourly_temp = hourly.get("temperature_2m", []) if isinstance(hourly, dict) and isinstance(hourly.get("temperature_2m"), list) else []
@@ -2423,6 +2474,19 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                 )
             if not hourly_out:
                 hourly_out = weather_fallback_hourly(query, float(current.get("temperature_2m", 0.0) or 0.0), code_map.get(code, "unknown"), float(current.get("wind_speed_10m", 0.0) or 0.0))
+            # Extract local time and sun times from the response.
+            # current.time format: "2026-02-25T15:00" — hour is chars 11-12.
+            def _parse_hour(s: str) -> int:
+                try:
+                    return int(str(s or "")[11:13])
+                except (ValueError, IndexError):
+                    return -1
+            daily = wx_json.get("daily", {}) if isinstance(wx_json, dict) else {}
+            daily_sunrise = (daily.get("sunrise") or []) if isinstance(daily, dict) else []
+            daily_sunset  = (daily.get("sunset")  or []) if isinstance(daily, dict) else []
+            local_hour    = _parse_hour(str(current.get("time", "") or ""))
+            sunrise_hour  = _parse_hour(str(daily_sunrise[0]) if daily_sunrise else "")
+            sunset_hour   = _parse_hour(str(daily_sunset[0])  if daily_sunset  else "")
             return {
                 "ok": True,
                 "source": "open-meteo",
@@ -2431,19 +2495,17 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                 "windMph": float(current.get("wind_speed_10m", 0.0) or 0.0),
                 "condition": code_map.get(code, f"code {code}" if code >= 0 else "unknown"),
                 "hourly": hourly_out,
+                "localHour": local_hour,
+                "sunriseHour": sunrise_hour if sunrise_hour >= 0 else 6,
+                "sunsetHour": sunset_hour  if sunset_hour  >= 0 else 19,
             }
     except Exception:
-        if mode == "live":
-            return {
-                "ok": False,
-                "source": "open-meteo",
-                "location": query,
-                "temperatureF": 0.0,
-                "windMph": 0.0,
-                "condition": "unavailable",
-                "error": "live provider unavailable",
-            }
-        return weather_fallback_snapshot(query)
+        # Never hard-fail weather rendering on provider/network issues.
+        # Fall back to deterministic local snapshot so intent UX remains usable.
+        fallback = weather_fallback_snapshot(query)
+        fallback["source"] = "fallback"
+        fallback["degradedFrom"] = "open-meteo"
+        return fallback
 
 
 def default_handoff_state() -> dict[str, Any]:
@@ -16908,10 +16970,11 @@ def resolve_auto_location_hint() -> str:
         if not isinstance(data, dict):
             return ""
         city = str(data.get("city", "")).strip()
-        region = str(data.get("region", "")).strip()
-        country = str(data.get("country_name", "") or data.get("country_code", "")).strip()
-        parts = [part for part in [city, region, country] if part]
-        hint = ", ".join(parts[:3]).strip()
+        # Use short country code (e.g. "US") not full name — open-meteo geocoding handles
+        # "Tulsa, US" fine but chokes on "Tulsa, Oklahoma, United States".
+        country_code = str(data.get("country_code", "")).strip()
+        parts = [part for part in [city, country_code] if part]
+        hint = ", ".join(parts).strip()
         if hint:
             _AUTO_LOCATION_HINT_CACHE = (now, hint)
         return hint
@@ -17451,12 +17514,9 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "code": "unknown_connector_scope",
             }
     if capability["name"] == "weather_forecast":
-        if not connector_scope_granted("weather.forecast.read"):
-            return {
-                "allowed": False,
-                "reason": "Connector scope missing. Try: grant weather forecast",
-                "code": "connector_scope_required",
-            }
+        # Weather forecast is a public read path and should be usable from plain intent
+        # without pre-grant friction.
+        return {"allowed": True, "reason": "allowed_public_read", "code": "ok"}
     if capability["name"] == "contacts_lookup":
         if not connector_scope_granted("contacts.read"):
             return {
@@ -29208,7 +29268,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             f"wind: {wind:.1f} mph",
             f"source: {source}",
         ]
-        weather_url = f"https://weather.com/weather/today/l/{quote_plus(resolved)}"
+        weather_url = f"https://www.google.com/search?q=weather+{quote_plus(resolved)}"
         source_target = {"label": f"Open forecast for {resolved}", "url": weather_url, "mode": "assist"}
         lines.append(f"direct: {source_target['label']} | {source_target['url']}")
         return {
