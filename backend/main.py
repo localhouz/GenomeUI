@@ -2408,11 +2408,12 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                     "longitude": lon,
                     "current": "temperature_2m,wind_speed_10m,weather_code",
                     "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,weather_code",
-                    "daily": "sunrise,sunset",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset",
                     "temperature_unit": "fahrenheit",
                     "wind_speed_unit": "mph",
                     "timezone": "auto",
-                    "forecast_hours": 12,
+                    "forecast_hours": 48,
+                    "forecast_days": 7,
                 },
             )
             wx.raise_for_status()
@@ -2457,36 +2458,65 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
             hourly_wind = hourly.get("wind_speed_10m", []) if isinstance(hourly, dict) and isinstance(hourly.get("wind_speed_10m"), list) else []
             hourly_precip = hourly.get("precipitation_probability", []) if isinstance(hourly, dict) and isinstance(hourly.get("precipitation_probability"), list) else []
             hourly_code = hourly.get("weather_code", []) if isinstance(hourly, dict) and isinstance(hourly.get("weather_code"), list) else []
-            hourly_out: list[dict[str, Any]] = []
-            for idx in range(min(len(hourly_times), len(hourly_temp), len(hourly_wind), 12)):
-                raw_time = str(hourly_times[idx] or "")
-                hour_label = raw_time[-5:] if len(raw_time) >= 5 else f"+{idx}h"
-                code_i = int(hourly_code[idx] or code) if idx < len(hourly_code) else code
-                hourly_out.append(
-                    {
-                        "hourOffset": int(idx),
+            def _build_hourly(start: int, end: int) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                for idx in range(start, min(end, len(hourly_times), len(hourly_temp), len(hourly_wind))):
+                    raw_time = str(hourly_times[idx] or "")
+                    hour_label = raw_time[-5:] if len(raw_time) >= 5 else f"+{idx}h"
+                    code_i = int(hourly_code[idx] or code) if idx < len(hourly_code) else code
+                    out.append({
+                        "hourOffset": int(idx - start),
                         "hourLabel": hour_label,
                         "tempF": float(hourly_temp[idx] or 0.0),
                         "windMph": float(hourly_wind[idx] or 0.0),
-                        "precipChance": int(hourly_precip[idx] or 0),
+                        "precipChance": int(hourly_precip[idx] or 0) if idx < len(hourly_precip) else 0,
                         "condition": code_map.get(code_i, f"code {code_i}" if code_i >= 0 else "unknown"),
-                    }
-                )
+                    })
+                return out
+            hourly_out = _build_hourly(0, 12)
+            hourly_tomorrow_out = _build_hourly(24, 36)
             if not hourly_out:
                 hourly_out = weather_fallback_hourly(query, float(current.get("temperature_2m", 0.0) or 0.0), code_map.get(code, "unknown"), float(current.get("wind_speed_10m", 0.0) or 0.0))
-            # Extract local time and sun times from the response.
-            # current.time format: "2026-02-25T15:00" — hour is chars 11-12.
+            # Extract local time, sun times, and 7-day daily data.
+            # current.time format: "2026-02-26T15:00" — hour is chars 11-12.
             def _parse_hour(s: str) -> int:
                 try:
                     return int(str(s or "")[11:13])
                 except (ValueError, IndexError):
                     return -1
             daily = wx_json.get("daily", {}) if isinstance(wx_json, dict) else {}
-            daily_sunrise = (daily.get("sunrise") or []) if isinstance(daily, dict) else []
-            daily_sunset  = (daily.get("sunset")  or []) if isinstance(daily, dict) else []
-            local_hour    = _parse_hour(str(current.get("time", "") or ""))
-            sunrise_hour  = _parse_hour(str(daily_sunrise[0]) if daily_sunrise else "")
-            sunset_hour   = _parse_hour(str(daily_sunset[0])  if daily_sunset  else "")
+            d_times   = (daily.get("time", [])                           or []) if isinstance(daily, dict) else []
+            d_codes   = (daily.get("weather_code", [])                   or []) if isinstance(daily, dict) else []
+            d_max     = (daily.get("temperature_2m_max", [])             or []) if isinstance(daily, dict) else []
+            d_min     = (daily.get("temperature_2m_min", [])             or []) if isinstance(daily, dict) else []
+            d_precip  = (daily.get("precipitation_probability_max", [])  or []) if isinstance(daily, dict) else []
+            d_wind    = (daily.get("wind_speed_10m_max", [])             or []) if isinstance(daily, dict) else []
+            d_sunrise = (daily.get("sunrise", [])                        or []) if isinstance(daily, dict) else []
+            d_sunset  = (daily.get("sunset",  [])                        or []) if isinstance(daily, dict) else []
+            import datetime as _dt_mod
+            daily_out: list[dict[str, Any]] = []
+            for i in range(min(len(d_times), len(d_max), 7)):
+                day_date = str(d_times[i] or "")
+                try:
+                    day_name = _dt_mod.datetime.strptime(day_date, "%Y-%m-%d").strftime("%a")
+                except Exception:
+                    day_name = day_date[-5:]
+                code_i = int(d_codes[i]) if i < len(d_codes) and d_codes[i] is not None else code
+                daily_out.append({
+                    "dayOffset": i,
+                    "dayName": day_name,
+                    "date": day_date,
+                    "maxTempF": float(d_max[i] or 0.0),
+                    "minTempF": float(d_min[i] or 0.0) if i < len(d_min) else 0.0,
+                    "precipChance": int(d_precip[i] or 0) if i < len(d_precip) else 0,
+                    "windMph": float(d_wind[i] or 0.0) if i < len(d_wind) else 0.0,
+                    "condition": code_map.get(code_i, f"code {code_i}" if code_i >= 0 else "unknown"),
+                    "sunriseHour": _parse_hour(str(d_sunrise[i]) if i < len(d_sunrise) else ""),
+                    "sunsetHour":  _parse_hour(str(d_sunset[i])  if i < len(d_sunset)  else ""),
+                })
+            local_hour   = _parse_hour(str(current.get("time", "") or ""))
+            sunrise_hour = _parse_hour(str(d_sunrise[0]) if d_sunrise else "")
+            sunset_hour  = _parse_hour(str(d_sunset[0])  if d_sunset  else "")
             return {
                 "ok": True,
                 "source": "open-meteo",
@@ -2495,6 +2525,8 @@ def weather_read_snapshot(location: str, provider_mode: str | None = None) -> di
                 "windMph": float(current.get("wind_speed_10m", 0.0) or 0.0),
                 "condition": code_map.get(code, f"code {code}" if code >= 0 else "unknown"),
                 "hourly": hourly_out,
+                "hourlyTomorrow": hourly_tomorrow_out,
+                "daily": daily_out,
                 "localHour": local_hour,
                 "sunriseHour": sunrise_hour if sunrise_hour >= 0 else 6,
                 "sunsetHour": sunset_hour  if sunset_hour  >= 0 else 19,
@@ -17023,7 +17055,15 @@ def parse_semantic_command(text: str) -> dict[str, Any] | None:
         location = "__current__"
     if not location:
         return None
-    return {"type": "weather_forecast", "domain": "weather", "payload": {"location": location}}
+    # Detect time window from the query text.
+    window = "now"
+    if re.search(r"\b(tomorrow|tom(?:rw)?)\b", lower):
+        window = "tomorrow"
+    elif re.search(r"\b(tonight|this\s+(?:evening|night))\b", lower):
+        window = "tonight"
+    elif re.search(r"\b(this\s+week|next\s+week|weekend|7[\s\-]?day|weekly|extended|week(?:ly)?)\b", lower):
+        window = "7day"
+    return {"type": "weather_forecast", "domain": "weather", "payload": {"location": location, "window": window}}
 
 
 CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
@@ -29229,6 +29269,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
 
     if kind == "weather_forecast":
         location = normalize_weather_location(str(payload.get("location", "")))
+        window = str(payload.get("window", "now")).strip() or "now"
         snapshot = weather_read_snapshot(location)
         if not bool(snapshot.get("ok", False)):
             return {
@@ -29245,29 +29286,66 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         condition = str(snapshot.get("condition", "unknown"))
         source = str(snapshot.get("source", "fallback"))
         resolved = str(snapshot.get("location", location))
-        hourly = snapshot.get("hourly", []) if isinstance(snapshot.get("hourly"), list) else []
-        hourly_data: list[dict[str, Any]] = []
-        for item in hourly[:12]:
-            if not isinstance(item, dict):
-                continue
-            hourly_data.append(
-                {
-                    "hourOffset": int(item.get("hourOffset", 0) or 0),
-                    "hourLabel": str(item.get("hourLabel", ""))[:16],
-                    "tempF": float(item.get("tempF", 0.0) or 0.0),
-                    "windMph": float(item.get("windMph", 0.0) or 0.0),
+
+        def _clean_hourly(items: list) -> list[dict[str, Any]]:
+            out = []
+            for item in (items or [])[:12]:
+                if not isinstance(item, dict):
+                    continue
+                out.append({
+                    "hourOffset":   int(item.get("hourOffset", 0) or 0),
+                    "hourLabel":    str(item.get("hourLabel", ""))[:16],
+                    "tempF":        float(item.get("tempF", 0.0) or 0.0),
+                    "windMph":      float(item.get("windMph", 0.0) or 0.0),
                     "precipChance": int(item.get("precipChance", 0) or 0),
-                    "condition": str(item.get("condition", condition))[:40],
-                }
-            )
-        graph_add_event(graph, "weather_forecast", {"location": resolved[:80], "source": source})
-        lines = [
-            f"location: {resolved}",
-            f"condition: {condition}",
-            f"temperature: {temperature:.1f}F",
-            f"wind: {wind:.1f} mph",
-            f"source: {source}",
-        ]
+                    "condition":    str(item.get("condition", condition))[:40],
+                })
+            return out
+
+        hourly_data = _clean_hourly(snapshot.get("hourly", []))
+        hourly_tomorrow_data = _clean_hourly(snapshot.get("hourlyTomorrow", []))
+
+        raw_daily = snapshot.get("daily", []) if isinstance(snapshot.get("daily"), list) else []
+        daily_data: list[dict[str, Any]] = []
+        for day in raw_daily[:7]:
+            if not isinstance(day, dict):
+                continue
+            daily_data.append({
+                "dayOffset":    int(day.get("dayOffset", 0) or 0),
+                "dayName":      str(day.get("dayName", ""))[:8],
+                "date":         str(day.get("date", ""))[:12],
+                "maxTempF":     float(day.get("maxTempF", 0.0) or 0.0),
+                "minTempF":     float(day.get("minTempF", 0.0) or 0.0),
+                "precipChance": int(day.get("precipChance", 0) or 0),
+                "windMph":      float(day.get("windMph", 0.0) or 0.0),
+                "condition":    str(day.get("condition", condition))[:40],
+                "sunriseHour":  int(day.get("sunriseHour", 6) or 6),
+                "sunsetHour":   int(day.get("sunsetHour", 19) or 19),
+            })
+
+        graph_add_event(graph, "weather_forecast", {"location": resolved[:80], "source": source, "window": window})
+        # Build preview lines appropriate to the window.
+        if window == "7day" and daily_data:
+            lines = [f"location: {resolved}", f"7-day forecast:"]
+            for day in daily_data:
+                lines.append(f"  {day['dayName']}: {day['condition']}, {round(day['minTempF'])}-{round(day['maxTempF'])}F")
+        elif window in ("tomorrow", "tonight") and hourly_tomorrow_data:
+            tmr = daily_data[1] if len(daily_data) > 1 else {}
+            lines = [
+                f"location: {resolved}",
+                f"tomorrow: {str(tmr.get('condition', condition))}",
+                f"high: {round(float(tmr.get('maxTempF', temperature)))}F  low: {round(float(tmr.get('minTempF', temperature - 10)))}F",
+                f"wind: {round(float(tmr.get('windMph', wind)))} mph",
+                f"source: {source}",
+            ]
+        else:
+            lines = [
+                f"location: {resolved}",
+                f"condition: {condition}",
+                f"temperature: {temperature:.1f}F",
+                f"wind: {wind:.1f} mph",
+                f"source: {source}",
+            ]
         weather_url = f"https://www.google.com/search?q=weather+{quote_plus(resolved)}"
         source_target = {"label": f"Open forecast for {resolved}", "url": weather_url, "mode": "assist"}
         lines.append(f"direct: {source_target['label']} | {source_target['url']}")
@@ -29281,7 +29359,13 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "temperatureF": float(temperature),
                 "windMph": float(wind),
                 "source": source,
+                "window": window,
                 "forecast": hourly_data,
+                "forecastTomorrow": hourly_tomorrow_data,
+                "daily": daily_data,
+                "localHour":   int(snapshot.get("localHour", -1) or -1),
+                "sunriseHour": int(snapshot.get("sunriseHour", 6) or 6),
+                "sunsetHour":  int(snapshot.get("sunsetHour", 19) or 19),
                 "sourceTarget": source_target,
             },
         }

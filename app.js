@@ -1845,8 +1845,8 @@ const UIEngine = {
                 'status: weather connector active',
                 { text: "what's the weather where i am", command: "what's the weather where i am" },
                 { text: 'weather tomorrow where i am', command: 'weather tomorrow where i am' },
+                { text: '7-day forecast', command: 'weather this week where i am' },
                 { text: locationWeatherLabel, command: locationWeatherCommand },
-                { text: 'where am i', command: 'where am i' }
             ];
         }
         if (latest?.ok && latest?.op === 'location_status') {
@@ -2016,8 +2016,17 @@ const UIEngine = {
                     : lower.includes('sun') || lower.includes('clear')
                         ? 'theme-sun'
                         : 'theme-cloud';
-            const mergedInfo = { ...info, ...weatherData, forecast: Array.isArray(weatherData.forecast) ? weatherData.forecast : [] };
-            return { headline, summary: summaryParts.join(' | '), variant: 'result', kind: 'weather', theme, info: mergedInfo };
+            const window = String(weatherData.window || 'now');
+            const kind = window === '7day' ? 'weather_7day'
+                       : (window === 'tomorrow' || window === 'tonight') ? 'weather_tomorrow'
+                       : 'weather';
+            const mergedInfo = {
+                ...info, ...weatherData,
+                forecast: Array.isArray(weatherData.forecast) ? weatherData.forecast : [],
+                forecastTomorrow: Array.isArray(weatherData.forecastTomorrow) ? weatherData.forecastTomorrow : [],
+                daily: Array.isArray(weatherData.daily) ? weatherData.daily : [],
+            };
+            return { headline, summary: summaryParts.join(' | '), variant: 'result', kind, theme, info: mergedInfo };
         }
         if (latest.op === 'location_status') {
             const info = this.parsePreviewMap(latest.previewLines);
@@ -2530,6 +2539,119 @@ const UIEngine = {
                         </div>
                     </div>
                     <div class="weather-forecast-strip">${forecastStrip}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'weather_tomorrow') {
+            const info = core.info || {};
+            const condition = String(info.condition || '').toLowerCase();
+            const location  = String(info.location || '').trim();
+            const daily     = Array.isArray(info.daily) ? info.daily : [];
+            const tmr       = daily[1] || daily[0] || {};
+            const tmrCond   = String(tmr.condition || condition).toLowerCase();
+            const tmrMax    = Math.round(Number(tmr.maxTempF || info.temperatureF || 0));
+            const tmrMin    = Math.round(Number(tmr.minTempF || 0));
+            const tmrWind   = Math.round(Number(tmr.windMph  || info.windMph || 0));
+            const tmrPrecip = Number(tmr.precipChance || 0);
+            const tmrIcon   = this.conditionIcon(tmrCond);
+            const tomorrow  = (info.window === 'tonight') ? 'Tonight' : 'Tomorrow';
+            const hourlyData = Array.isArray(info.forecastTomorrow) && info.forecastTomorrow.length
+                ? info.forecastTomorrow : (Array.isArray(info.forecast) ? info.forecast : []);
+            const tmrStrip = hourlyData.slice(0, 6).map((p) => {
+                const precip = Number(p.precipChance || 0);
+                const wet = precip >= 45 ? 'wet' : precip >= 20 ? 'mixed' : 'dry';
+                return `<div class="weather-forecast-card ${wet}">
+                    <div class="wfc-time">${escapeHtml(String(p.hourLabel || ''))}</div>
+                    <div class="wfc-icon">${this.conditionIcon(p.condition)}</div>
+                    <div class="wfc-temp">${escapeHtml(String(Math.round(Number(p.tempF || 0))))}F</div>
+                    <div class="wfc-bar"><div class="wfc-bar-fill" style="width:${Math.min(100, precip)}%"></div></div>
+                </div>`;
+            }).join('');
+            const weatherTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
+            const weatherTargetUrl = String(weatherTarget?.url || '').trim();
+            const weatherTargetLabel = String(weatherTarget?.label || 'open forecast').trim();
+            const tmrSunrise = Number(tmr.sunriseHour ?? info.sunriseHour ?? 6);
+            const tmrSunset  = Number(tmr.sunsetHour  ?? info.sunsetHour  ?? 19);
+            return `
+                <div class="scene scene-weather theme-tomorrow ${escapeAttr(core.theme || '')}">
+                    <canvas class="scene-canvas weather-canvas"
+                        data-scene="weather"
+                        data-condition="${escapeAttr(tmrCond)}"
+                        data-temp="${escapeAttr(String(tmrMax))}"
+                        data-wind="${escapeAttr(String(tmrWind))}"
+                        data-hour="${escapeAttr(String(tmrSunrise + 3))}"
+                        data-sunrise="${escapeAttr(String(tmrSunrise))}"
+                        data-sunset="${escapeAttr(String(tmrSunset))}"
+                        data-terrain="${escapeAttr(this.locationTerrain(location))}"
+                    ></canvas>
+                    <div class="weather-radar" aria-hidden="true">
+                        <div class="radar-ring ring-1"></div>
+                        <div class="radar-ring ring-2"></div>
+                        <div class="radar-ring ring-3"></div>
+                        <div class="radar-sweep"></div>
+                    </div>
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-grid"></div>
+                    <div class="weather-hero">
+                        <div class="weather-hero-label">${escapeHtml(tomorrow)}</div>
+                        <div class="weather-hero-temp">${escapeHtml(String(tmrMax))}°</div>
+                        <div class="weather-hero-cond">${escapeHtml(tmrCond)} ${tmrIcon}</div>
+                        <div class="weather-hero-meta">
+                            <span>${escapeHtml(String(tmrMin))}° low</span>
+                            <span class="wh-sep">·</span>
+                            <span>${escapeHtml(String(tmrWind))} mph</span>
+                            <span class="wh-sep">·</span>
+                            <span>${escapeHtml(String(tmrPrecip))}% rain</span>
+                            ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                        </div>
+                    </div>
+                    <div class="weather-forecast-strip">${tmrStrip}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'weather_7day') {
+            const info     = core.info || {};
+            const location = String(info.location || '').trim();
+            const daily    = Array.isArray(info.daily) ? info.daily : [];
+            const source   = String(info.source || '').trim();
+            const weatherTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
+            const weatherTargetUrl   = String(weatherTarget?.url   || '').trim();
+            const weatherTargetLabel = String(weatherTarget?.label || 'open forecast').trim();
+            const dayCards = daily.slice(0, 7).map((d, i) => {
+                const precip = Number(d.precipChance || 0);
+                const wet = precip >= 50 ? 'wet' : precip >= 25 ? 'mixed' : 'dry';
+                const icon = this.conditionIcon(d.condition);
+                const label = i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : escapeHtml(String(d.dayName || ''));
+                return `<div class="wx7-card ${wet}">
+                    <div class="wx7-day">${label}</div>
+                    <div class="wx7-icon">${icon}</div>
+                    <div class="wx7-cond">${escapeHtml(String(d.condition || ''))}</div>
+                    <div class="wx7-temps">
+                        <span class="wx7-hi">${escapeHtml(String(Math.round(Number(d.maxTempF || 0))))}°</span>
+                        <span class="wx7-lo">${escapeHtml(String(Math.round(Number(d.minTempF || 0))))}°</span>
+                    </div>
+                    <div class="wx7-bar"><div class="wx7-bar-fill" style="width:${Math.min(100, precip)}%"></div></div>
+                    <div class="wx7-wind">${escapeHtml(String(Math.round(Number(d.windMph || 0))))} mph</div>
+                </div>`;
+            }).join('');
+            // Dominant condition for canvas (use most common or today's)
+            const domCond = String((daily[0] || {}).condition || info.condition || '').toLowerCase();
+            return `
+                <div class="scene scene-weather scene-weather-7day ${escapeAttr(core.theme || '')}">
+                    <canvas class="scene-canvas weather-7day-canvas"
+                        data-scene="weather-7day"
+                        data-condition="${escapeAttr(domCond)}"
+                        data-temp="${escapeAttr(String(Math.round(Number((daily[0] || {}).maxTempF || info.temperatureF || 60))))}"
+                        data-terrain="${escapeAttr(this.locationTerrain(location))}"
+                    ></canvas>
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-grid"></div>
+                    <div class="wx7-header">
+                        <div class="wx7-title">7-day forecast</div>
+                        <div class="wx7-location">${escapeHtml(location)}</div>
+                        ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                    </div>
+                    <div class="wx7-strip">${dayCards}</div>
                 </div>
             `;
         }
@@ -3155,6 +3277,8 @@ const UIEngine = {
         const scene = String(canvas.dataset.scene || '').trim();
         if (scene === 'weather') {
             this._sceneRenderer = this.makeWeatherRenderer(canvas);
+        } else if (scene === 'weather-7day') {
+            this._sceneRenderer = this.makeWeather7DayRenderer(canvas);
         } else if (scene === 'shopping') {
             this._sceneRenderer = this.makeShoppingRenderer(canvas);
         } else if (scene === 'tasks') {
@@ -3720,6 +3844,112 @@ const UIEngine = {
             ctx.fillStyle = isSun ? `rgba(255, 244, 192, ${0.76 + warmth * 0.14})` : 'rgba(216, 232, 252, 0.76)';
             ctx.font = "700 12px 'IBM Plex Mono', monospace";
             ctx.fillText(`${Math.round(temp)}F`, 14, 24);
+        };
+    },
+
+    makeWeather7DayRenderer(canvas) {
+        const condition = String(canvas.dataset.condition || '').toLowerCase();
+        const terrain   = String(canvas.dataset.terrain   || 'hills');
+        const isSun   = condition.includes('clear') || condition.includes('sun');
+        const isRain  = condition.includes('rain') || condition.includes('drizzle');
+        const isSnow  = condition.includes('snow');
+        const isStorm = condition.includes('storm') || condition.includes('thunder');
+
+        // Slow-drifting cloud blobs for background ambiance
+        const clouds = Array.from({ length: 6 }, (_, i) => ({
+            x: (i * 0.19 + 0.04) % 1.1,
+            y: 0.05 + (i * 0.11) % 0.32,
+            rw: 0.14 + (i * 0.06) % 0.12,
+            rh: 0.045 + (i * 0.02) % 0.038,
+            sp: 0.000038 + i * 0.000018,
+            a: isSun ? 0.07 + (i * 0.03) % 0.07 : 0.22 + (i * 0.05) % 0.14,
+        }));
+        const drawCloud = (ctx, cx, cy, rw, rh, alpha) => {
+            ctx.fillStyle = `rgba(220, 230, 242, ${alpha})`;
+            ctx.beginPath(); ctx.ellipse(cx,            cy,            rw,        rh,        0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(cx - rw * 0.38, cy - rh * 0.34, rw * 0.52, rh * 0.70, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(cx + rw * 0.32, cy - rh * 0.26, rw * 0.48, rh * 0.66, 0, 0, Math.PI * 2); ctx.fill();
+        };
+        // Slow diagonal rain streaks for rainy background
+        const drops = Array.from({ length: 60 }, (_, i) => ({
+            x: (i * 37.3) % 1, y: ((i * 83.7) % 991) / 991, v: 0.5 + ((i * 17) % 100) / 100,
+        }));
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.016;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+
+            // Sky
+            const sky = ctx.createLinearGradient(0, 0, 0, h);
+            if (isStorm || isRain) {
+                sky.addColorStop(0, 'rgba(16, 28, 48, 0.68)');
+                sky.addColorStop(1, 'rgba(28, 44, 66, 0.18)');
+            } else if (isSnow) {
+                sky.addColorStop(0, 'rgba(110, 148, 192, 0.48)');
+                sky.addColorStop(1, 'rgba(80, 120, 164, 0.10)');
+            } else if (isSun) {
+                sky.addColorStop(0, 'rgba(18, 28, 72, 0.52)');
+                sky.addColorStop(0.6, 'rgba(38, 80, 130, 0.22)');
+                sky.addColorStop(1, 'rgba(80, 130, 180, 0.06)');
+            } else {
+                sky.addColorStop(0, 'rgba(44, 58, 74, 0.50)');
+                sky.addColorStop(1, 'rgba(68, 84, 102, 0.10)');
+            }
+            ctx.fillStyle = sky; ctx.fillRect(0, 0, w, h);
+
+            // Clouds
+            clouds.forEach((c) => {
+                c.x += c.sp; if (c.x > 1.26) c.x = -0.26;
+                drawCloud(ctx, c.x * w, c.y * h, c.rw * w, c.rh * h, c.a);
+            });
+
+            // Background rain (subtle, non-distracting)
+            if (isRain || isStorm) {
+                ctx.strokeStyle = `rgba(180, 216, 255, 0.18)`;
+                ctx.lineWidth = 0.7;
+                drops.forEach((d) => {
+                    d.y += 0.003 * d.v; d.x += 0.0006 * d.v;
+                    if (d.y > 1.04) { d.y = -0.08; } if (d.x > 1.08) d.x -= 1.1;
+                    ctx.beginPath(); ctx.moveTo(d.x * w, d.y * h);
+                    ctx.lineTo(d.x * w + 2, d.y * h + 8); ctx.stroke();
+                });
+            }
+
+            // Terrain silhouette (same logic as main renderer, reused here)
+            const groundY = h * 0.76;
+            ctx.fillStyle = 'rgba(8, 12, 22, 0.80)';
+            ctx.beginPath(); ctx.moveTo(0, h);
+            if (terrain === 'mountains') {
+                ctx.lineTo(0, groundY + h * 0.04); ctx.lineTo(w * 0.08, groundY - h * 0.07);
+                ctx.lineTo(w * 0.18, groundY + h * 0.01); ctx.lineTo(w * 0.30, groundY - h * 0.20);
+                ctx.lineTo(w * 0.42, groundY + h * 0.01); ctx.lineTo(w * 0.53, groundY - h * 0.14);
+                ctx.lineTo(w * 0.64, groundY + h * 0.02); ctx.lineTo(w * 0.74, groundY - h * 0.09);
+                ctx.lineTo(w * 0.87, groundY + h * 0.01); ctx.lineTo(w, groundY - h * 0.04);
+            } else if (terrain === 'city') {
+                const b = groundY;
+                [[0.04,0.07,0.12],[0.12,0.06,0.20],[0.19,0.08,0.14],[0.28,0.05,0.26],
+                 [0.34,0.07,0.16],[0.42,0.09,0.22],[0.52,0.06,0.13],[0.59,0.08,0.17],
+                 [0.68,0.05,0.24],[0.74,0.07,0.11],[0.82,0.06,0.18],[0.89,0.09,0.09]].forEach(([bx, bw, bh]) => {
+                    ctx.lineTo(bx * w, b); ctx.lineTo(bx * w, b - bh * h);
+                    ctx.lineTo((bx + bw) * w, b - bh * h); ctx.lineTo((bx + bw) * w, b);
+                }); ctx.lineTo(w, b);
+            } else if (terrain === 'desert') {
+                const b = groundY + h * 0.02;
+                ctx.lineTo(0, b); ctx.lineTo(w * 0.14, b + h * 0.01);
+                ctx.lineTo(w * 0.19, b - h * 0.09); ctx.lineTo(w * 0.33, b - h * 0.09); ctx.lineTo(w * 0.37, b + h * 0.01);
+                ctx.lineTo(w * 0.55, b - h * 0.13); ctx.lineTo(w * 0.68, b - h * 0.13); ctx.lineTo(w * 0.72, b + h * 0.01);
+                ctx.lineTo(w, b);
+            } else {
+                const b = groundY + h * 0.03;
+                ctx.lineTo(0, b + h * 0.02);
+                ctx.bezierCurveTo(w * 0.22, b - h * 0.04, w * 0.38, b + h * 0.01, w * 0.52, b - h * 0.06);
+                ctx.bezierCurveTo(w * 0.66, b - h * 0.13, w * 0.80, b - h * 0.02, w, b);
+            }
+            ctx.lineTo(w, h); ctx.closePath(); ctx.fill();
         };
     },
 

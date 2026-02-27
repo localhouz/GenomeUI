@@ -837,6 +837,151 @@ main {
     background: rgba(255, 210, 100, 0.52);
 }
 
+/* ── Tomorrow label above the temp ──────────────────────────────────── */
+.weather-hero-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(200, 220, 255, 0.68);
+    margin-bottom: 2px;
+}
+
+/* ── 7-day forecast scene ────────────────────────────────────────────── */
+.scene-weather-7day {
+    display: flex;
+    flex-direction: column;
+}
+
+.wx7-header {
+    position: absolute;
+    top: clamp(14px, 3.5%, 24px);
+    left: clamp(16px, 3vw, 28px);
+    z-index: 3;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.wx7-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(200, 220, 255, 0.72);
+}
+
+.wx7-location {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: rgba(170, 196, 230, 0.62);
+}
+
+.wx7-strip {
+    position: absolute;
+    inset: 0;
+    top: clamp(44px, 12%, 70px);
+    bottom: 10px;
+    left: clamp(12px, 2vw, 20px);
+    right: clamp(12px, 2vw, 20px);
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 6px;
+    z-index: 3;
+    align-items: stretch;
+}
+
+.wx7-card {
+    border: 1px solid rgba(220, 236, 255, 0.30);
+    border-radius: 12px;
+    padding: 9px 7px 10px;
+    background: rgba(6, 14, 28, 0.38);
+    backdrop-filter: blur(8px);
+    color: rgba(240, 248, 255, 0.95);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.wx7-card.wet  { border-color: rgba(110, 180, 255, 0.55); }
+.wx7-card.mixed { border-color: rgba(170, 215, 255, 0.42); }
+.wx7-card.dry  { border-color: rgba(255, 220, 140, 0.38); }
+
+.wx7-day {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    opacity: 0.82;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.wx7-icon {
+    font-size: 18px;
+    line-height: 1;
+    margin: 2px 0;
+}
+
+.wx7-cond {
+    font-size: 9px;
+    opacity: 0.72;
+    line-height: 1.2;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.wx7-temps {
+    display: flex;
+    gap: 5px;
+    align-items: baseline;
+    margin-top: 2px;
+}
+
+.wx7-hi {
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.wx7-lo {
+    font-size: 11px;
+    opacity: 0.58;
+}
+
+.wx7-bar {
+    margin-top: 4px;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.wx7-bar-fill {
+    height: 100%;
+    background: rgba(140, 200, 255, 0.62);
+    border-radius: 2px;
+    min-width: 2px;
+}
+
+.wx7-card.wet  .wx7-bar-fill { background: rgba(100, 170, 255, 0.82); }
+.wx7-card.dry  .wx7-bar-fill { background: rgba(255, 210, 100, 0.52); }
+
+.wx7-wind {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    opacity: 0.60;
+    margin-top: 2px;
+}
+
 /* ── Weather hero: temp / condition / meta ─────────────────────────── */
 .weather-hero {
     position: absolute;
