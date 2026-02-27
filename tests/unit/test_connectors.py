@@ -4,6 +4,7 @@ import asyncio
 import copy
 import os
 import unittest
+from unittest import mock
 
 import backend.main as main
 
@@ -56,6 +57,13 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertIn("hourly", a)
         self.assertIsInstance(a.get("hourly"), list)
 
+    def test_weather_live_mode_degrades_to_fallback_on_provider_error(self) -> None:
+        with mock.patch("backend.main.httpx.Client", side_effect=RuntimeError("offline")):
+            snap = main.weather_read_snapshot("Tulsa, Oklahoma", provider_mode="live")
+        self.assertTrue(bool(snap.get("ok", False)))
+        self.assertEqual(str(snap.get("source", "")), "fallback")
+        self.assertEqual(str(snap.get("degradedFrom", "")), "open-meteo")
+
     def test_web_fetch_snapshot_scaffold_is_deterministic(self) -> None:
         a = main.web_fetch_snapshot("https://example.com", provider_mode="scaffold")
         b = main.web_fetch_snapshot("https://example.com", provider_mode="scaffold")
@@ -95,13 +103,13 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertEqual(base_url, "https://social.example.com")
         self.assertEqual(token, "vault-token")
 
-    def test_policy_blocks_weather_without_scope(self) -> None:
+    def test_policy_allows_weather_without_scope(self) -> None:
         main.CONNECTOR_VAULT = main.default_connector_vault_state()
         op = {"type": "weather_forecast", "payload": {"location": "Austin"}}
         capability = main.resolve_capability(op)
         policy = main.evaluate_policy(op, capability)
-        self.assertFalse(bool(policy.get("allowed", True)))
-        self.assertEqual(str(policy.get("code", "")), "connector_scope_required")
+        self.assertTrue(bool(policy.get("allowed", False)))
+        self.assertEqual(str(policy.get("code", "")), "ok")
 
     def test_policy_allows_weather_with_scope(self) -> None:
         main.CONNECTOR_VAULT = main.default_connector_vault_state()

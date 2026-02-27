@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from semantics import parse_semantic_command  # noqa: F401 (re-exported for callers)
+from semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY  # noqa: F401 (re-exported for callers)
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -269,6 +269,9 @@ class TurnBody(BaseModel):
     deviceId: str | None = None
     onConflict: str | None = None
     idempotencyKey: str | None = None
+    # Pre-classification from Nous AI gateway.  When present with confidence ≥ 0.6
+    # the NLU (semantics.py) is bypassed entirely and the op/slots are used directly.
+    nousIntent: dict[str, Any] | None = None
 
 
 class HandoffStartBody(BaseModel):
@@ -2928,6 +2931,21 @@ async def health() -> dict[str, Any]:
             "large": OLLAMA_MODEL_LARGE or None,
         },
     }
+
+
+@app.get("/api/intent-taxonomy")
+async def get_intent_taxonomy() -> dict[str, Any]:
+    """Return the full intent taxonomy grouped by domain, for frontend suggestion chips."""
+    by_domain: dict[str, list[dict[str, Any]]] = {}
+    for intent in TAXONOMY.values():
+        entry = {
+            "id": intent.id,
+            "op": intent.op,
+            "description": intent.description,
+            "examples": intent.examples,
+        }
+        by_domain.setdefault(intent.domain, []).append(entry)
+    return {"domains": by_domain, "total": len(TAXONOMY)}
 
 
 @app.get("/api/connectors")
@@ -7609,7 +7627,7 @@ async def turn(body: TurnBody) -> dict[str, Any]:
             reused["idempotency"] = {"reused": True, "key": idem_key}
             return reused
 
-    envelope = compile_intent_envelope(intent)
+    envelope = compile_intent_envelope(intent, nous_hint=body.nousIntent)
     clarification = envelope.get("clarification") or {}
     clarification_required = bool(clarification.get("required", False))
     parse_done_ms = now_ms()
@@ -12836,10 +12854,34 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
     return None
 
 
-def compile_intent_envelope(text: str) -> dict[str, Any]:
+def _op_to_domain(op: str) -> str:
+    """Resolve an op string to its domain using the TAXONOMY, e.g. 'weather_forecast' → 'weather'."""
+    for intent in TAXONOMY.values():
+        if intent.op == op:
+            return intent.domain
+    # Fallback: derive from op prefix (e.g. "add_task" → "tasks")
+    prefix = op.split("_")[0] if "_" in op else op
+    domain_map = {"add": "tasks", "toggle": "tasks", "delete": "tasks", "clear": "tasks",
+                  "weather": "weather", "timer": "system", "calc": "system", "unit": "system",
+                  "schedule": "reminders", "list": "reminders", "cancel": "reminders",
+                  "web": "web", "news": "news", "finance": "finance", "banking": "finance",
+                  "note": "notes", "shopping": "shopping", "social": "social",
+                  "contacts": "contacts", "email": "email", "graph": "graph"}
+    return domain_map.get(prefix, "system")
+
+
+def compile_intent_envelope(text: str, nous_hint: "dict[str, Any] | None" = None) -> dict[str, Any]:
     normalized_text = normalize_intent_text(text)
     lower = normalized_text.lower()
-    writes = parse_commands(normalized_text)
+
+    # If Nous pre-classified this turn with sufficient confidence, use it directly
+    # and skip the rule-based NLU pipeline entirely.
+    if nous_hint and nous_hint.get("op") and float(nous_hint.get("confidence", 0)) >= 0.6:
+        op = str(nous_hint["op"])
+        domain = _op_to_domain(op)
+        writes = [{"type": op, "domain": domain, "payload": nous_hint.get("slots") or {}}]
+    else:
+        writes = parse_commands(normalized_text)
     clarification = build_clarification_signal(normalized_text, lower, writes)
 
     state_domains = [op["domain"] for op in writes] if writes else infer_domains(lower)

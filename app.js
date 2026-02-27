@@ -52,7 +52,8 @@ const RemoteTurnService = {
     },
 
     async process(intent, sessionId, baseRevision, deviceId, onConflict = 'rebase_if_commutative', idempotencyKey = null) {
-        const response = await fetch('/api/turn', {
+        const NOUS_URL = window.NOUS_URL || 'http://localhost:7700';
+        const response = await fetch(`${NOUS_URL}/api/turn`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ intent, sessionId, baseRevision, deviceId, onConflict, idempotencyKey })
@@ -2171,6 +2172,59 @@ const UIEngine = {
                 info: { ...data, op: latest.op },
             };
         }
+        // ── Personal data ops ─────────────────────────────────────────────────
+        if (latest.op === 'graph_query') {
+            const writeOps = Array.isArray(envelope?.stateIntent?.writeOperations)
+                ? envelope.stateIntent.writeOperations : [];
+            const gOp = writeOps.find((o) => String(o?.type || '') === 'graph_query');
+            const qKind = String(gOp?.payload?.kind || '').trim().toLowerCase();
+            if (qKind === 'task') {
+                const tasks = this.state.memory?.tasks || [];
+                const open = tasks.filter((t) => !t.done).length;
+                return { headline: `${open} open task${open !== 1 ? 's' : ''}`, summary: `${tasks.length} total`, variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
+            }
+            if (qKind === 'note') {
+                const notes = this.state.memory?.notes || [];
+                return { headline: `${notes.length} note${notes.length !== 1 ? 's' : ''}`, summary: 'knowledge stream', variant: 'result', kind: 'notes', theme: 'theme-notes' };
+            }
+            if (qKind === 'expense') {
+                const expenses = this.state.memory?.expenses || [];
+                const total = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+                return { headline: `${formatCurrency(total)} tracked`, summary: `${expenses.length} expense${expenses.length !== 1 ? 's' : ''}`, variant: 'result', kind: 'expenses', theme: 'theme-expenses' };
+            }
+        }
+        if (latest.op === 'add_task' || latest.op === 'toggle_task' ||
+            latest.op === 'delete_task' || latest.op === 'clear_completed') {
+            const tasks = this.state.memory?.tasks || [];
+            const open = tasks.filter((t) => !t.done).length;
+            const msg = String(latest.message || '').trim();
+            return { headline: msg || 'Tasks updated', summary: `${open} open`, variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
+        }
+        if (latest.op === 'add_note') {
+            const notes = this.state.memory?.notes || [];
+            const msg = String(latest.message || '').trim();
+            return { headline: msg || 'Note saved', summary: `${notes.length} note${notes.length !== 1 ? 's' : ''}`, variant: 'result', kind: 'notes', theme: 'theme-notes' };
+        }
+        if (latest.op === 'add_expense') {
+            const expenses = this.state.memory?.expenses || [];
+            const total = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+            const msg = String(latest.message || '').trim();
+            return { headline: msg || 'Expense logged', summary: `${formatCurrency(total)} total`, variant: 'result', kind: 'expenses', theme: 'theme-expenses' };
+        }
+        if (latest.op === 'schedule_remind_once' || latest.op === 'list_reminders' ||
+            latest.op === 'cancel_reminder' || latest.op === 'pause_reminder' ||
+            latest.op === 'resume_reminder') {
+            const lines = Array.isArray(latest.previewLines) ? latest.previewLines : [];
+            const msg = String(latest.message || '').trim();
+            return {
+                headline: msg || 'Reminders',
+                summary: lines.length ? String(lines[0]).slice(0, 80) : 'Reminder status',
+                variant: 'result',
+                kind: 'reminders',
+                theme: 'theme-reminders',
+                info: { lines, op: latest.op },
+            };
+        }
         const summary = String(latest.message || fallbackSummary);
         if (domain === 'tasks') {
             return { headline: 'Task Flow', summary: 'Generated task workspace', variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
@@ -2807,6 +2861,41 @@ const UIEngine = {
                         <div class="notes-sub">${escapeHtml(summary)}</div>
                     </div>
                     <div class="notes-wall">${tiles || '<article class="notes-card"><div class="notes-card-text">No notes yet.</div></article>'}</div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'reminders') {
+            const info = core.info || {};
+            const lines = Array.isArray(info.lines) ? info.lines : [];
+            const isSet = String(info.op || '') === 'schedule_remind_once';
+            const isEmpty = lines.length === 0 ||
+                (lines.length === 1 && String(lines[0]).toLowerCase().includes('no'));
+            const rowsHtml = (isEmpty ? ['No active reminders'] : lines).map((line, idx) => {
+                const parts = String(line).split('|').map((s) => s.trim());
+                const isHeader = parts.length < 3;
+                const text  = isHeader ? String(line) : (parts[2] || parts[0]);
+                const isOnce = String(parts[1] || '').toLowerCase().includes('once');
+                const rid   = parts[4] || '';
+                return `<div class="reminders-row">
+                    <span class="reminders-row-index">${escapeHtml(String(idx + 1))}</span>
+                    ${!isHeader ? `<span class="reminders-row-badge ${isOnce ? 'once' : 'repeat'}">${isOnce ? 'once' : 'repeat'}</span>` : ''}
+                    <span class="reminders-row-text">${escapeHtml(text)}</span>
+                    ${rid ? `<button class="reminders-row-cancel" type="button" data-command="${escapeAttr(`cancel reminder ${rid}`)}" title="Cancel">✕</button>` : ''}
+                </div>`;
+            }).join('');
+            const ctaHtml = isSet
+                ? `<div class="reminders-cta"><button class="reminders-cta-link" type="button" data-command="show my reminders">view all reminders</button></div>`
+                : '';
+            return `<div class="scene scene-domain scene-reminders interactive">
+                <canvas class="scene-canvas domain-canvas" data-scene="reminders"
+                    data-count="${escapeAttr(String(lines.length))}"></canvas>
+                <div class="reminders-shell">
+                    <div class="reminders-header">
+                        <div class="reminders-title">scheduled reminders</div>
+                        <div class="reminders-count">${escapeHtml(isEmpty ? '0 active' : `${lines.length} active`)}</div>
+                    </div>
+                    <div class="reminders-list">${rowsHtml}</div>
+                    ${ctaHtml}
                 </div>
             </div>`;
         }

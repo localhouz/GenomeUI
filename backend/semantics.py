@@ -27,6 +27,8 @@ Intent priority
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -261,9 +263,9 @@ def _infer_shopping_category(lower: str) -> str:
 
 def _ext_weather(raw: str, lower: str) -> dict[str, Any] | None:
     location = _extract_location(raw, lower)
-    if not location:
-        return None
-    return {"location": location, "window": _extract_time_window(lower)}
+    # Default to current location rather than rejecting — any weather signal
+    # without an explicit place still implies "where I am now".
+    return {"location": location or "__current__", "window": _extract_time_window(lower)}
 
 
 def _ext_shopping(raw: str, lower: str) -> dict[str, Any] | None:
@@ -335,13 +337,16 @@ def _ext_social_feed(_raw: str, _lower: str) -> dict[str, Any] | None:
 
 def _ext_social_post(raw: str, _lower: str) -> dict[str, Any] | None:
     m = re.match(
-        r"^(?:post|tweet|share|send\s+a\s+(?:tweet|post|social\s+message))\s+"
-        r"(?:that\s+|this\s*:\s*|:\s*)?(.+)$",
+        r"^(?:post|tweet|share|send\s+a\s+(?:tweet|post|social\s+message))\s*[:\-]?\s*"
+        r"(?:that\s+|this\s*[:\-]\s*)?(.+)$",
         raw, re.IGNORECASE,
     )
     if not m:
         return None
-    return {"text": m.group(1).strip()[:280], "confirmed": False}
+    text = m.group(1).strip()
+    if not text or len(text) < 2:
+        return None
+    return {"text": text[:280], "confirmed": False}
 
 
 _MONEY_RE = re.compile(
@@ -432,9 +437,9 @@ def _ext_task_create(raw: str, lower: str) -> dict[str, Any] | None:
         r"^remember\s+to\s+(.+)$",
         r"^don'?t\s+(?:let\s+me\s+)?forget\s+to\s+(.+)$",
         r"^(?:i\s+)?(?:need|have|gotta|got(?:ta)?)\s+to\s+(.+)$",
-        r"^(?:add|create|make)\s+(?:a\s+)?(?:new\s+)?task\s+(?:to\s+|for\s+|called\s+)?(.+)$",
+        r"^(?:add|create|make)\s+(?:a\s+)?(?:new\s+)?task\s*[:\-]?\s*(?:to\s+|for\s+|called\s+)?(.+)$",
         r"^(?:can\s+you\s+)?(?:add|create|make)\s+(?:me\s+)?(?:a\s+)?(?:new\s+)?"
-        r"task\s+(?:to\s+|for\s+|called\s+)?(.+)$",
+        r"task\s*[:\-]?\s*(?:to\s+|for\s+|called\s+)?(.+)$",
         r"^(?:todo|to-do|task)\s*[:\-]\s*(.+)$",
         r"^i\s+(?:should|must|ought\s+to)\s+(?!be\b)(.+)$",
         r"^(?:put|add)\s+(?:on\s+my\s+(?:list|todo)|to\s+my\s+(?:list|todo))\s*[:\-]?\s*(.+)$",
@@ -493,7 +498,8 @@ def _ext_task_list(_raw: str, _lower: str) -> dict[str, Any] | None:
 
 def _ext_contacts(raw: str, _lower: str) -> dict[str, Any] | None:
     m = re.match(
-        r"^(?:find|search|look\s+up|get|show|what(?:'s|\s+is))\s+"
+        r"^(?:find|search|look\s+up|get|show|what(?:'s|\s+is)"
+        r"|how\s+do\s+i\s+(?:reach|contact|get\s+(?:in\s+touch\s+with|a\s+hold\s+of)))\s+"
         r"(?:(?:the\s+)?(?:contact|phone\s+number|email)\s+(?:for\s+|called\s+|named\s+)?)?(.+?)"
         r"(?:\s+(?:contact|number|email|phone))?$",
         raw, re.IGNORECASE,
@@ -504,6 +510,65 @@ def _ext_contacts(raw: str, _lower: str) -> dict[str, Any] | None:
     if not q or len(q) < 2:
         return None
     return {"query": q}
+
+
+def _ext_timer_start(_raw: str, lower: str) -> dict[str, Any] | None:
+    """Extract timer duration from 'set a timer for 5 minutes' or '30 second timer'."""
+    _UNITS = {"second": 1_000, "sec": 1_000, "minute": 60_000, "min": 60_000,
+              "hour": 3_600_000, "hr": 3_600_000}
+    # "for 5 minutes" / "in 5 minutes"
+    m = re.search(r"(?:for|in)\s+(\d+(?:\.\d+)?)\s+(second|sec|minute|min|hour|hr)s?\b", lower)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        return {"durationMs": max(1_000, int(val * _UNITS[unit]))}
+    # "30 second timer" / "5 minute timer"
+    m2 = re.search(r"(\d+(?:\.\d+)?)\s*(second|sec|minute|min|hour|hr)s?\s+(?:timer|countdown)\b", lower)
+    if m2:
+        val = float(m2.group(1))
+        unit = m2.group(2)
+        return {"durationMs": max(1_000, int(val * _UNITS[unit]))}
+    return None
+
+
+def _ext_calc(_raw: str, lower: str) -> dict[str, Any] | None:
+    """Extract a calculation expression."""
+    m = re.search(
+        r"(?:what(?:'s|\s+is)\s+|calculate\s+|compute\s+|eval(?:uate)?\s+)?"
+        r"([\d\s\+\-\*\/\(\)\.%]+(?:percent\s+of\s+[\d\.]+)?)",
+        lower,
+    )
+    if not m:
+        return None
+    expr = m.group(1).strip()
+    if len(expr) < 3 or not re.search(r"\d", expr):
+        return None
+    return {"expression": expr}
+
+
+def _ext_unit_convert(_raw: str, lower: str) -> dict[str, Any] | None:
+    """Extract unit conversion query."""
+    _UNITS = (r"miles?|km|kilometers?|meters?|feet|foot|inches?|pounds?|lbs?|"
+              r"kilograms?|kg|celsius|fahrenheit|gallons?|liters?|litres?|oz|ounces?|"
+              r"cups?|tbsp|tsp")
+    # Standard: "10 km to miles" / "convert 72 fahrenheit to celsius"
+    m = re.search(
+        r"(?:convert\s+|what\s+is\s+)?([\d\.]+)\s*"
+        r"(" + _UNITS + r")\s+(?:in|to|into|as)\s+(" + _UNITS + r")",
+        lower,
+    )
+    if m:
+        return {"amount": m.group(1), "from_unit": m.group(2), "to_unit": m.group(3),
+                "query": lower}
+    # Inverted: "how many miles is 10 km"
+    m2 = re.search(
+        r"how\s+many\s+(" + _UNITS + r")\s+is\s+([\d\.]+)\s*(" + _UNITS + r")",
+        lower,
+    )
+    if m2:
+        return {"amount": m2.group(2), "from_unit": m2.group(3), "to_unit": m2.group(1),
+                "query": lower}
+    return None
 
 
 def _ext_web_search(raw: str, _lower: str) -> dict[str, Any] | None:
@@ -565,6 +630,9 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "web_search":           _ext_web_search,
     "web_fetch":            _ext_web_fetch,
     "web_summarize":        _ext_web_summarize,
+    "timer_start":          _ext_timer_start,
+    "calc":                 _ext_calc,
+    "unit_convert":         _ext_unit_convert,
 }
 
 
@@ -604,10 +672,13 @@ TAXONOMY: dict[str, Intent] = {
                  "puma", "nike", "adidas", "reebok", "new balance", "asics", "converse",
                  "vans", "jordan", "under armour", "fila", "skechers",
                  "buy", "order", "purchase", "shop for"],
-        # Note/jot verbs and contact queries must not trigger shopping
+        # Note/jot verbs, task/reminder verbs, and contact queries must not trigger shopping
         blockers=["jot", "note that", "write down", "remember that", "log this",
                   "save this", "keep this", "jot down",
-                  "phone number", "number for", "email for", "contact"],
+                  "phone number", "number for", "email for", "contact",
+                  "remind me to", "remember to", "don't forget to", "dont forget to",
+                  "need to", "have to", "gotta", "i should", "i must",
+                  "log expense", "expense", "spent", "paid"],
         extractor="shopping",
         examples=["show me Nike running shoes size 10", "I want to buy a laptop",
                   "find me a black hoodie", "order some AirPods"],
@@ -652,7 +723,9 @@ TAXONOMY: dict[str, Intent] = {
         description="Look up a stock price or market data",
         signals=["stock", "shares", "ticker", "dow", "nasdaq", "nyse", "s&p", "sp500",
                  "aapl", "tsla", "goog", "googl", "msft", "amzn", "meta", "nvda",
-                 "amd", "nflx", "uber", "lyft", "market"],
+                 "amd", "nflx", "market"],
+        # Don't match expense phrases like "paid $15 for Uber"
+        blockers=["paid", "spent", "pay", "cost", "bought", "charged"],
         extractor="finance_stock",
         examples=["what's AAPL trading at", "Tesla stock price",
                   "how is the market today", "S&P 500 today"],
@@ -681,8 +754,8 @@ TAXONOMY: dict[str, Intent] = {
                  "bank statement", "account history"],
         extractor="banking_transactions",
         blockers=[],
-        examples=["show my recent transactions", "what did I buy this week",
-                  "my recent spending", "bank statement"],
+        examples=["show my recent transactions", "show my recent spending",
+                  "my recent charges", "bank statement"],
     ),
 
     "banking.balance": Intent(
@@ -754,7 +827,8 @@ TAXONOMY: dict[str, Intent] = {
         domain="notes",
         description="Save a note",
         signals=["jot", "note that", "write down", "remember that", "log this",
-                 "save this", "keep this"],
+                 "save this", "keep this", "add a note", "add note", "make a note",
+                 "make note"],
         extractor="note_create",
         examples=["jot this down: the API key expires in March",
                   "note that we need to revisit auth",
@@ -790,7 +864,7 @@ TAXONOMY: dict[str, Intent] = {
         domain="system",
         description="Show scheduled reminders",
         signals=["my reminders", "show reminders", "list reminders",
-                 "any reminders", "do i have reminders"],
+                 "any reminders", "do i have reminders", "what reminders"],
         extractor="reminder_list",
         examples=["show my reminders", "what reminders do I have",
                   "do I have any reminders"],
@@ -868,8 +942,8 @@ TAXONOMY: dict[str, Intent] = {
         signals=["contact", "contacts", "phone number", "email for", "number for",
                  "how do i reach", "how to contact"],
         extractor="contacts",
-        examples=["find John's phone number", "what's Sarah's email",
-                  "look up contact for Dr. Kim"],
+        examples=["find John's phone number", "look up contact for Dr. Kim",
+                  "how do I reach Mike"],
     ),
 
     # ── Web ───────────────────────────────────────────────────────────────
@@ -879,7 +953,6 @@ TAXONOMY: dict[str, Intent] = {
         domain="web",
         description="Summarize a web page",
         signals=["summarize", "tldr", "summary of"],
-        patterns=[r"https?://"],
         extractor="web_summarize",
         examples=["summarize https://example.com/article",
                   "tldr this: https://news.ycombinator.com"],
@@ -894,6 +967,47 @@ TAXONOMY: dict[str, Intent] = {
         patterns=[r"https?://"],
         extractor="web_fetch",
         examples=["fetch https://example.com", "open https://api.github.com/zen"],
+    ),
+
+    # ── Utility ───────────────────────────────────────────────────────────
+    "timer.start": Intent(
+        id="timer.start",
+        op="timer_start",
+        domain="system",
+        description="Set a countdown timer",
+        signals=["timer", "set a timer", "start a timer", "countdown"],
+        extractor="timer_start",
+        examples=["set a timer for 5 minutes", "start a 30 second timer",
+                  "timer for 1 hour"],
+    ),
+
+    "calc.evaluate": Intent(
+        id="calc.evaluate",
+        op="calc_evaluate",
+        domain="system",
+        description="Evaluate a math expression or percentage",
+        signals=["calculate", "compute", "what is", "how much is",
+                 "percent of", "% of"],
+        patterns=[r"what(?:'s|\s+is)\s+\d+.*[\+\-\*\/]"],
+        extractor="calc",
+        examples=["what is 15% of 120", "calculate 42 * 7",
+                  "how much is 250 / 5"],
+    ),
+
+    "unit.convert": Intent(
+        id="unit.convert",
+        op="unit_convert",
+        domain="system",
+        description="Convert between units of measurement",
+        signals=["convert", "how many", "how much is", "miles to km",
+                 "km to miles", "celsius to fahrenheit", "pounds to kg"],
+        patterns=[
+            r"\d+\s*(?:miles?|km|feet|lbs?|kg|celsius|fahrenheit|gallons?|liters?)\s+"
+            r"(?:in|to|into)\s+(?:miles?|km|feet|lbs?|kg|celsius|fahrenheit|gallons?|liters?)",
+        ],
+        extractor="unit_convert",
+        examples=["how many miles is 10 km", "convert 72 fahrenheit to celsius",
+                  "5 pounds in kg"],
     ),
 
     "web.search": Intent(
@@ -964,13 +1078,17 @@ def classify(text: str) -> IntentMatch | None:
 
     raw = _normalize(text)
     lower = raw.lower()
+    # Strip URLs before signal matching so words inside URLs (e.g. "news" in
+    # "news.ycombinator.com") don't accidentally trigger unrelated intents.
+    lower_no_url = re.sub(r"https?://\S+", "", lower).strip()
 
     for intent in TAXONOMY.values():
         # Skip if a blocker phrase is present
-        if _has_blocker(intent, lower):
+        if _has_blocker(intent, lower_no_url):
             continue
-        # Skip if no signal / pattern matched
-        if not _has_signal(intent, lower):
+        # Skip if no signal / pattern matched (use URL-stripped lower for signals
+        # so words inside URLs don't accidentally trigger unrelated intents)
+        if not _has_signal(intent, lower_no_url):
             # Intent with no signals and no patterns can't be activated
             if not intent.signals and not intent.patterns:
                 continue
@@ -993,4 +1111,72 @@ def classify(text: str) -> IntentMatch | None:
 def parse_semantic_command(text: str) -> "dict[str, Any] | None":
     """Drop-in replacement for the old monolithic parse_semantic_command in main.py."""
     match = classify(text)
+    return match.to_op_dict() if match else None
+
+
+# ─── Nous integration ─────────────────────────────────────────────────────────
+#
+# Set NOUS_URL=http://localhost:7700 to enable LLM-backed classification.
+# When set, classify_async() tries the Nous HTTP server first and falls back
+# to the rule-based classify() if Nous is unavailable or returns no match.
+#
+# Build and start the Nous server with:
+#   cd Nous/rust
+#   cargo run --bin nous-server --features http-api -- --model phi4-mini
+
+NOUS_URL: str = os.getenv("NOUS_URL", "")
+
+
+def _taxonomy_for_nous() -> list[dict[str, Any]]:
+    """Serialize TAXONOMY into the compact form nous-server expects."""
+    return [
+        {
+            "id": intent.id,
+            "op": intent.op,
+            "description": intent.description,
+            "examples": intent.examples[:3],  # keep payload small
+        }
+        for intent in TAXONOMY.values()
+    ]
+
+
+async def classify_async(text: str) -> IntentMatch | None:
+    """
+    Async variant of classify() that routes through Nous when available.
+
+    Resolution order:
+      1. Nous LLM (if NOUS_URL is set and server responds within 2 s)
+      2. Rule-based classify() as fallback
+
+    Returns an IntentMatch or None.
+    """
+    if NOUS_URL:
+        try:
+            import httpx  # already a project dependency (main.py uses it)
+
+            payload = {"text": text, "intents": _taxonomy_for_nous()}
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.post(f"{NOUS_URL}/api/classify", json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                op = data.get("op")
+                slots = data.get("slots") or {}
+                confidence = float(data.get("confidence", 0.0))
+                # Only accept if Nous is confident and the op maps to a known intent
+                if op and confidence >= 0.6:
+                    intent = next(
+                        (i for i in TAXONOMY.values() if i.op == op), None
+                    )
+                    if intent:
+                        return IntentMatch(intent=intent, payload=slots)
+        except Exception:
+            pass  # Nous down or timed out — fall through to rules
+
+    # Rule-based fallback (always works, zero latency)
+    return classify(text)
+
+
+async def parse_semantic_command_async(text: str) -> "dict[str, Any] | None":
+    """Async variant of parse_semantic_command; uses Nous when NOUS_URL is set."""
+    match = await classify_async(text)
     return match.to_op_dict() if match else None
