@@ -17051,7 +17051,13 @@ def parse_semantic_command(text: str) -> dict[str, Any] | None:
             location = candidate
     if not location and any(phrase in lower for phrase in ("where i am", "my location", "where am i", "here")):
         location = "__current__"
-    if not location and re.match(r"^(what(?:'s| is)|whats|show|check|get|tell me|how(?:'s| is)|weather|forecast|temperature)\b", lower):
+    if not location and re.match(r"^(what(?:'s| is|\s+(?:the|will|about)\b)|whats|show|check|get|tell me|how(?:'s| is|\s+will\b)|is\s+it\b|will\s+it\b|weather|forecast|temperature)\b", lower):
+        location = "__current__"
+    # Broader NL fallback: "what the weather this week", "is it gonna rain", etc.
+    if not location and re.match(r"^(what|how|is|will|gonna|going)\b", lower):
+        location = "__current__"
+    # Temporal fallback: any time reference without explicit location → current location.
+    if not location and re.search(r"\b(today|tonight|this\s+(?:evening|night|week|weekend|morning|afternoon)|tomorrow|next\s+week)\b", lower):
         location = "__current__"
     if not location:
         return None
@@ -17061,7 +17067,7 @@ def parse_semantic_command(text: str) -> dict[str, Any] | None:
         window = "tomorrow"
     elif re.search(r"\b(tonight|this\s+(?:evening|night))\b", lower):
         window = "tonight"
-    elif re.search(r"\b(this\s+week|next\s+week|weekend|7[\s\-]?day|weekly|extended|week(?:ly)?)\b", lower):
+    elif re.search(r"\b(this\s+week|next\s+week|weekend|7[\s\-]?day|weekly|extended|week(?:ly)?|this\s+weekend)\b", lower):
         window = "7day"
     return {"type": "weather_forecast", "domain": "weather", "payload": {"location": location, "window": window}}
 
