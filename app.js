@@ -2561,8 +2561,8 @@ const UIEngine = {
                     const itemUrl = String(item.url      || brandLink).trim();
                     const host    = String(item.sourceHost || '').trim();
                     return `
-                        <a class="shop-stage-tile" href="${escapeAttr(itemUrl)}" target="_blank" rel="noopener noreferrer">
-                            ${imgSrc ? `<img src="${escapeAttr(imgSrc)}" alt="${escapeAttr(ttl)}" loading="lazy" />` : '<div class="shop-stage-tile-img-fallback"></div>'}
+                        <a class="shop-stage-tile" href="${safeUrl(itemUrl)}" target="_blank" rel="noopener noreferrer">
+                            ${imgSrc ? `<img src="${safeUrl(imgSrc)}" alt="${escapeAttr(ttl)}" loading="lazy" />` : '<div class="shop-stage-tile-img-fallback"></div>'}
                             <div class="shop-stage-tile-text">
                                 <span class="shop-stage-tile-label">${escapeHtml(ttl)}</span>
                                 <span class="shop-stage-tile-price">${escapeHtml([prc, host].filter(Boolean).join(' | '))}</span>
@@ -2582,7 +2582,7 @@ const UIEngine = {
                         <div class="shop-brand-bar">
                             <div class="shop-brand-name">${escapeHtml(brandName)}</div>
                             ${fitSignal ? `<div class="shop-fit-signal">${escapeHtml(fitSignal)}</div>` : ''}
-                            <a class="scene-chip scene-chip-link shop-brand-cta" href="${escapeAttr(brandLink)}" target="_blank" rel="noopener noreferrer">
+                            <a class="scene-chip scene-chip-link shop-brand-cta" href="${safeUrl(brandLink)}" target="_blank" rel="noopener noreferrer">
                                 ${escapeHtml(brandLabel)}
                             </a>
                         </div>
@@ -2594,13 +2594,13 @@ const UIEngine = {
                         ${refineHtml ? `<div class="shop-refine-row">${refineHtml}</div>` : ''}
                         <div class="shop-stage-body">
                             <div class="shop-stage-hero">
-                                ${liveFrameUrl ? `<iframe class="shop-stage-live-frame" src="${escapeAttr(liveFrameUrl)}" title="${escapeAttr(`${brandName || 'brand'} live source`)}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>` : ''}
-                                ${heroImage ? `<img class="shop-stage-hero-fallback-image" src="${escapeAttr(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="lazy" />` : '<div class="shop-stage-hero-fallback"></div>'}
+                                ${liveFrameUrl ? `<iframe class="shop-stage-live-frame" src="${safeUrl(liveFrameUrl)}" title="${escapeAttr(`${brandName || 'brand'} live source`)}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>` : ''}
+                                ${heroImage ? `<img class="shop-stage-hero-fallback-image" src="${safeUrl(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="lazy" />` : '<div class="shop-stage-hero-fallback"></div>'}
                                 <div class="shop-stage-hero-tint"></div>
                                 <div class="shop-stage-hero-meta">
                                     <div class="shop-stage-hero-title">${escapeHtml(heroTitle)}</div>
                                     ${heroPrice ? `<div class="shop-stage-hero-price">${escapeHtml(heroPrice)}</div>` : ''}
-                                    <a class="shop-stage-open-live" href="${escapeAttr(heroUrl)}" target="_blank" rel="noopener noreferrer">open product</a>
+                                    <a class="shop-stage-open-live" href="${safeUrl(heroUrl)}" target="_blank" rel="noopener noreferrer">open product</a>
                                 </div>
                             </div>
                             <div class="shop-stage-rail">
@@ -2619,9 +2619,9 @@ const UIEngine = {
                 const host     = String(item.sourceHost || '').trim();
                 const sizeMod  = idx === 0 ? ' shop-card-featured' : (idx % 5 === 2 ? ' shop-card-tall' : '');
                 return `
-                    <a class="shop-card${sizeMod}" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">
+                    <a class="shop-card${sizeMod}" href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">
                         <div class="shop-image-wrap">
-                            ${imageUrl ? `<img class="shop-image" src="${escapeAttr(imageUrl)}" alt="${escapeAttr(title)}" loading="${idx < 3 ? 'eager' : 'lazy'}" />` : '<div class="shop-image-placeholder"></div>'}
+                            ${imageUrl ? `<img class="shop-image" src="${safeUrl(imageUrl)}" alt="${escapeAttr(title)}" loading="${idx < 3 ? 'eager' : 'lazy'}" />` : '<div class="shop-image-placeholder"></div>'}
                         </div>
                         <div class="shop-meta">
                             <div class="shop-title">${escapeHtml(title)}</div>
@@ -2641,7 +2641,7 @@ const UIEngine = {
                     <div class="scene-grid"></div>
                     <div class="scene-chip-row immersive-scene-head">
                         <div class="scene-chip">visual catalog</div>
-                        <a class="scene-chip scene-chip-link" href="${escapeAttr(brandLink)}" target="_blank" rel="noopener noreferrer">
+                        <a class="scene-chip scene-chip-link" href="${safeUrl(brandLink)}" target="_blank" rel="noopener noreferrer">
                             ${escapeHtml(brandLabel)}
                         </a>
                     </div>
@@ -2836,7 +2836,7 @@ const UIEngine = {
                             <span>${escapeHtml(String(Math.round(windMph)))} mph</span>
                             <span class="wh-sep">·</span>
                             <span>${escapeHtml(location)}</span>
-                            ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                            ${weatherTargetUrl ? `<a class="wh-link" href="${safeUrl(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
                         </div>
                     </div>
                     <div class="weather-forecast-strip">${forecastStrip}</div>
@@ -2903,7 +2903,7 @@ const UIEngine = {
                             <span>${escapeHtml(String(tmrWind))} mph</span>
                             <span class="wh-sep">·</span>
                             <span>${escapeHtml(String(tmrPrecip))}% rain</span>
-                            ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                            ${weatherTargetUrl ? `<a class="wh-link" href="${safeUrl(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
                         </div>
                     </div>
                     <div class="weather-forecast-strip">${tmrStrip}</div>
@@ -2950,7 +2950,7 @@ const UIEngine = {
                     <div class="wx7-header">
                         <div class="wx7-title">${escapeHtml(String(info.windowLabel || '7-day forecast'))}</div>
                         <div class="wx7-location">${escapeHtml(location)}</div>
-                        ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
+                        ${weatherTargetUrl ? `<a class="wh-link" href="${safeUrl(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
                     </div>
                     <div class="wx7-strip">${dayCards}</div>
                 </div>
@@ -3018,7 +3018,7 @@ const UIEngine = {
                     const hex   = teamHex(t);
                     const logo  = String(t.logo || '').trim();
                     const logoEl = logo
-                        ? `<img class="sp-bs-logo" src="${escapeAttr(logo)}" alt="${abbr}" onerror="this.style.display='none'">`
+                        ? `<img class="sp-bs-logo" src="${safeUrl(logo)}" alt="${abbr}" onerror="this.style.display='none'">`
                         : `<div class="sp-bs-logo-fb" style="${hex ? `background:#${hex}` : ''}">${abbr}</div>`;
                     const accentStyle = hex ? `style="--tc:#${hex}"` : '';
                     return `<div class="sp-bs-team sp-bs-${align}${winner ? ' sp-bs-winner' : ''}" ${accentStyle}>
@@ -3097,7 +3097,7 @@ const UIEngine = {
                     const hex = teamHex(t) || (side === 'away' ? '1a1a2e' : '0f2027');
                     const logoUrl = String(t.logo || '').trim();
                     const logoHtml = logoUrl
-                        ? `<img class="sp-duel-logo" src="${escapeAttr(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">`
+                        ? `<img class="sp-duel-logo" src="${safeUrl(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">`
                         : `<div class="sp-duel-abbr">${abbr}</div>`;
                     return `<div class="sp-duel-half sp-duel-${side}${winner ? ' sp-duel-winner' : ''}" style="--tc:#${hex}">
                         <div class="sp-duel-glow"></div>
@@ -3157,7 +3157,7 @@ const UIEngine = {
                     const borderSide = align === 'away' ? 'border-left' : 'border-right';
                     const borderStyle = hex ? `${borderSide}:3px solid #${hex}` : '';
                     return `<div class="sp-compact-team sp-compact-${align}${winner ? ' sp-compact-winner' : ''}" style="${borderStyle}">
-                        ${logoUrl ? `<img class="sp-compact-logo" src="${escapeAttr(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">` : ''}
+                        ${logoUrl ? `<img class="sp-compact-logo" src="${safeUrl(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">` : ''}
                         <span class="sp-compact-name">${name}</span>
                         ${score ? `<span class="sp-compact-score">${score}</span>` : ''}
                     </div>`;
@@ -3512,7 +3512,7 @@ const UIEngine = {
                 : '<p class="mcp-text-block mcp-empty">No text response from tool.</p>';
 
             const imgHtml = imageItems.map(img =>
-                `<img class="mcp-image" src="${escapeAttr(String(img.url || ''))}" alt="MCP image" loading="lazy" />`
+                `<img class="mcp-image" src="${safeUrl(String(img.url || ''))}" alt="MCP image" loading="lazy" />`
             ).join('');
 
             return `
@@ -3553,7 +3553,7 @@ const UIEngine = {
             const displayUrl = url ? safeHostname(url) : (isSearch ? 'web search' : '');
             const barText = isSearch ? `Search: ${String(info.query || '')}` : (title.slice(0, 80) || displayUrl);
             const faviconHtml = favicon
-                ? `<img class="webdeck-favicon" src="${escapeAttr(favicon)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+                ? `<img class="webdeck-favicon" src="${safeUrl(favicon)}" alt="" loading="lazy" onerror="this.style.display='none'">`
                 : '<div class="webdeck-favicon-fallback"></div>';
             const resultsHtml = isSearch
                 ? items.map((item) => {
@@ -3563,9 +3563,9 @@ const UIEngine = {
                     const itemHost = String(item.host || '').trim() || (itemUrl ? safeHostname(itemUrl) : '');
                     const itemThumb = String(item.thumbnail || '').trim();
                     const itemFav = String(item.favicon || '').trim();
-                    return `<a class="webdeck-result-card" href="${escapeAttr(itemUrl)}" target="_blank" rel="noopener noreferrer">
+                    return `<a class="webdeck-result-card" href="${safeUrl(itemUrl)}" target="_blank" rel="noopener noreferrer">
                         <div class="webdeck-result-media">
-                            ${itemThumb ? `<img class="webdeck-result-thumb" src="${escapeAttr(itemThumb)}" alt="${escapeAttr(itemTitle)}" loading="lazy" onerror="this.style.display='none'">` : `<div class="webdeck-result-thumb-fallback">${itemFav ? `<img class="webdeck-result-favicon" src="${escapeAttr(itemFav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}</div>`}
+                            ${itemThumb ? `<img class="webdeck-result-thumb" src="${safeUrl(itemThumb)}" alt="${escapeAttr(itemTitle)}" loading="lazy" onerror="this.style.display='none'">` : `<div class="webdeck-result-thumb-fallback">${itemFav ? `<img class="webdeck-result-favicon" src="${safeUrl(itemFav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}</div>`}
                         </div>
                         <div class="webdeck-result-title">${escapeHtml(itemTitle)}</div>
                         <div class="webdeck-result-host">${escapeHtml(itemHost)}</div>
@@ -3574,13 +3574,13 @@ const UIEngine = {
                 }).join('')
                 : (excerpt
                     ? `<div class="webdeck-page-preview">
-                        ${thumbnail ? `<img class="webdeck-page-hero" src="${escapeAttr(thumbnail)}" alt="${escapeAttr(title || 'Page preview')}" loading="lazy" onerror="this.style.display='none'">` : ''}
+                        ${thumbnail ? `<img class="webdeck-page-hero" src="${safeUrl(thumbnail)}" alt="${escapeAttr(title || 'Page preview')}" loading="lazy" onerror="this.style.display='none'">` : ''}
                         <div class="webdeck-page-text">${escapeHtml(excerpt.slice(0, 400))}</div>
                     </div>`
                     : '');
             const directBtn = siteTarget
-                ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(String(siteTarget.url || ''))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(siteTarget.label || 'Open source'))}</a>`
-                : (url ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open page</a>` : '');
+                ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${safeUrl(String(siteTarget.url || ''))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(siteTarget.label || 'Open source'))}</a>`
+                : (url ? `<a class="webdeck-direct-btn scene-chip scene-chip-link" href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">Open page</a>` : '');
             const mobileClass = isMobile ? ' webdeck-mobile' : '';
             const modeClass = isFullMode ? ' webdeck-full' : '';
             const sourceUrl = String(siteTarget?.url || url || '').trim();
@@ -3636,19 +3636,19 @@ const UIEngine = {
                 ? (isElectron
                     ? `
                                 <div class="webdeck-live-surface">
-                                    <webview class="webdeck-live-frame webdeck-webview" src="${escapeAttr(fullViewUrl)}" allowpopups partition="persist:genome-browser"></webview>
+                                    <webview class="webdeck-live-frame webdeck-webview" src="${safeUrl(fullViewUrl)}" allowpopups partition="persist:genome-browser"></webview>
                                     <div class="webdeck-live-meta">
                                         <span>live source: ${escapeHtml(safeHostname(fullViewUrl))}</span>
-                                        <a href="${escapeAttr(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
+                                        <a href="${safeUrl(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
                                     </div>
                                 </div>
                             `
                     : `
                                 <div class="webdeck-live-surface">
-                                    <iframe class="webdeck-live-frame" src="${escapeAttr(fullViewUrl)}" title="${escapeAttr(title || 'Web live surface')}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
+                                    <iframe class="webdeck-live-frame" src="${safeUrl(fullViewUrl)}" title="${escapeAttr(title || 'Web live surface')}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
                                     <div class="webdeck-live-meta">
                                         <span>live source: ${escapeHtml(safeHostname(fullViewUrl))}</span>
-                                        <a href="${escapeAttr(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
+                                        <a href="${safeUrl(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>
                                     </div>
                                 </div>
                             `)
@@ -3678,7 +3678,7 @@ const UIEngine = {
                             <div class="webdeck-inspector-card">
                                 <div class="webdeck-inspector-label">Source</div>
                                 <div class="webdeck-inspector-value">${escapeHtml(sourceHost || source || 'unknown')}</div>
-                                ${sourceUrl ? `<a class="webdeck-inspector-link" href="${escapeAttr(sourceUrl)}" target="_blank" rel="noopener noreferrer">open source</a>` : ''}
+                                ${sourceUrl ? `<a class="webdeck-inspector-link" href="${safeUrl(sourceUrl)}" target="_blank" rel="noopener noreferrer">open source</a>` : ''}
                             </div>
                             <div class="webdeck-inspector-card">
                                 <div class="webdeck-inspector-label">Hosts</div>
@@ -6840,6 +6840,26 @@ function escapeAttr(value) {
 // Sanitize a CSS color value before interpolating into a style attribute.
 // Only allows CSS variables, hex colors, rgb/rgba, and safe keywords.
 // Returns 'inherit' for anything that doesn't match — never raw user strings.
+// Validate URLs before use in href/src attributes, then HTML-escape the result.
+// escapeAttr() only escapes HTML entities — it cannot prevent javascript: URLs.
+// This function whitelists http/https/mailto/tel and returns '#' for everything
+// else so no code is executed on click.  It also HTML-escapes so it can be used
+// directly in template literals without a second escapeAttr() call.
+function safeUrl(value) {
+    const v = String(value || '').trim();
+    if (!v) return '#';
+    let safe;
+    try {
+        const u = new URL(v, location.href);
+        safe = (u.protocol === 'https:' || u.protocol === 'http:' ||
+                u.protocol === 'mailto:' || u.protocol === 'tel:') ? v : '#';
+    } catch (_) {
+        // relative path (no scheme) — allow; anything with an unknown scheme — block
+        safe = /^[a-z][a-z0-9+.-]*:/i.test(v) ? '#' : v;
+    }
+    return escapeAttr(safe);
+}
+
 function safeCssColor(value) {
     const v = String(value || '').trim();
     if (!v || v === 'inherit' || v === 'transparent' || v === 'currentColor') return v || 'inherit';
