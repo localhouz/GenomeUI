@@ -24,7 +24,7 @@ from .semantics import parse_semantic_command, parse_semantic_command_async, TAX
 from . import auth as _auth
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
@@ -32,9 +32,15 @@ from pydantic import BaseModel
 app = FastAPI(title="GenomeUI Backend", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:7700",   # Nous gateway (same machine)
+        "http://127.0.0.1:7700",
+    ],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Genome-Auth"],
+    allow_credentials=False,
 )
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -717,7 +723,8 @@ def normalize_device_id(value: str) -> str:
 
 
 def generate_session_id() -> str:
-    return str(uuid.uuid4())[:8]
+    # 128 bits of cryptographic randomness — not a truncated UUID
+    return secrets.token_urlsafe(16)
 
 
 def list_connector_manifests() -> list[dict[str, Any]]:
@@ -825,44 +832,60 @@ def normalize_connector_scope(value: str) -> str:
     return str(value or "").strip().lower()
 
 
-def connector_vault_key_bytes() -> bytes:
-    return hashlib.sha256(CONNECTOR_VAULT_KEY.encode("utf-8")).digest()
-
-
-def xor_stream_cipher(data: bytes, key: bytes, nonce: bytes) -> bytes:
-    out = bytearray()
-    counter = 0
-    while len(out) < len(data):
-        block = hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest()
-        out.extend(block)
-        counter += 1
-    return bytes(a ^ b for a, b in zip(data, out[: len(data)]))
+def _connector_aes_key() -> bytes:
+    """Return the AES-256 key for the connector vault, stored in the OS keychain.
+    Generated once and persisted; never written to disk in plaintext."""
+    import keyring as _kr
+    raw = _kr.get_password("GenomeUI", "_connector_vault_key")
+    if raw:
+        return base64.b64decode(raw)
+    key = secrets.token_bytes(32)
+    _kr.set_password("GenomeUI", "_connector_vault_key", base64.b64encode(key).decode())
+    return key
 
 
 def encrypt_connector_vault(payload: dict[str, Any]) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     plain = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    key = connector_vault_key_bytes()
-    nonce = secrets.token_bytes(16)
-    cipher = xor_stream_cipher(plain, key, nonce)
-    mac = hmac.new(key, nonce + cipher, digestmod=hashlib.sha256).digest()
+    key   = _connector_aes_key()
+    nonce = secrets.token_bytes(12)
+    ct    = AESGCM(key).encrypt(nonce, plain, None)
     return {
-        "version": 1,
-        "alg": "xor-sha256-hmac-v1",
+        "version": 2,
+        "alg": "aes-256-gcm-v1",
         "nonce": base64.b64encode(nonce).decode("ascii"),
-        "ct": base64.b64encode(cipher).decode("ascii"),
-        "mac": base64.b64encode(mac).decode("ascii"),
+        "ct":    base64.b64encode(ct).decode("ascii"),
     }
 
 
 def decrypt_connector_vault(blob: dict[str, Any]) -> dict[str, Any]:
-    nonce = base64.b64decode(str(blob.get("nonce", "")).encode("ascii"))
-    cipher = base64.b64decode(str(blob.get("ct", "")).encode("ascii"))
-    mac = base64.b64decode(str(blob.get("mac", "")).encode("ascii"))
-    key = connector_vault_key_bytes()
-    expected = hmac.new(key, nonce + cipher, digestmod=hashlib.sha256).digest()
-    if not hmac.compare_digest(mac, expected):
-        raise ValueError("connector vault integrity check failed")
-    plain = xor_stream_cipher(cipher, key, nonce)
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    alg = str(blob.get("alg", ""))
+
+    if alg == "aes-256-gcm-v1":
+        key   = _connector_aes_key()
+        nonce = base64.b64decode(str(blob.get("nonce", "")))
+        ct    = base64.b64decode(str(blob.get("ct", "")))
+        plain = AESGCM(key).decrypt(nonce, ct, None)
+
+    elif alg == "xor-sha256-hmac-v1":
+        # Legacy format — migrate transparently on next write
+        nonce  = base64.b64decode(str(blob.get("nonce", "")))
+        cipher = base64.b64decode(str(blob.get("ct", "")))
+        mac    = base64.b64decode(str(blob.get("mac", "")))
+        leg_key = hashlib.sha256(CONNECTOR_VAULT_KEY.encode()).digest()
+        expected = hmac.new(leg_key, nonce + cipher, digestmod=hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, expected):
+            raise ValueError("connector vault integrity check failed")
+        out, counter = bytearray(), 0
+        while len(out) < len(cipher):
+            out.extend(hashlib.sha256(leg_key + nonce + counter.to_bytes(4, "big")).digest())
+            counter += 1
+        plain = bytes(a ^ b for a, b in zip(cipher, out[:len(cipher)]))
+
+    else:
+        raise ValueError(f"unknown connector vault algorithm: {alg!r}")
+
     data = json.loads(plain.decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("connector vault payload invalid")
@@ -3278,14 +3301,21 @@ async def get_mock_contacts(query: str = Query(default="")) -> dict[str, Any]:
 
 
 @app.get("/api/connectors/secrets")
-async def get_connector_secrets() -> dict[str, Any]:
+async def get_connector_secrets(
+    x_genome_auth: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
     async with CONNECTOR_VAULT_LOCK:
         items = connector_secret_status(["banking.api.token", "social.api.token", "user.home.location"])
     return {"ok": True, "items": items}
 
 
 @app.post("/api/connectors/secrets")
-async def set_connector_secret(body: ConnectorSecretBody) -> dict[str, Any]:
+async def set_connector_secret(
+    body: ConnectorSecretBody,
+    x_genome_auth: str | None = Header(default=None),
+) -> dict[str, Any]:
     key = str(body.key or "").strip().lower()
     if key not in {"banking.api.token", "social.api.token", "user.home.location"}:
         raise HTTPException(status_code=400, detail="unsupported connector secret key")
@@ -7846,7 +7876,13 @@ async def ws_session(websocket: WebSocket):
 
 
 @app.post("/api/turn")
-async def turn(body: TurnBody) -> dict[str, Any]:
+async def turn(
+    body: TurnBody,
+    x_genome_auth: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     started_ms = now_ms()
     intent = (body.intent or "").strip()
     if not intent:
@@ -7862,11 +7898,15 @@ async def turn(body: TurnBody) -> dict[str, Any]:
             return reused
 
     # Nous gateway sits above this backend and pre-classifies every turn.
-    # body.nousIntent is injected by the gateway before forwarding — trust it first.
-    # Only fall back to classify_async (rule-based) if the gateway didn't supply a hint.
+    # body.nousIntent is injected by the gateway before forwarding.
+    # Validate the op against CAPABILITY_REGISTRY before trusting it —
+    # an unknown op string must not reach run_operation().
     nous_hint: dict[str, Any] | None = None
     if body.nousIntent and body.nousIntent.get("op"):
-        nous_hint = body.nousIntent
+        raw_op = str(body.nousIntent["op"]).strip().lower()
+        if raw_op in CAPABILITY_REGISTRY:
+            nous_hint = {**body.nousIntent, "op": raw_op}
+        # Unknown op from gateway: fall through to local classifier
     else:
         nous_match = await classify_async(intent)
         if nous_match:

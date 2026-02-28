@@ -52,9 +52,13 @@ const RemoteTurnService = {
     },
 
     async process(intent, sessionId, baseRevision, deviceId, onConflict = 'rebase_if_commutative', idempotencyKey = null) {
+        const authToken = sessionStorage.getItem('genome_session') || '';
         const response = await fetch(`/api/turn`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Genome-Auth': authToken,
+            },
             body: JSON.stringify({ intent, sessionId, baseRevision, deviceId, onConflict, idempotencyKey })
         });
 
