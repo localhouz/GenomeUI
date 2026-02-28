@@ -175,9 +175,179 @@ const UIEngine = {
         this.setConnectivity(typeof navigator?.onLine === 'boolean' ? navigator.onLine : true);
         this.bindEvents();
         this.updateShortcutHint();
+        await this.ensureAuth();
         await this.runBootSequence();
         this.showToast('Surface ready. Press ? for command help.', 'info', 3000);
     },
+
+    // ── Passkey Authentication ───────────────────────────────────────────────
+
+    async ensureAuth() {
+        // Check if auth is enabled on the backend
+        let status;
+        try {
+            const res = await fetch('/api/auth/status');
+            status = await res.json();
+        } catch {
+            return; // backend unreachable — allow through, WS will gate
+        }
+        if (!status.enabled) return;
+
+        // Auth is enabled — check for a live session token
+        const existing = sessionStorage.getItem('genome_session');
+        if (existing) return; // assume valid; WS close 4401 will re-trigger if expired
+
+        // Need to authenticate (or register for the first time)
+        return new Promise((resolve) => {
+            this._showAuthScreen(status.registered, resolve);
+        });
+    },
+
+    _showAuthScreen(registered, onSuccess) {
+        // Remove any existing auth overlay
+        document.getElementById('genome-auth-overlay')?.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'genome-auth-overlay';
+        overlay.className = 'auth-overlay';
+        overlay.innerHTML = `
+            <div class="auth-card">
+                <div class="auth-logo">
+                    <span class="auth-logo-g">G</span><span class="auth-logo-rest">enomeUI</span>
+                </div>
+                <div class="auth-headline">
+                    ${registered ? 'Welcome back' : 'Set up your passkey'}
+                </div>
+                <div class="auth-sub">
+                    ${registered
+                        ? 'Authenticate with your device to continue.'
+                        : 'Your private key stays on this device. No password required.'}
+                </div>
+                <button class="auth-btn" id="auth-action-btn">
+                    ${registered ? 'Authenticate' : 'Create passkey'}
+                </button>
+                <div class="auth-hint" id="auth-hint"></div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const btn  = overlay.querySelector('#auth-action-btn');
+        const hint = overlay.querySelector('#auth-hint');
+
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            btn.textContent = registered ? 'Waiting for device…' : 'Creating passkey…';
+            hint.textContent = '';
+            try {
+                const token = registered
+                    ? await this._authenticatePasskey()
+                    : await this._registerPasskey();
+                sessionStorage.setItem('genome_session', token);
+                overlay.classList.add('auth-overlay--done');
+                setTimeout(() => { overlay.remove(); onSuccess(); }, 400);
+            } catch (err) {
+                btn.disabled = false;
+                btn.textContent = registered ? 'Try again' : 'Retry';
+                hint.textContent = err.message || 'Authentication failed — please try again.';
+            }
+        });
+    },
+
+    async _registerPasskey() {
+        const res     = await fetch('/api/auth/register/begin', { method: 'POST' });
+        const options = await res.json();
+        const nonce   = options.nonce;
+
+        const createOpts = {
+            publicKey: {
+                ...options,
+                challenge:     this._fromB64url(options.challenge),
+                user: {
+                    ...options.user,
+                    id: this._fromB64url(options.user.id),
+                },
+                excludeCredentials: (options.excludeCredentials || []).map((c) => ({
+                    ...c, id: this._fromB64url(c.id),
+                })),
+            },
+        };
+        const credential = await navigator.credentials.create(createOpts);
+        const body = {
+            nonce,
+            credential: {
+                id:    credential.id,
+                rawId: this._b64url(credential.rawId),
+                type:  credential.type,
+                response: {
+                    clientDataJSON:    this._b64url(credential.response.clientDataJSON),
+                    attestationObject: this._b64url(credential.response.attestationObject),
+                },
+            },
+        };
+        const completeRes = await fetch('/api/auth/register/complete', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(body),
+        });
+        const data = await completeRes.json();
+        if (!data.ok) throw new Error(data.detail || 'Registration failed');
+        return data.sessionToken;
+    },
+
+    async _authenticatePasskey() {
+        const res     = await fetch('/api/auth/login/begin', { method: 'POST' });
+        if (res.status === 409) throw new Error('No passkey registered — reload and set up first.');
+        const options = await res.json();
+        const nonce   = options.nonce;
+
+        const getOpts = {
+            publicKey: {
+                ...options,
+                challenge:       this._fromB64url(options.challenge),
+                allowCredentials: (options.allowCredentials || []).map((c) => ({
+                    ...c, id: this._fromB64url(c.id),
+                })),
+            },
+        };
+        const assertion = await navigator.credentials.get(getOpts);
+        const body = {
+            nonce,
+            assertion: {
+                id:    assertion.id,
+                rawId: this._b64url(assertion.rawId),
+                type:  assertion.type,
+                response: {
+                    clientDataJSON:    this._b64url(assertion.response.clientDataJSON),
+                    authenticatorData: this._b64url(assertion.response.authenticatorData),
+                    signature:         this._b64url(assertion.response.signature),
+                    userHandle:        assertion.response.userHandle
+                        ? this._b64url(assertion.response.userHandle)
+                        : null,
+                },
+            },
+        };
+        const completeRes = await fetch('/api/auth/login/complete', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(body),
+        });
+        const data = await completeRes.json();
+        if (!data.ok) throw new Error(data.detail || 'Authentication failed');
+        return data.sessionToken;
+    },
+
+    _b64url(buf) {
+        return btoa(String.fromCharCode(...new Uint8Array(buf)))
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    },
+
+    _fromB64url(s) {
+        s = s.replace(/-/g, '+').replace(/_/g, '/');
+        while (s.length % 4) s += '=';
+        return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    },
+
+    // ────────────────────────────────────────────────────────────────────────
 
     async primeRelativeLocationContext() {
         // Always try GPS — it's more accurate than IP geolocation.
@@ -583,7 +753,8 @@ const UIEngine = {
             this._ws = null;
         }
 
-        const wsUrl = `ws://${location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`;
+        const authToken = sessionStorage.getItem('genome_session') || '';
+        const wsUrl = `ws://${location.host}/ws?sessionId=${encodeURIComponent(sessionId)}&authToken=${encodeURIComponent(authToken)}`;
         const ws = new WebSocket(wsUrl);
         this._ws = ws;
 
@@ -597,6 +768,11 @@ const UIEngine = {
         ws.onmessage = (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                if (payload.type === 'auth_required') {
+                    sessionStorage.removeItem('genome_session');
+                    this.ensureAuth().then(() => this.openWebSocketSync());
+                    return;
+                }
                 this.applyRemoteSync(payload);
                 this.setConnectivity(true);
             } catch {
@@ -2275,6 +2451,54 @@ const UIEngine = {
                 info: { serverName, toolName, content, textItems, imageItems, matchScore: latest.matchScore || 0 },
             };
         }
+        // ── Computer layer ops ─────────────────────────────────────────────────
+        {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const action = String(d.action || '').trim();
+            const name   = String(d.name   || '').trim();
+            const topic  = String(d.topic  || '').trim();
+            if (['document_create', 'document_edit'].includes(latest.op)) {
+                return { headline: name || topic || (action === 'edit' ? 'Edit document' : 'New document'), summary: action || 'document', variant: 'result', kind: 'document', theme: 'theme-document', info: d };
+            }
+            if (['spreadsheet_create', 'spreadsheet_edit'].includes(latest.op)) {
+                return { headline: name || (action === 'edit' ? 'Edit spreadsheet' : 'New spreadsheet'), summary: action || 'spreadsheet', variant: 'result', kind: 'spreadsheet', theme: 'theme-spreadsheet', info: d };
+            }
+            if (['presentation_create', 'presentation_edit'].includes(latest.op)) {
+                const slides = d.slides ? `${d.slides} slides` : '';
+                return { headline: name || topic || (action === 'edit' ? 'Edit presentation' : 'New presentation'), summary: [action, slides].filter(Boolean).join(' · ') || 'presentation', variant: 'result', kind: 'presentation', theme: 'theme-presentation', info: d };
+            }
+            if (['code_create', 'code_edit', 'code_explain', 'code_debug', 'code_run'].includes(latest.op)) {
+                const language = String(d.language || '').trim();
+                return { headline: name || topic || action || 'code', summary: [language, action].filter(Boolean).join(' · ') || 'code', variant: 'result', kind: 'code', theme: 'theme-code', info: d };
+            }
+            if (latest.op === 'terminal_run') {
+                const command = String(d.command || '').trim();
+                return { headline: command || 'terminal', summary: 'shell', variant: 'result', kind: 'terminal', theme: 'theme-terminal', info: d };
+            }
+            if (['calendar_create', 'calendar_list', 'calendar_cancel'].includes(latest.op)) {
+                const title = String(d.title || '').trim();
+                const date  = String(d.date  || '').trim();
+                return { headline: title || action || 'calendar', summary: date || 'calendar', variant: 'result', kind: 'calendar', theme: 'theme-calendar', info: d };
+            }
+            if (['email_compose', 'email_read', 'email_reply', 'email_search'].includes(latest.op)) {
+                const to      = String(d.to      || '').trim();
+                const subject = String(d.subject || d.query || '').trim();
+                return { headline: (action === 'compose' || action === 'reply') ? (to ? `→ ${to}` : 'compose') : (subject || 'inbox'), summary: action || 'email', variant: 'result', kind: 'email', theme: 'theme-email', info: d };
+            }
+            if (['content_find', 'content_list', 'content_history', 'content_branch', 'content_revert', 'content_share'].includes(latest.op)) {
+                const type = String(d.type || '').trim();
+                return { headline: name || action || 'content', summary: [type, action].filter(Boolean).join(' · ') || 'content', variant: 'result', kind: 'content', theme: 'theme-content', info: d };
+            }
+        }
+        // ── Computer domain fallbacks (when latest.ok but op not specifically mapped) ──
+        if (domain === 'document')     return { headline: 'Document',     summary: 'Generated document workspace',     variant: 'result', kind: 'document',     theme: 'theme-document'     };
+        if (domain === 'spreadsheet')  return { headline: 'Spreadsheet',  summary: 'Generated spreadsheet workspace',  variant: 'result', kind: 'spreadsheet',  theme: 'theme-spreadsheet'  };
+        if (domain === 'presentation') return { headline: 'Presentation', summary: 'Generated presentation workspace', variant: 'result', kind: 'presentation', theme: 'theme-presentation' };
+        if (domain === 'code')         return { headline: 'Code',         summary: 'Generated code workspace',         variant: 'result', kind: 'code',         theme: 'theme-code'         };
+        if (domain === 'terminal')     return { headline: 'Terminal',     summary: 'Shell workspace',                  variant: 'result', kind: 'terminal',     theme: 'theme-terminal'     };
+        if (domain === 'calendar')     return { headline: 'Calendar',     summary: 'Generated calendar workspace',     variant: 'result', kind: 'calendar',     theme: 'theme-calendar'     };
+        if (domain === 'email')        return { headline: 'Email',        summary: 'Generated email workspace',        variant: 'result', kind: 'email',        theme: 'theme-email'        };
+        if (domain === 'content')      return { headline: 'Content',      summary: 'Generated content workspace',      variant: 'result', kind: 'content',      theme: 'theme-content'      };
         return { headline: summary, summary: fallbackSummary, variant: 'result', kind: 'generic', theme: 'theme-neutral' };
     },
 
@@ -3459,6 +3683,268 @@ const UIEngine = {
                 </div>
             </div>`;
         }
+        // ── Computer layer scenes ──────────────────────────────────────────────
+        if (core.kind === 'document') {
+            const info   = core.info || {};
+            const action = String(info.action || 'create').trim();
+            const name   = String(info.name  || '').trim();
+            const topic  = String(info.topic || '').trim();
+            const title  = name || topic || (action === 'edit' ? 'Existing Document' : 'New Document');
+            const lineSizes = [0.85, 0.62, 0.78, 0, 0.70, 0.88, 0.45, 0, 0.75, 0.60];
+            const docLines  = lineSizes.map((w) => w === 0
+                ? '<div class="doc-line gap"></div>'
+                : `<div class="doc-line"><span style="width:${(w * 100).toFixed(0)}%"></span></div>`).join('');
+            return `<div class="scene scene-computer scene-document interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="document"></canvas>
+                <div class="doc-shell">
+                    <div class="doc-header">
+                        <div class="doc-action-badge">${escapeHtml(action)}</div>
+                        <div class="doc-title">${escapeHtml(title)}</div>
+                        ${topic && name ? `<div class="doc-topic">${escapeHtml(topic)}</div>` : ''}
+                    </div>
+                    <div class="doc-page">
+                        <div class="doc-page-title">${escapeHtml(title)}</div>
+                        <div class="doc-page-lines">${docLines}</div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'spreadsheet') {
+            const info   = core.info || {};
+            const action = String(info.action || 'create').trim();
+            const name   = String(info.name   || 'New Spreadsheet').trim();
+            const cols   = ['A', 'B', 'C', 'D', 'E'];
+            const rows   = [['Category','Q1','Q2','Q3','Q4'],['Revenue','—','—','—','—'],['Expenses','—','—','—','—'],['Profit','—','—','—','—']];
+            const hdrHtml = ['', ...cols].map((c) => `<div class="ss-cell ss-head">${escapeHtml(c)}</div>`).join('');
+            const rowsHtml = rows.map((row, ri) => `<div class="ss-row"><div class="ss-cell ss-rownum">${ri + 1}</div>${row.map((cell, ci) => `<div class="ss-cell ${ri === 0 || ci === 0 ? 'ss-label' : ''}">${escapeHtml(cell)}</div>`).join('')}</div>`).join('');
+            return `<div class="scene scene-computer scene-spreadsheet interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="spreadsheet"></canvas>
+                <div class="ss-shell">
+                    <div class="ss-header">
+                        <div class="ss-action-badge">${escapeHtml(action)}</div>
+                        <div class="ss-title">${escapeHtml(name)}</div>
+                    </div>
+                    <div class="ss-table">
+                        <div class="ss-col-headers">${hdrHtml}</div>
+                        ${rowsHtml}
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'presentation') {
+            const info   = core.info || {};
+            const action = String(info.action || 'create').trim();
+            const name   = String(info.name   || '').trim();
+            const topic  = String(info.topic  || '').trim();
+            const slides = Number(info.slides || 8);
+            const title  = name || topic || 'New Presentation';
+            const thumbs = Array.from({ length: Math.min(slides, 6) }, (_, i) => `
+                <div class="pres-thumb ${i === 0 ? 'active' : ''}">
+                    <div class="pres-thumb-inner"><div class="pres-thumb-line l1"></div><div class="pres-thumb-line l2"></div><div class="pres-thumb-line l3"></div></div>
+                    <div class="pres-thumb-num">${i + 1}</div>
+                </div>`).join('');
+            return `<div class="scene scene-computer scene-presentation interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="presentation"></canvas>
+                <div class="pres-shell">
+                    <div class="pres-filmstrip">${thumbs}</div>
+                    <div class="pres-stage">
+                        <div class="pres-slide">
+                            <div class="pres-slide-eyebrow">${escapeHtml(action)} · ${escapeHtml(String(slides))} slides</div>
+                            <div class="pres-slide-title">${escapeHtml(title)}</div>
+                            <div class="pres-slide-sub">${escapeHtml(topic || 'Generated presentation')}</div>
+                            <div class="pres-slide-lines"><div class="pres-slide-line"></div><div class="pres-slide-line short"></div><div class="pres-slide-line"></div></div>
+                        </div>
+                    </div>
+                    <div class="pres-controls">
+                        <div class="pres-action-badge">${escapeHtml(action)}</div>
+                        <div class="pres-count">${escapeHtml(String(slides))} slides</div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'code') {
+            const info     = core.info || {};
+            const action   = String(info.action   || 'create').trim();
+            const language = String(info.language || '').trim();
+            const topic    = String(info.topic    || '').trim();
+            const name     = String(info.name     || '').trim();
+            const fname    = name || topic || 'untitled';
+            const fakeCode = [
+                `<span class="ck">function</span> <span class="cf">${escapeHtml(name || 'main')}</span>() {`,
+                `  <span class="ck">const</span> result = <span class="cf">initialize</span>()`,
+                `  <span class="ck">if</span> (result.<span class="cp">ok</span>) {`,
+                `    <span class="cf">process</span>(result.<span class="cp">data</span>)`,
+                `    <span class="ck">return</span> <span class="cs">'success'</span>`,
+                `  }`,
+                `  <span class="ck">return</span> <span class="cs">'error'</span>`,
+                `}`,
+            ].map((src, i) => `<div class="code-line"><span class="code-lnum">${i + 1}</span><span class="code-src">${src}</span></div>`).join('');
+            const actionLabel = action === 'explain' ? '// explaining' : action === 'debug' ? '// debugging' : action === 'run' ? '// running' : `// ${action}`;
+            return `<div class="scene scene-computer scene-code interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="code"></canvas>
+                <div class="code-shell">
+                    <div class="code-header">
+                        <div class="code-dots"><span></span><span></span><span></span></div>
+                        ${language ? `<div class="code-lang-badge">${escapeHtml(language)}</div>` : ''}
+                        <div class="code-action-badge">${escapeHtml(action)}</div>
+                        <div class="code-filename">${escapeHtml(fname.slice(0, 40))}</div>
+                    </div>
+                    <div class="code-editor">
+                        ${fakeCode}
+                        <div class="code-status-line">
+                            <span class="code-status-action">${escapeHtml(actionLabel)}</span>
+                            ${topic ? `<span class="code-status-topic">${escapeHtml(topic.slice(0, 60))}</span>` : ''}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'terminal') {
+            const info    = core.info || {};
+            const command = String(info.command || '').trim();
+            const outLines = ['Initializing session...', 'Environment ready'].map((l) => `<div class="term-output-line">${escapeHtml(l)}</div>`).join('');
+            return `<div class="scene scene-computer scene-terminal interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="terminal"></canvas>
+                <div class="term-shell">
+                    <div class="term-bar">
+                        <div class="term-dots"><span class="term-dot red"></span><span class="term-dot yellow"></span><span class="term-dot green"></span></div>
+                        <div class="term-title">terminal</div>
+                    </div>
+                    <div class="term-body">
+                        ${outLines}
+                        <div class="term-prompt-line">
+                            <span class="term-prompt">$ </span>
+                            <span class="term-cmd">${escapeHtml(command)}</span>
+                            <span class="term-cursor"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'calendar') {
+            const info   = core.info || {};
+            const action = String(info.action || 'list').trim();
+            const title  = String(info.title  || '').trim();
+            const date   = String(info.date   || 'today').trim();
+            const isCreate = action === 'create';
+            const isCancel = action === 'cancel';
+            const agendaItems = [
+                { time: '9:00 AM',  label: 'Team standup',  dot: 'blue'   },
+                { time: '11:00 AM', label: 'Design review',  dot: 'purple' },
+                { time: '2:00 PM',  label: title || 'New event', dot: 'green'  },
+                { time: '4:30 PM',  label: 'Wrap-up sync',  dot: 'blue'   },
+            ];
+            const agendaHtml = agendaItems.map((item, i) => `
+                <div class="cal-item ${i === 2 ? 'cal-item-focus' : ''}">
+                    <div class="cal-item-time">${escapeHtml(item.time)}</div>
+                    <div class="cal-item-dot ${escapeAttr(item.dot)}"></div>
+                    <div class="cal-item-title">${escapeHtml(item.label)}</div>
+                </div>`).join('');
+            return `<div class="scene scene-computer scene-calendar interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="calendar"></canvas>
+                <div class="cal-shell">
+                    <div class="cal-header">
+                        <div class="cal-action-badge ${isCancel ? 'cancel' : ''}">${escapeHtml(action)}</div>
+                        <div class="cal-date">${escapeHtml(date)}</div>
+                    </div>
+                    ${isCreate ? `<div class="cal-event-card">
+                        <div class="cal-event-title">${escapeHtml(title || 'New Event')}</div>
+                        <div class="cal-event-meta">${escapeHtml(date)}</div>
+                        <div class="cal-event-status">generating event...</div>
+                    </div>` : ''}
+                    <div class="cal-agenda">${agendaHtml}</div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'email') {
+            const info    = core.info || {};
+            const action  = String(info.action  || 'read').trim();
+            const to      = String(info.to      || '').trim();
+            const subject = String(info.subject || '').trim();
+            const from    = String(info['from'] || '').trim();
+            const query   = String(info.query   || '').trim();
+            const isCompose = action === 'compose' || action === 'reply';
+            const fakeInbox = [
+                { from: 'Sarah M.',          subject: 'Re: Project update', preview: "Looks great, let's sync...", time: '10:42 AM', unread: true  },
+                { from: 'Team Alerts',       subject: 'Daily digest',        preview: 'Here is your summary...',  time: '8:01 AM',  unread: false },
+                { from: from || 'Mike T.',   subject: subject || query || 'Meeting notes', preview: 'Attached are the notes...', time: 'Yesterday', unread: action === 'reply' },
+            ];
+            const inboxHtml = fakeInbox.map((msg, i) => `
+                <div class="email-msg ${msg.unread ? 'unread' : ''} ${i === 2 ? 'focused' : ''}">
+                    <div class="email-msg-from">${escapeHtml(msg.from)}</div>
+                    <div class="email-msg-subject">${escapeHtml(msg.subject)}</div>
+                    <div class="email-msg-preview">${escapeHtml(msg.preview)}</div>
+                    <div class="email-msg-time">${escapeHtml(msg.time)}</div>
+                </div>`).join('');
+            const composeHtml = `<div class="email-compose">
+                <div class="email-field"><span class="email-field-label">To</span><span class="email-field-value">${escapeHtml(to || '...')}</span></div>
+                <div class="email-field"><span class="email-field-label">Subject</span><span class="email-field-value">${escapeHtml(subject || '...')}</span></div>
+                <div class="email-divider"></div>
+                <div class="email-body-lines">
+                    <div class="email-body-line long"></div><div class="email-body-line mid"></div>
+                    <div class="email-body-line long"></div><div class="email-body-line short"></div>
+                </div></div>`;
+            return `<div class="scene scene-computer scene-email interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="email"></canvas>
+                <div class="email-shell">
+                    <div class="email-sidebar">
+                        <div class="email-folder ${!isCompose ? 'active' : ''}">Inbox</div>
+                        <div class="email-folder">Sent</div>
+                        <div class="email-folder ${isCompose ? 'active' : ''}">Drafts</div>
+                    </div>
+                    <div class="email-main">
+                        <div class="email-header">
+                            <div class="email-action-badge">${escapeHtml(action)}</div>
+                            ${query ? `<div class="email-query">"${escapeHtml(query)}"</div>` : ''}
+                        </div>
+                        ${isCompose ? composeHtml : `<div class="email-inbox">${inboxHtml}</div>`}
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'content') {
+            const info     = core.info || {};
+            const action   = String(info.action || 'find').trim();
+            const name     = String(info.name   || '').trim();
+            const type     = String(info.type   || '').trim();
+            const isHistory = ['history', 'branch', 'revert'].includes(action);
+            const listItems = [
+                { name: name || 'Q4 Report',       type: type || 'document',     ver: 'v3', time: '2h ago'   },
+                { name: 'Budget 2026',             type: 'spreadsheet',           ver: 'v7', time: 'yesterday'},
+                { name: 'Product Roadmap',         type: 'presentation',          ver: 'v2', time: '3d ago'  },
+            ];
+            const histItems = [
+                { ver: 'HEAD', msg: 'Latest revision',         time: 'now',       current: true  },
+                { ver: 'v3',   msg: 'Updated section 2',       time: '2h ago',    current: false },
+                { ver: 'v2',   msg: 'Added executive summary', time: 'yesterday', current: false },
+                { ver: 'v1',   msg: 'Initial draft',           time: '3d ago',    current: false },
+            ];
+            const listHtml = listItems.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${escapeAttr(item.type)}"></div>
+                    <div class="cnt-item-name">${escapeHtml(item.name)}</div>
+                    <div class="cnt-item-type">${escapeHtml(item.type)}</div>
+                    <div class="cnt-item-ver">${escapeHtml(item.ver)}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.time)}</div>
+                </div>`).join('');
+            const histHtml = histItems.map((item) => `
+                <div class="cnt-hist-item ${item.current ? 'current' : ''}">
+                    <div class="cnt-hist-ver">${escapeHtml(item.ver)}</div>
+                    <div class="cnt-hist-msg">${escapeHtml(item.msg)}</div>
+                    <div class="cnt-hist-time">${escapeHtml(item.time)}</div>
+                </div>`).join('');
+            return `<div class="scene scene-computer scene-content interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="content"></canvas>
+                <div class="cnt-shell">
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">${escapeHtml(action)}</div>
+                        ${type ? `<div class="cnt-type-badge">${escapeHtml(type)}</div>` : ''}
+                        ${name ? `<div class="cnt-name">${escapeHtml(name)}</div>` : ''}
+                    </div>
+                    ${isHistory ? `<div class="cnt-history">${histHtml}</div>` : `<div class="cnt-list">${listHtml}</div>`}
+                </div>
+            </div>`;
+        }
         const intent = this.humanizeIntentLabel((envelope?.raw || this.state.session.lastIntent || '').trim());
         return `
             <div class="scene scene-generic">
@@ -3505,6 +3991,14 @@ const UIEngine = {
         if (core.kind === 'expenses') return 'Spend Dynamics + Distribution';
         if (core.kind === 'notes') return 'Knowledge Fragments + Context';
         if (core.kind === 'graph') return 'Relationship Topology + Guidance';
+        if (core.kind === 'document')     return 'Document + Generation Context';
+        if (core.kind === 'spreadsheet')  return 'Spreadsheet + Data Structure';
+        if (core.kind === 'presentation') return 'Presentation + Slide Architecture';
+        if (core.kind === 'code')         return 'Code + Execution Context';
+        if (core.kind === 'terminal')     return 'Terminal + Shell Environment';
+        if (core.kind === 'calendar')     return 'Calendar + Time Context';
+        if (core.kind === 'email')        return 'Email + Communication Layer';
+        if (core.kind === 'content')      return 'Content Graph + Version History';
         const intent = String(envelope?.surfaceIntent?.raw || '').trim();
         return intent ? `Intent Lens: ${intent.slice(0, 48)}` : (latest.message || 'Intent + State');
     },
@@ -3691,6 +4185,8 @@ const UIEngine = {
             this._sceneRenderer = this.makeMcpRenderer(canvas);
         } else if (scene === 'sports') {
             this._sceneRenderer = this.makeSportsRenderer(canvas);
+        } else if (['document','spreadsheet','presentation','code','terminal','calendar','email','content'].includes(scene)) {
+            this._sceneRenderer = this.makeComputerRenderer(canvas);
         } else {
             this._sceneRenderer = this.makeGenericRenderer(canvas);
         }
@@ -3853,6 +4349,124 @@ const UIEngine = {
             ctx.fillRect(0, 0, w, h);
         };
     },
+    makeComputerRenderer(canvas) {
+        const scene = String(canvas.dataset.scene || 'document');
+        const THEMES = {
+            document:     [96,  128, 196],
+            spreadsheet:  [48,  160, 120],
+            presentation: [140,  96, 220],
+            code:         [64,  180, 200],
+            terminal:     [48,  200,  80],
+            calendar:     [80,  160, 240],
+            email:        [100, 140, 200],
+            content:      [120,  80, 240],
+        };
+        const [r, g, b] = THEMES[scene] || THEMES.document;
+        const nodes = scene === 'content' ? Array.from({ length: 18 }, (_, i) => ({
+            x: ((i * 1973 + 83) % 9973) / 9973, y: ((i * 2741 + 17) % 9871) / 9871,
+            vx: (((i * 137) % 100) - 50) * 0.00018, vy: (((i * 251) % 100) - 50) * 0.00018,
+        })) : [];
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            // Base dark gradient
+            const bg = ctx.createLinearGradient(0, 0, w * 0.3, h);
+            bg.addColorStop(0, `rgba(${r * 0.08 | 0}, ${g * 0.08 | 0}, ${b * 0.12 | 0}, 1)`);
+            bg.addColorStop(1, `rgba(6, 8, 14, 1)`);
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Scene-specific texture
+            if (scene === 'document') {
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.04)`;
+                ctx.lineWidth = 1;
+                for (let y = 22; y < h; y += 22) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.07)`;
+                ctx.beginPath(); ctx.moveTo(48, 0); ctx.lineTo(48, h); ctx.stroke();
+            } else if (scene === 'spreadsheet') {
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.06)`;
+                ctx.lineWidth = 0.5;
+                for (let x = 0; x < w; x += 80) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+                for (let y = 0; y < h; y += 24) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+            } else if (scene === 'presentation') {
+                const cx = w * 0.6, cy = h * 0.45;
+                const pulse = 0.04 + Math.sin(t * 0.5) * 0.015;
+                const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, w * 0.4);
+                glow.addColorStop(0, `rgba(${r},${g},${b},${pulse * 2})`);
+                glow.addColorStop(1, `rgba(${r},${g},${b},0)`);
+                ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.1)`;
+                ctx.lineWidth = 1;
+                ctx.strokeRect(cx - w * 0.28, cy - h * 0.2, w * 0.56, h * 0.4);
+            } else if (scene === 'code') {
+                const bands = [0.15, 0.32, 0.50, 0.67, 0.84];
+                bands.forEach((yf, i) => {
+                    const a = 0.02 + Math.sin(t * 0.35 + i) * 0.008;
+                    ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+                    ctx.fillRect(0, h * yf, w * (0.38 + ((i * 37) % 40) / 100), 12);
+                });
+                ctx.strokeStyle = 'rgba(0,0,0,0.07)';
+                ctx.lineWidth = 1;
+                for (let y = 0; y < h; y += 3) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+            } else if (scene === 'terminal') {
+                ctx.strokeStyle = 'rgba(0,0,0,0.16)';
+                ctx.lineWidth = 1;
+                for (let y = 0; y < h; y += 3) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+                const glow = ctx.createLinearGradient(0, h * 0.65, 0, h);
+                glow.addColorStop(0, `rgba(${r},${g},${b},0)`);
+                glow.addColorStop(1, `rgba(${r},${g},${b},0.07)`);
+                ctx.fillStyle = glow; ctx.fillRect(0, h * 0.65, w, h * 0.35);
+            } else if (scene === 'calendar') {
+                const hour = new Date().getHours();
+                const dp = Math.max(0, Math.min(1, (hour - 6) / 16));
+                const glow = ctx.createRadialGradient(w * 0.5, h, 0, w * 0.5, h, w * 0.75);
+                glow.addColorStop(0, `rgba(${80 + dp * 60 | 0},${120 + dp * 30 | 0},${240 - dp * 80 | 0},0.1)`);
+                glow.addColorStop(1, `rgba(${r},${g},${b},0)`);
+                ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.05)`;
+                ctx.lineWidth = 0.5;
+                for (let i = 0; i <= 24; i++) {
+                    const x = (i / 24) * w;
+                    ctx.beginPath(); ctx.moveTo(x, h * 0.88); ctx.lineTo(x, h); ctx.stroke();
+                }
+            } else if (scene === 'email') {
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.05)`;
+                ctx.lineWidth = 0.5;
+                for (let y = 48; y < h; y += 48) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+            } else if (scene === 'content') {
+                nodes.forEach((n) => {
+                    n.x += n.vx; n.y += n.vy;
+                    if (n.x < 0) n.x = 1; if (n.x > 1) n.x = 0;
+                    if (n.y < 0) n.y = 1; if (n.y > 1) n.y = 0;
+                });
+                ctx.strokeStyle = `rgba(${r},${g},${b},0.08)`;
+                ctx.lineWidth = 0.5;
+                for (let i = 0; i < nodes.length; i++) {
+                    for (let j = i + 1; j < nodes.length; j++) {
+                        const dx = (nodes[i].x - nodes[j].x) * w, dy = (nodes[i].y - nodes[j].y) * h;
+                        if (Math.sqrt(dx * dx + dy * dy) < w * 0.22) {
+                            ctx.beginPath(); ctx.moveTo(nodes[i].x * w, nodes[i].y * h); ctx.lineTo(nodes[j].x * w, nodes[j].y * h); ctx.stroke();
+                        }
+                    }
+                }
+                nodes.forEach((n, i) => {
+                    const a = 0.28 + Math.sin(t * 0.8 + i * 0.5) * 0.14;
+                    ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+                    ctx.beginPath(); ctx.arc(n.x * w, n.y * h, 2.5, 0, Math.PI * 2); ctx.fill();
+                });
+            }
+            // Subtle corner accent
+            const corner = ctx.createRadialGradient(0, 0, 0, 0, 0, w * 0.38);
+            corner.addColorStop(0, `rgba(${r},${g},${b},0.06)`);
+            corner.addColorStop(1, `rgba(${r},${g},${b},0)`);
+            ctx.fillStyle = corner; ctx.fillRect(0, 0, w, h);
+        };
+    },
+
     makeGenericRenderer(canvas) {
         let t = 0;
         return () => {

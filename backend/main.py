@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY, extract_slots_for_op, classify_async  # noqa: F401 (re-exported for callers)
+from . import auth as _auth
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -3076,6 +3077,76 @@ async def shutdown_scheduler() -> None:
         persist_connector_vault_to_disk_sync()
     await persist_sessions_to_disk_safe("shutdown")
 
+
+# ── Auth endpoints ─────────────────────────────────────────────────────────────
+# These bypass the Nous gateway (vite proxy routes /api/auth directly to :8787).
+# Credentials never travel through the gateway layer.
+
+@app.get("/api/auth/status")
+async def auth_status() -> dict[str, Any]:
+    return {
+        "enabled":    _auth.AUTH_ENABLED,
+        "registered": _auth.passkey_registered(),
+        "connections": _auth.vault_list(),
+    }
+
+@app.post("/api/auth/register/begin")
+async def auth_register_begin() -> dict[str, Any]:
+    try:
+        return _auth.registration_begin()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+class _RegCompleteBody(BaseModel):
+    nonce:      str
+    credential: dict
+
+@app.post("/api/auth/register/complete")
+async def auth_register_complete(body: _RegCompleteBody) -> dict[str, Any]:
+    try:
+        token = _auth.registration_complete(body.nonce, body.credential)
+        return {"ok": True, "sessionToken": token}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.post("/api/auth/login/begin")
+async def auth_login_begin() -> dict[str, Any]:
+    if not _auth.passkey_registered():
+        raise HTTPException(status_code=409, detail="No passkey registered — complete setup first")
+    try:
+        return _auth.authentication_begin()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+class _LoginCompleteBody(BaseModel):
+    nonce:     str
+    assertion: dict
+
+@app.post("/api/auth/login/complete")
+async def auth_login_complete(body: _LoginCompleteBody) -> dict[str, Any]:
+    try:
+        token = _auth.authentication_complete(body.nonce, body.assertion)
+        return {"ok": True, "sessionToken": token}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.post("/api/auth/logout")
+async def auth_logout(body: dict = Body(default={})) -> dict[str, Any]:
+    token = body.get("sessionToken", "")
+    if token:
+        _auth.session_revoke(token)
+    return {"ok": True}
+
+@app.delete("/api/auth/connections/{service}")
+async def auth_disconnect_service(service: str) -> dict[str, Any]:
+    _auth.vault_delete(service)
+    return {"ok": True, "service": service}
+
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
@@ -7739,6 +7810,12 @@ async def mcp_list_servers():
 @app.websocket("/ws")
 async def ws_session(websocket: WebSocket):
     await websocket.accept()
+    # Auth gate — passkey session must be valid when auth is enabled
+    auth_token = websocket.query_params.get("authToken", "")
+    if not _auth.session_valid(auth_token):
+        await websocket.send_json({"type": "auth_required"})
+        await websocket.close(code=4401)
+        return
     sid = normalize_session_id(websocket.query_params.get("sessionId", ""))
     if not sid:
         await websocket.close(code=1008)
