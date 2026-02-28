@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import math
 import os
 import pathlib
@@ -15,6 +16,8 @@ import re
 import secrets
 import time as _time
 import uuid
+
+_log = logging.getLogger("genomeui")
 from urllib.parse import quote_plus, urlparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -3078,6 +3081,16 @@ async def startup_scheduler() -> None:
     for _auto_scope in ("weather.forecast.read",):
         if not connector_scope_granted(_auto_scope):
             connector_grant_scope(_auto_scope)
+    # Warn loudly when authentication is disabled so it's never silently deployed
+    if not _auth.AUTH_ENABLED:
+        _log.warning(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  ⚠  GENOME_AUTH_ENABLED=false — authentication is OFF       ║\n"
+            "║     Any caller can access /api/turn and WebSocket endpoints. ║\n"
+            "║     Set GENOME_AUTH_ENABLED=true before any public exposure. ║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
     # Connect to MCP servers defined in .mcp.json — non-blocking, errors are stored per server
     asyncio.create_task(load_mcp_servers_from_config())
     global SCHEDULER_TASK
@@ -7840,13 +7853,25 @@ async def mcp_list_servers():
 @app.websocket("/ws")
 async def ws_session(websocket: WebSocket):
     await websocket.accept()
-    # Auth gate — passkey session must be valid when auth is enabled
-    auth_token = websocket.query_params.get("authToken", "")
+    # Auth gate — first message must be {type:"auth", token, sessionId}
+    # Credentials are NOT passed in the URL to avoid leaking them into logs/history.
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+        init_msg = json.loads(raw)
+    except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+        await websocket.send_json({"type": "auth_required"})
+        await websocket.close(code=4401)
+        return
+    if init_msg.get("type") != "auth":
+        await websocket.send_json({"type": "auth_required"})
+        await websocket.close(code=4401)
+        return
+    auth_token = str(init_msg.get("token", ""))
     if not _auth.session_valid(auth_token):
         await websocket.send_json({"type": "auth_required"})
         await websocket.close(code=4401)
         return
-    sid = normalize_session_id(websocket.query_params.get("sessionId", ""))
+    sid = normalize_session_id(str(init_msg.get("sessionId", "")))
     if not sid:
         await websocket.close(code=1008)
         return
@@ -13183,6 +13208,36 @@ def _op_to_domain(op: str) -> str:
     return domain_map.get(prefix, "system")
 
 
+_SLOT_MAX_STR = 512  # chars per slot value
+
+
+def _sanitize_slots(raw: Any) -> "dict[str, Any]":
+    """Strip anything that isn't a primitive from Nous-supplied slot payloads.
+
+    The Nous gateway is trusted for *op* selection (validated against
+    CAPABILITY_REGISTRY) but slots come straight from an LLM and must be
+    treated as untrusted user-controlled input.  We only allow primitive
+    scalars so that downstream code can never receive nested objects,
+    callables, or unexpectedly large blobs.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        if isinstance(v, bool):
+            clean[k] = v
+        elif isinstance(v, (int, float)):
+            clean[k] = v
+        elif isinstance(v, str):
+            clean[k] = v[:_SLOT_MAX_STR]
+        elif v is None:
+            clean[k] = None
+        # nested dicts/lists are silently dropped
+    return clean
+
+
 def compile_intent_envelope(text: str, nous_hint: "dict[str, Any] | None" = None) -> dict[str, Any]:
     normalized_text = normalize_intent_text(text)
     lower = normalized_text.lower()
@@ -13192,7 +13247,7 @@ def compile_intent_envelope(text: str, nous_hint: "dict[str, Any] | None" = None
     if nous_hint and nous_hint.get("op") and float(nous_hint.get("confidence", 0)) >= 0.6:
         op = str(nous_hint["op"])
         domain = _op_to_domain(op)
-        nous_slots = nous_hint.get("slots") or {}
+        nous_slots = _sanitize_slots(nous_hint.get("slots") or {})
         # Always run the local extractor so it can fill in fields the LLM missed.
         # Nous-supplied slots take precedence; local extractor fills the gaps.
         local_slots = extract_slots_for_op(op, normalized_text, lower)

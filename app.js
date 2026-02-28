@@ -757,12 +757,14 @@ const UIEngine = {
             this._ws = null;
         }
 
-        const authToken = sessionStorage.getItem('genome_session') || '';
-        const wsUrl = `ws://${location.host}/ws?sessionId=${encodeURIComponent(sessionId)}&authToken=${encodeURIComponent(authToken)}`;
+        const wsUrl = `ws://${location.host}/ws`;
         const ws = new WebSocket(wsUrl);
         this._ws = ws;
 
         ws.onopen = () => {
+            // Send auth as first message — never embed tokens in the URL (logs/history)
+            const authToken = sessionStorage.getItem('genome_session') || '';
+            ws.send(JSON.stringify({ type: 'auth', token: authToken, sessionId }));
             this.setConnectivity(true);
             this.state.session.syncTransport = 'ws';
             this.resetReconnectBackoff();
