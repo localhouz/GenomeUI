@@ -5955,7 +5955,7 @@ const UIEngine = {
             return `
                 <div class="feed-card">
                     <div class="surface-label">${escapeHtml(block.label || 'Metric')}</div>
-                    <div class="feed-value" style="color:${block.color || 'inherit'}">${escapeHtml(String(block.value ?? ''))}</div>
+                    <div class="feed-value" style="color:${safeCssColor(block.color)}">${escapeHtml(String(block.value ?? ''))}</div>
                     ${block.meta ? `<div class="feed-meta">${escapeHtml(block.meta)}</div>` : ''}
                 </div>
             `;
@@ -6055,7 +6055,7 @@ const UIEngine = {
             return `
                 <div class="compact-card">
                     <div class="label">${escapeHtml(block.label || '')}</div>
-                    <div class="value compact-value" style="color:${block.color || 'inherit'}">${escapeHtml(String(block.value ?? ''))}</div>
+                    <div class="value compact-value" style="color:${safeCssColor(block.color)}">${escapeHtml(String(block.value ?? ''))}</div>
                     ${block.meta ? `<div class="meta-line">${escapeHtml(block.meta)}</div>` : ''}
                 </div>
             `;
@@ -6086,7 +6086,7 @@ const UIEngine = {
             return `
                 <div class="card ${block.span === 2 ? 'card-span-2' : ''}">
                     <div class="label">${escapeHtml(block.label || '')}</div>
-                    <div class="value" style="color:${block.color || 'inherit'}">${escapeHtml(String(block.value ?? ''))}</div>
+                    <div class="value" style="color:${safeCssColor(block.color)}">${escapeHtml(String(block.value ?? ''))}</div>
                     ${block.meta ? `<div class="meta-line">${escapeHtml(block.meta)}</div>` : ''}
                 </div>
             `;
@@ -6833,6 +6833,18 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
     return escapeHtml(value);
+}
+
+// Sanitize a CSS color value before interpolating into a style attribute.
+// Only allows CSS variables, hex colors, rgb/rgba, and safe keywords.
+// Returns 'inherit' for anything that doesn't match — never raw user strings.
+function safeCssColor(value) {
+    const v = String(value || '').trim();
+    if (!v || v === 'inherit' || v === 'transparent' || v === 'currentColor') return v || 'inherit';
+    if (/^var\(--[a-z0-9-]+\)$/.test(v)) return v;
+    if (/^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/.test(v)) return v;
+    if (/^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*[\d.]+)?\s*\)$/.test(v)) return v;
+    return 'inherit';
 }
 
 function sleep(ms) {
