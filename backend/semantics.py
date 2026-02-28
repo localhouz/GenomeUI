@@ -1374,6 +1374,8 @@ def _ext_content(raw: str, lower: str) -> dict | None:
 
 def _ext_document(raw: str, lower: str) -> dict | None:
     action_map = [
+        (r"\b(?:delete|remove|trash)\b", "delete"),
+        (r"\b(?:export|download|convert)\b", "export"),
         (r"\b(?:edit|update|revise|rewrite|modify|change|add\s+to)\b", "edit"),
         (r"\b(?:create|new|start|write|draft|make|generate|open)\b", "create"),
     ]
@@ -1382,11 +1384,17 @@ def _ext_document(raw: str, lower: str) -> dict | None:
         if re.search(pat, lower):
             action = act
             break
-    return {"action": action, "name": _extract_content_name(lower), "topic": _extract_topic(lower)}
+    fmt = None
+    m = re.search(r"\b(?:as|to)\s+(pdf|docx|word|txt)\b", lower)
+    if m:
+        fmt = m.group(1)
+    return {"action": action, "name": _extract_content_name(lower), "topic": _extract_topic(lower), "format": fmt}
 
 
 def _ext_spreadsheet(raw: str, lower: str) -> dict | None:
     action_map = [
+        (r"\b(?:delete|remove|trash)\b", "delete"),
+        (r"\b(?:export|download|convert)\b", "export"),
         (r"\b(?:edit|update|modify|add\s+(?:a\s+)?(?:row|column))\b", "edit"),
         (r"\b(?:create|new|start|make|build|generate)\b", "create"),
     ]
@@ -1395,11 +1403,17 @@ def _ext_spreadsheet(raw: str, lower: str) -> dict | None:
         if re.search(pat, lower):
             action = act
             break
-    return {"action": action, "name": _extract_content_name(lower)}
+    fmt = None
+    m = re.search(r"\b(?:as|to)\s+(csv|xlsx|excel|pdf)\b", lower)
+    if m:
+        fmt = m.group(1)
+    return {"action": action, "name": _extract_content_name(lower), "format": fmt}
 
 
 def _ext_presentation(raw: str, lower: str) -> dict | None:
     action_map = [
+        (r"\b(?:delete|remove|trash)\b", "delete"),
+        (r"\b(?:export|download|convert)\b", "export"),
         (r"\b(?:edit|update|modify|revise|add\s+a\s+slide)\b", "edit"),
         (r"\b(?:create|new|start|make|build|generate|write)\b", "create"),
     ]
@@ -1412,11 +1426,16 @@ def _ext_presentation(raw: str, lower: str) -> dict | None:
     m = re.search(r"(\d+)\s+slides?", lower)
     if m:
         slides = int(m.group(1))
+    fmt = None
+    mf = re.search(r"\b(?:as|to)\s+(pdf|pptx|powerpoint)\b", lower)
+    if mf:
+        fmt = mf.group(1)
     return {
         "action": action,
         "name": _extract_content_name(lower),
         "slides": slides,
         "topic": _extract_topic(lower),
+        "format": fmt,
     }
 
 
@@ -1489,6 +1508,7 @@ def _ext_calendar(raw: str, lower: str) -> dict | None:
 def _ext_email(raw: str, lower: str) -> dict | None:
     action_map = [
         (r"\b(?:reply|respond|answer)\s+(?:to\s+)?(?:the\s+)?(?:email|message)\b", "reply"),
+        (r"\b(?:forward)\s+(?:the\s+|this\s+)?(?:email|message)\b", "forward"),
         (r"\b(?:search|find|look\s+for)\s+(?:for\s+)?(?:emails?|messages?)\b", "search"),
         (r"\bemails?\s+(?:about|from|with)\b", "search"),
         (r"\b(?:archive|delete|trash)\b", "archive"),
@@ -1507,6 +1527,231 @@ def _ext_email(raw: str, lower: str) -> dict | None:
     if m:
         to = m.group(1).strip()
     return {"action": action, "to": to, "subject": _extract_content_name(lower)}
+
+
+# ─── Extended extractors ──────────────────────────────────────────────────────
+
+def _ext_weather_alert(raw: str, lower: str) -> dict[str, Any] | None:
+    return {"location": _extract_location(raw, lower) or "__current__", "type": "alert"}
+
+
+def _ext_location_nearby(raw: str, lower: str) -> dict[str, Any] | None:
+    place_m = re.search(
+        r"\b([a-z][a-z\s]{2,30}?)"
+        r"(?:\s+(?:nearby|near\s+me|around|close\s+by|around\s+here|in\s+the\s+area))\b",
+        lower,
+    )
+    if place_m:
+        query = place_m.group(1).strip()
+    else:
+        q2 = re.sub(r"^(?:find|show\s+me|where(?:'s|\s+is)|are\s+there\s+any)\s+", "", lower)
+        q2 = re.sub(
+            r"\s+(?:nearby|near\s+me|around\s+(?:here|me)|close\s+by|in\s+the\s+area)\s*$",
+            "", q2,
+        ).strip()
+        query = q2 if q2 else "places"
+    return {"query": query, "location": _extract_location(raw, lower) or "__current__"}
+
+
+def _ext_shopping_track(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:track(?:ing)?|watch(?:ing)?|alert\s+(?:me\s+)?(?:when|if))"
+        r"\s+(?:the\s+)?(?:price\s+(?:of\s+)?)?(.+?)"
+        r"(?:\s+(?:drops?|goes?\s+(?:down|below)|changes?))?$",
+        lower,
+    )
+    query = m.group(1).strip() if m else raw.strip()
+    if not query or len(query) < 2:
+        return None
+    return {"query": query, "category": _infer_shopping_category(lower)}
+
+
+def _ext_shopping_wishlist(raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:show|view|see|my|list)\b", lower):
+        if not re.search(r"\b(?:add|save|put)\b", lower):
+            return {"action": "list"}
+    m = re.search(
+        r"(?:add|save|put)\s+(.+?)\s+(?:to|on)\s+(?:my\s+)?(?:wishlist|wish\s+list)", lower
+    )
+    if not m:
+        m = re.search(r"(?:wishlist|wish\s+list)\s+(.+)$", lower)
+    query = m.group(1).strip() if m else raw.strip()
+    return {"action": "add", "query": query}
+
+
+def _ext_news_saved(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {"kind": "saved"}
+
+
+def _ext_finance_portfolio(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_finance_watchlist(raw: str, lower: str) -> dict[str, Any] | None:
+    action = "list"
+    if re.search(r"\b(?:add|track|watch|follow)\b", lower):
+        action = "add"
+    elif re.search(r"\b(?:remove|unwatch|unfollow|drop)\b", lower):
+        action = "remove"
+    m = re.search(r"\b([A-Z]{1,5})\b", raw)
+    symbol = m.group(1) if m else None
+    return {"action": action, "symbol": symbol}
+
+
+def _ext_banking_transfer(raw: str, lower: str) -> dict[str, Any] | None:
+    mm = _MONEY_RE.search(lower)
+    if not mm:
+        return None
+    try:
+        amount = float((mm.group(1) or mm.group(2) or "0").replace(",", ""))
+    except ValueError:
+        amount = 0.0
+    m = re.search(r"(?:to|send\s+to|transfer\s+to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    return {"amount": amount, "to": m.group(1).strip() if m else None}
+
+
+def _ext_banking_pay(raw: str, lower: str) -> dict[str, Any] | None:
+    mm = _MONEY_RE.search(lower)
+    amount = None
+    if mm:
+        try:
+            amount = float((mm.group(1) or mm.group(2) or "0").replace(",", ""))
+        except ValueError:
+            pass
+    m = re.search(
+        r"(?:pay|payment\s+(?:for|to))\s+(?:\$[\d\.]+\s+)?(?:for\s+)?(.+?)(?:\s+\$[\d\.]+)?$",
+        lower,
+    )
+    return {"amount": amount, "payee": m.group(1).strip() if m else None}
+
+
+def _ext_note_search(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:search|find|look\s+for)\s+(?:(?:in|through|my)\s+)?notes?\s+"
+        r"(?:about\s+|for\s+|with\s+)?(.+)$",
+        lower,
+    )
+    if not m:
+        m = re.search(r"notes?\s+(?:about|on|with|containing)\s+(.+)$", lower)
+    query = m.group(1).strip() if m else ""
+    return {"query": query} if query else None
+
+
+def _ext_note_delete(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:delete|remove|trash)\s+(?:(?:the|my|that)\s+)?(?:note\s+)?"
+        r"(?:about\s+|called\s+|titled\s+)?(.+?)(?:\s+note)?$",
+        lower,
+    )
+    if not m:
+        return None
+    selector = m.group(1).strip()
+    return {"selector": selector} if selector and len(selector) >= 2 else None
+
+
+def _ext_note_pin(_raw: str, lower: str) -> dict[str, Any] | None:
+    action = "unpin" if re.search(r"\bunpin\b", lower) else "pin"
+    m = re.search(
+        r"(?:pin|unpin)\s+(?:(?:the|my)\s+)?(?:note\s+)?(?:about\s+)?(.+?)(?:\s+note)?$", lower
+    )
+    return {"action": action, "name": m.group(1).strip() if m else ""}
+
+
+def _ext_reminder_delete(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:delete|remove|cancel|clear)\s+(?:(?:the|my|that)\s+)?(?:reminder\s+)?"
+        r"(?:for\s+|about\s+)?(.+?)(?:\s+reminder)?$",
+        lower,
+    )
+    if not m:
+        return None
+    selector = m.group(1).strip()
+    return {"selector": selector} if selector and len(selector) >= 2 else None
+
+
+def _ext_reminder_snooze(raw: str, lower: str) -> dict[str, Any] | None:
+    delay_ms = _parse_relative_delay_ms(lower) or (10 * 60_000)
+    m = re.search(
+        r"(?:snooze|defer|postpone)\s+(?:(?:the|my)\s+)?(?:reminder\s+)?"
+        r"(?:for\s+|about\s+)?(.+?)(?:\s+(?:for|by|until)|\s+\d+|$)",
+        lower,
+    )
+    return {"selector": m.group(1).strip() if m else "", "delayMs": delay_ms}
+
+
+def _ext_social_dm(raw: str, _lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:dm|direct\s+message|message|text)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
+        r"\s*(?:[:\-]\s*(.+))?$",
+        raw,
+    )
+    if not m:
+        return None
+    recipient = m.group(1).strip()
+    return {"to": recipient, "text": (m.group(2) or "").strip()} if recipient else None
+
+
+def _ext_social_profile(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_terminal_history(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_terminal_kill(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:kill|stop|terminate|end|force\s+quit)\s+(?:the\s+)?(?:process\s+)?(.+?)"
+        r"(?:\s+process)?$",
+        lower,
+    )
+    if not m:
+        return None
+    process = m.group(1).strip()
+    return {"process": process} if process else None
+
+
+def _ext_contacts_create(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:add|save|create)\s+(?:a\s+)?(?:new\s+)?contact\s+(?:for\s+)?(.+)$", lower)
+    name = m.group(1).strip() if m else ""
+    phone_m = re.search(r"\b(\d[\d\s\-\(\)\.]{6,14}\d)\b", raw)
+    email_m = re.search(r"\b([\w.+\-]+@[\w\-]+\.\w+)\b", raw)
+    return {
+        "name": name,
+        "phone": phone_m.group(1) if phone_m else None,
+        "email": email_m.group(1) if email_m else None,
+    }
+
+
+def _ext_contacts_call(raw: str, _lower: str) -> dict[str, Any] | None:
+    m = re.match(r"^(?:call|dial|phone|ring)\s+(.+)$", raw, re.IGNORECASE)
+    if not m:
+        return None
+    return {"name": m.group(1).strip()}
+
+
+def _ext_contacts_message(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.match(r"^(?:text|sms|message)\s+(.+?)(?:\s+(?:that|saying|:)\s+(.+))?$", raw,
+                 re.IGNORECASE)
+    if not m:
+        return None
+    return {"to": m.group(1).strip(), "body": (m.group(2) or "").strip()}
+
+
+def _ext_calendar_rsvp(raw: str, lower: str) -> dict[str, Any] | None:
+    response = None
+    if re.search(r"\b(?:accept|yes|going|attending|will\s+attend|i'll\s+be\s+there)\b", lower):
+        response = "accept"
+    elif re.search(r"\b(?:decline|no|not\s+going|won't\s+attend|can't\s+make\s+it)\b", lower):
+        response = "decline"
+    elif re.search(r"\b(?:maybe|tentative|might|possibly)\b", lower):
+        response = "tentative"
+    m = re.search(
+        r"(?:rsvp|respond)\s+(?:to\s+)?(?:the\s+)?(.+?)"
+        r"(?:\s+(?:invite|invitation|event|meeting))?$",
+        lower,
+    )
+    return {"response": response, "event": m.group(1).strip() if m else ""}
 
 
 # ─── Extractor registry ───────────────────────────────────────────────────────
@@ -1550,6 +1795,29 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "terminal":             _ext_terminal,
     "calendar":             _ext_calendar,
     "email":                _ext_email,
+    # Extended extractors
+    "weather_alert":        _ext_weather_alert,
+    "location_nearby":      _ext_location_nearby,
+    "shopping_track":       _ext_shopping_track,
+    "shopping_wishlist":    _ext_shopping_wishlist,
+    "news_saved":           _ext_news_saved,
+    "finance_portfolio":    _ext_finance_portfolio,
+    "finance_watchlist":    _ext_finance_watchlist,
+    "banking_transfer":     _ext_banking_transfer,
+    "banking_pay":          _ext_banking_pay,
+    "note_search":          _ext_note_search,
+    "note_delete":          _ext_note_delete,
+    "note_pin":             _ext_note_pin,
+    "reminder_delete":      _ext_reminder_delete,
+    "reminder_snooze":      _ext_reminder_snooze,
+    "social_dm":            _ext_social_dm,
+    "social_profile":       _ext_social_profile,
+    "terminal_history":     _ext_terminal_history,
+    "terminal_kill":        _ext_terminal_kill,
+    "contacts_create":      _ext_contacts_create,
+    "contacts_call":        _ext_contacts_call,
+    "contacts_message":     _ext_contacts_message,
+    "calendar_rsvp":        _ext_calendar_rsvp,
 }
 
 
@@ -2496,6 +2764,513 @@ TAXONOMY: dict[str, Intent] = {
         examples=["find emails from Sarah about the project",
                   "search my inbox for the invoice"],
         slots={"action": "search", "query": "search terms", "from": "sender"},
+    ),
+
+    "email.forward": Intent(
+        id="email.forward",
+        op="email_forward",
+        domain="email",
+        description="Forward an email to someone",
+        signals=["forward the email", "forward this email", "forward to",
+                 "pass along the email"],
+        patterns=[r"\b(?:forward)\s+(?:the\s+|this\s+)?(?:email|message)\b"],
+        extractor="email",
+        examples=["forward the meeting invite to Sarah",
+                  "forward John's email to the team"],
+        slots={"action": "forward", "to": "recipient"},
+    ),
+
+    "email.archive": Intent(
+        id="email.archive",
+        op="email_archive",
+        domain="email",
+        description="Archive or delete an email",
+        signals=["archive the email", "delete the email", "trash the email",
+                 "archive this email", "mark as read and archive"],
+        patterns=[r"\b(?:archive|delete|trash)\s+(?:the\s+|this\s+)?(?:email|message)\b"],
+        extractor="email",
+        examples=["archive the newsletter", "delete the promotional emails",
+                  "trash yesterday's spam"],
+        slots={"action": "archive", "query": "which emails"},
+    ),
+
+    # ── Weather extended ───────────────────────────────────────────────────
+
+    "weather.alert": Intent(
+        id="weather.alert",
+        op="weather_alert",
+        domain="weather",
+        description="Get active severe weather alerts and warnings for a location",
+        signals=["weather alert", "severe weather", "weather warning", "tornado warning",
+                 "flood warning", "winter storm warning", "heat advisory",
+                 "weather advisory", "any alerts", "storm warning"],
+        extractor="weather_alert",
+        examples=["any weather alerts today", "severe weather warning in Chicago",
+                  "are there tornado warnings near me", "weather advisories tonight"],
+        slots={"location": "city name or empty for current location"},
+    ),
+
+    # ── Shopping extended ──────────────────────────────────────────────────
+
+    "shopping.track": Intent(
+        id="shopping.track",
+        op="shopping_track",
+        domain="shopping",
+        description="Track the price of a product and get alerted when it drops",
+        signals=["track the price", "price alert", "notify me when", "alert me when",
+                 "watch the price", "price drop alert", "let me know when it drops"],
+        extractor="shopping_track",
+        examples=["track the price of the MacBook Pro",
+                  "alert me when Nike shoes drop below $80",
+                  "watch the AirPods Pro price"],
+        slots={"query": "product to track"},
+    ),
+
+    "shopping.wishlist": Intent(
+        id="shopping.wishlist",
+        op="shopping_wishlist",
+        domain="shopping",
+        description="Add a product to the wishlist or view the wishlist",
+        signals=["add to wishlist", "add to my wishlist", "save for later",
+                 "wish list", "wishlist", "my wishlist", "show my wishlist"],
+        extractor="shopping_wishlist",
+        examples=["add these Nikes to my wishlist", "show my wishlist",
+                  "save the MacBook for later"],
+        slots={"action": "add|list", "query": "product name"},
+    ),
+
+    # ── News extended ──────────────────────────────────────────────────────
+
+    "news.by_topic": Intent(
+        id="news.by_topic",
+        op="web_search",
+        domain="web",
+        description="Get news filtered to a specific topic or category",
+        signals=["tech news", "business news", "sports news", "politics news",
+                 "science news", "health news", "entertainment news", "finance news",
+                 "world news", "local news", "news about", "latest in"],
+        extractor="news",
+        examples=["show me tech news", "latest business news",
+                  "news about AI", "what's happening in politics"],
+        slots={"query": "news topic"},
+    ),
+
+    "news.saved": Intent(
+        id="news.saved",
+        op="news_saved",
+        domain="news",
+        description="Show saved or bookmarked articles",
+        signals=["saved articles", "bookmarked articles", "saved news",
+                 "my articles", "articles i saved", "news i saved", "my saved articles"],
+        extractor="news_saved",
+        examples=["show my saved articles", "bookmarked news", "articles I saved"],
+    ),
+
+    # ── Location extended ──────────────────────────────────────────────────
+
+    "location.nearby": Intent(
+        id="location.nearby",
+        op="location_nearby",
+        domain="system",
+        description="Find places or businesses near the user's current location",
+        signals=["nearby", "near me", "around me", "close by", "in the area",
+                 "around here", "close to me", "restaurants near", "coffee near"],
+        blockers=["search the web", "google", "explain"],
+        extractor="location_nearby",
+        examples=["restaurants near me", "coffee shops nearby",
+                  "find a gas station near me", "what's around me"],
+        slots={"query": "type of place", "location": "location or current"},
+    ),
+
+    # ── Contacts extended ──────────────────────────────────────────────────
+
+    "contacts.create": Intent(
+        id="contacts.create",
+        op="contacts_create",
+        domain="contacts",
+        description="Create or save a new contact",
+        signals=["add a contact", "save contact", "new contact", "create a contact",
+                 "add to contacts", "save as contact", "add someone to my contacts"],
+        extractor="contacts_create",
+        examples=["add John Smith 555-1234 to my contacts",
+                  "save Sarah Lee sarah@email.com as a contact",
+                  "create a contact for Mike"],
+        slots={"name": "person name", "phone": "phone number", "email": "email"},
+    ),
+
+    "contacts.call": Intent(
+        id="contacts.call",
+        op="contacts_call",
+        domain="contacts",
+        description="Call a contact by name",
+        signals=["call", "dial", "give a call", "place a call"],
+        patterns=[r"^(?:call|dial|phone|ring)\s+\w"],
+        blockers=["conference call", "on a call", "schedule a call",
+                  "video call", "cancel the call", "cancel call"],
+        extractor="contacts_call",
+        examples=["call John", "dial Sarah", "phone my mom", "ring the office"],
+        slots={"name": "person or number to call"},
+    ),
+
+    "contacts.message": Intent(
+        id="contacts.message",
+        op="contacts_message",
+        domain="contacts",
+        description="Send a text message to a contact",
+        signals=["send a text", "send a message", "text message to", "sms to"],
+        patterns=[r"^(?:text|sms)\s+\w"],
+        blockers=["email", "tweet", "post", "dm", "direct message", "slack"],
+        extractor="contacts_message",
+        examples=["text Sarah I'm on my way", "send a text to John: running late",
+                  "message my mom that dinner is at 7"],
+        slots={"to": "recipient name", "body": "message text"},
+    ),
+
+    # ── Finance extended ───────────────────────────────────────────────────
+
+    "finance.portfolio": Intent(
+        id="finance.portfolio",
+        op="finance_portfolio",
+        domain="finance",
+        description="View the user's investment portfolio and holdings",
+        signals=["my portfolio", "my investments", "my holdings", "my stocks",
+                 "portfolio value", "my positions", "what am i invested in",
+                 "investment portfolio", "what stocks do i own"],
+        extractor="finance_portfolio",
+        examples=["show my portfolio", "what are my holdings",
+                  "my investment value", "what stocks do I own"],
+    ),
+
+    "finance.watchlist": Intent(
+        id="finance.watchlist",
+        op="finance_watchlist",
+        domain="finance",
+        description="Manage or view a stock/crypto watchlist",
+        signals=["my watchlist", "add to watchlist", "watch this stock",
+                 "remove from watchlist", "stock watchlist", "crypto watchlist"],
+        extractor="finance_watchlist",
+        examples=["show my watchlist", "add AAPL to my watchlist",
+                  "remove Tesla from watchlist"],
+        slots={"action": "add|remove|list", "symbol": "ticker symbol"},
+    ),
+
+    # ── Banking extended ───────────────────────────────────────────────────
+
+    "banking.transfer": Intent(
+        id="banking.transfer",
+        op="banking_transfer",
+        domain="banking",
+        description="Transfer money between accounts or to a person",
+        signals=["transfer", "send money", "move money", "wire", "zelle",
+                 "venmo", "pay someone", "send to"],
+        blockers=["pay bill", "pay my bill", "pay the bill", "subscription"],
+        extractor="banking_transfer",
+        examples=["transfer $200 to savings", "send $50 to Sarah via Zelle",
+                  "move $500 from checking to savings"],
+        slots={"amount": "dollar amount", "to": "destination or recipient"},
+    ),
+
+    "banking.pay": Intent(
+        id="banking.pay",
+        op="banking_pay",
+        domain="banking",
+        description="Pay a bill or make a scheduled payment",
+        signals=["pay my bill", "pay the bill", "pay my rent", "pay my mortgage",
+                 "make a payment", "schedule a payment", "bill payment",
+                 "pay utilities", "pay my credit card"],
+        extractor="banking_pay",
+        examples=["pay my electricity bill", "make a $200 credit card payment",
+                  "schedule my rent payment for Friday"],
+        slots={"amount": "dollar amount", "payee": "who to pay"},
+    ),
+
+    # ── Notes extended ─────────────────────────────────────────────────────
+
+    "note.search": Intent(
+        id="note.search",
+        op="note_search",
+        domain="notes",
+        description="Search through saved notes",
+        signals=["search notes", "find notes", "look for notes", "search my notes",
+                 "notes about", "find a note", "look through my notes"],
+        extractor="note_search",
+        examples=["search my notes for meeting agenda",
+                  "find notes about Q4", "look for the password note"],
+        slots={"query": "search terms"},
+    ),
+
+    "note.delete": Intent(
+        id="note.delete",
+        op="note_delete",
+        domain="notes",
+        description="Delete a note",
+        signals=["delete the note", "remove the note", "trash the note",
+                 "delete my note", "remove my note"],
+        patterns=[
+            r"\b(?:delete|remove|trash)\s+(?:the\s+|my\s+)?note\s+(?:about|called|titled)?\s*\w"
+        ],
+        extractor="note_delete",
+        examples=["delete the note about the dentist",
+                  "remove the grocery list note", "trash my shopping note"],
+        slots={"selector": "note identifier"},
+    ),
+
+    "note.pin": Intent(
+        id="note.pin",
+        op="note_pin",
+        domain="notes",
+        description="Pin or unpin a note to keep it at the top",
+        signals=["pin the note", "pin my note", "unpin the note",
+                 "pin this note", "keep this note at the top"],
+        extractor="note_pin",
+        examples=["pin the API key note", "unpin my grocery list",
+                  "pin this note to the top"],
+        slots={"action": "pin|unpin", "name": "note name"},
+    ),
+
+    # ── Reminders extended ─────────────────────────────────────────────────
+
+    "reminder.delete": Intent(
+        id="reminder.delete",
+        op="reminder_delete",
+        domain="system",
+        description="Delete a reminder",
+        signals=["delete the reminder", "remove the reminder", "cancel the reminder",
+                 "clear the reminder", "delete my reminder"],
+        patterns=[r"\b(?:delete|remove|cancel|clear)\s+(?:the\s+|my\s+)?reminder\b"],
+        extractor="reminder_delete",
+        examples=["delete the dentist reminder", "remove my 3pm reminder",
+                  "cancel the standup reminder"],
+        slots={"selector": "reminder text"},
+    ),
+
+    "reminder.snooze": Intent(
+        id="reminder.snooze",
+        op="reminder_snooze",
+        domain="system",
+        description="Snooze or postpone a reminder",
+        signals=["snooze", "snooze the reminder", "remind me later", "postpone the reminder",
+                 "defer the reminder", "push back the reminder"],
+        extractor="reminder_snooze",
+        examples=["snooze the dentist reminder for 20 minutes",
+                  "remind me later about the standup"],
+        slots={"selector": "reminder text", "delayMs": "snooze duration in ms"},
+    ),
+
+    # ── Social extended ────────────────────────────────────────────────────
+
+    "social.dm": Intent(
+        id="social.dm",
+        op="social_dm_send",
+        domain="social",
+        description="Send a direct message to someone on social media",
+        signals=["dm", "direct message", "send a dm", "message on twitter",
+                 "instagram dm"],
+        patterns=[r"^(?:dm|direct\s+message)\s+[A-Z]"],
+        extractor="social_dm",
+        examples=["DM John: hey are you free tomorrow",
+                  "send a direct message to Sarah", "dm @user this"],
+        slots={"to": "recipient handle or name", "text": "message body"},
+    ),
+
+    "social.profile": Intent(
+        id="social.profile",
+        op="social_profile_read",
+        domain="social",
+        description="View a social media profile",
+        signals=["my profile", "social profile", "twitter profile", "instagram profile",
+                 "view profile", "my twitter", "my instagram", "my social"],
+        extractor="social_profile",
+        examples=["show my Twitter profile", "view my Instagram", "my social profile"],
+    ),
+
+    # ── Terminal extended ──────────────────────────────────────────────────
+
+    "terminal.history": Intent(
+        id="terminal.history",
+        op="terminal_history",
+        domain="terminal",
+        description="Show recent terminal command history",
+        signals=["command history", "terminal history", "shell history",
+                 "recent commands", "last commands"],
+        patterns=[r"\b(?:show|view|see)\s+(?:(?:my|the|command|shell|terminal)\s+)?history\b"],
+        extractor="terminal_history",
+        examples=["show my command history", "terminal history", "recent commands"],
+    ),
+
+    "terminal.kill": Intent(
+        id="terminal.kill",
+        op="terminal_kill",
+        domain="terminal",
+        description="Kill or terminate a running process",
+        signals=["kill the process", "stop the process", "terminate the process",
+                 "end the process", "force quit", "kill the program"],
+        patterns=[r"\b(?:kill|terminate|force\s+quit)\s+(?:the\s+)?\w"],
+        blockers=["don't kill", "cancel kill"],
+        extractor="terminal_kill",
+        examples=["kill the Python process", "terminate node",
+                  "force quit Chrome", "stop the webpack process"],
+        slots={"process": "process name or PID"},
+    ),
+
+    # ── Document extended ──────────────────────────────────────────────────
+
+    "document.delete": Intent(
+        id="document.delete",
+        op="document_delete",
+        domain="document",
+        description="Delete a document",
+        signals=["delete the document", "remove the document", "trash the document",
+                 "delete the report", "delete the letter", "delete the memo"],
+        patterns=[
+            r"\b(?:delete|remove|trash)\s+(?:the\s+)?[\w\s]+\s+(?:document|doc|report|letter|memo)\b"
+        ],
+        extractor="document",
+        examples=["delete the Q4 report", "remove my cover letter",
+                  "trash the old proposal"],
+        slots={"action": "delete", "name": "document name"},
+    ),
+
+    "document.export": Intent(
+        id="document.export",
+        op="document_export",
+        domain="document",
+        description="Export a document to PDF or another format",
+        signals=["export the document", "export the report", "export as pdf",
+                 "download the document", "save as pdf", "convert to pdf"],
+        extractor="document",
+        examples=["export the Q4 report as PDF", "download the proposal as Word",
+                  "convert my resume to PDF"],
+        slots={"action": "export", "name": "document name", "format": "pdf|docx|txt"},
+    ),
+
+    # ── Spreadsheet extended ───────────────────────────────────────────────
+
+    "spreadsheet.delete": Intent(
+        id="spreadsheet.delete",
+        op="spreadsheet_delete",
+        domain="spreadsheet",
+        description="Delete a spreadsheet",
+        signals=["delete the spreadsheet", "remove the spreadsheet",
+                 "trash the spreadsheet", "delete my spreadsheet"],
+        patterns=[r"\b(?:delete|remove|trash)\s+(?:the\s+)?[\w\s]+\s+spreadsheet\b"],
+        extractor="spreadsheet",
+        examples=["delete the budget spreadsheet", "remove the expense tracker"],
+        slots={"action": "delete", "name": "spreadsheet name"},
+    ),
+
+    "spreadsheet.export": Intent(
+        id="spreadsheet.export",
+        op="spreadsheet_export",
+        domain="spreadsheet",
+        description="Export a spreadsheet to CSV, Excel, or PDF",
+        signals=["export the spreadsheet", "download the spreadsheet",
+                 "export as csv", "export as excel", "save spreadsheet as"],
+        extractor="spreadsheet",
+        examples=["export the budget spreadsheet as CSV",
+                  "download the tracker as Excel"],
+        slots={"action": "export", "name": "spreadsheet name", "format": "csv|xlsx|pdf"},
+    ),
+
+    # ── Presentation extended ──────────────────────────────────────────────
+
+    "presentation.delete": Intent(
+        id="presentation.delete",
+        op="presentation_delete",
+        domain="presentation",
+        description="Delete a presentation",
+        signals=["delete the presentation", "remove the presentation",
+                 "trash the deck", "delete the deck", "delete the slides"],
+        patterns=[
+            r"\b(?:delete|remove|trash)\s+(?:the\s+)?[\w\s]+\s+(?:presentation|deck|slides)\b"
+        ],
+        extractor="presentation",
+        examples=["delete the Q4 presentation", "remove the sales deck"],
+        slots={"action": "delete", "name": "presentation name"},
+    ),
+
+    "presentation.export": Intent(
+        id="presentation.export",
+        op="presentation_export",
+        domain="presentation",
+        description="Export a presentation to PDF or PowerPoint",
+        signals=["export the presentation", "export the deck", "download the deck",
+                 "export as powerpoint", "save the deck as"],
+        extractor="presentation",
+        examples=["export the Q4 deck as PDF",
+                  "download the sales presentation as PowerPoint"],
+        slots={"action": "export", "name": "presentation name", "format": "pdf|pptx"},
+    ),
+
+    # ── Code extended ──────────────────────────────────────────────────────
+
+    "code.review": Intent(
+        id="code.review",
+        op="code_review",
+        domain="code",
+        description="Review code for quality, bugs, or best practices",
+        signals=["review the code", "audit the code", "code review", "check this code",
+                 "lint this", "critique the code", "review this function"],
+        patterns=[
+            r"\b(?:review|audit|lint|critique)\s+(?:this\s+)?(?:code|script|function|class|module)\b"
+        ],
+        blockers=["explain", "fix", "debug", "run"],
+        extractor="code",
+        examples=["review this Python function", "audit my auth code",
+                  "do a code review of the module"],
+        slots={"action": "review", "language": "language"},
+    ),
+
+    "code.test": Intent(
+        id="code.test",
+        op="code_test",
+        domain="code",
+        description="Write unit tests or run the test suite for a piece of code",
+        signals=["write tests", "write unit tests", "add tests", "test this",
+                 "run the tests", "generate tests", "unit test this"],
+        patterns=[
+            r"\b(?:write|add|generate|create)\s+(?:unit\s+)?tests?\s+(?:for|to)\b",
+            r"\b(?:run|execute)\s+(?:the\s+)?tests?\b",
+        ],
+        extractor="code",
+        examples=["write unit tests for this function",
+                  "add tests to the auth module", "run the tests"],
+        slots={"action": "test", "language": "language", "name": "what to test"},
+    ),
+
+    # ── Calendar extended ──────────────────────────────────────────────────
+
+    "calendar.reschedule": Intent(
+        id="calendar.reschedule",
+        op="calendar_reschedule",
+        domain="calendar",
+        description="Reschedule or move an existing calendar event",
+        signals=["reschedule", "move the meeting", "push the meeting",
+                 "change the time", "move the appointment", "postpone the meeting",
+                 "shift the call", "change the meeting to"],
+        patterns=[
+            r"\b(?:reschedule|move|push|postpone)\s+(?:the\s+)?(?:meeting|event|appointment|call)\b"
+        ],
+        blockers=["cancel"],
+        extractor="calendar",
+        examples=["reschedule the Monday meeting to Wednesday",
+                  "move the dentist appointment to next week",
+                  "push the call to 3pm"],
+        slots={"action": "reschedule", "title": "event title", "date": "new date/time"},
+    ),
+
+    "calendar.rsvp": Intent(
+        id="calendar.rsvp",
+        op="calendar_rsvp",
+        domain="calendar",
+        description="Accept, decline, or mark tentative for an event invitation",
+        signals=["rsvp", "accept the invite", "decline the invite", "accept the meeting",
+                 "decline the meeting", "not going", "can't make it", "will attend",
+                 "i'll be there", "accept the invitation"],
+        extractor="calendar_rsvp",
+        examples=["RSVP yes to the team dinner", "decline the Monday meeting invite",
+                  "accept Sarah's calendar invite", "can't make it to the standup"],
+        slots={"response": "accept|decline|tentative", "event": "event name"},
     ),
 }
 
