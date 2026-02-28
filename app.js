@@ -2594,7 +2594,7 @@ const UIEngine = {
                         ${refineHtml ? `<div class="shop-refine-row">${refineHtml}</div>` : ''}
                         <div class="shop-stage-body">
                             <div class="shop-stage-hero">
-                                ${liveFrameUrl ? `<iframe class="shop-stage-live-frame" src="${safeUrl(liveFrameUrl)}" title="${escapeAttr(`${brandName || 'brand'} live source`)}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>` : ''}
+                                ${liveFrameUrl ? `<iframe class="shop-stage-live-frame" src="${safeUrl(liveFrameUrl)}" title="${escapeAttr(`${brandName || 'brand'} live source`)}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>` : ''}
                                 ${heroImage ? `<img class="shop-stage-hero-fallback-image" src="${safeUrl(heroImage)}" alt="${escapeAttr(heroTitle)}" loading="lazy" />` : '<div class="shop-stage-hero-fallback"></div>'}
                                 <div class="shop-stage-hero-tint"></div>
                                 <div class="shop-stage-hero-meta">
@@ -3645,7 +3645,7 @@ const UIEngine = {
                             `
                     : `
                                 <div class="webdeck-live-surface">
-                                    <iframe class="webdeck-live-frame" src="${safeUrl(fullViewUrl)}" title="${escapeAttr(title || 'Web live surface')}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
+                                    <iframe class="webdeck-live-frame" src="${safeUrl(fullViewUrl)}" title="${escapeAttr(title || 'Web live surface')}" loading="eager" referrerpolicy="no-referrer" sandbox="allow-scripts allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
                                     <div class="webdeck-live-meta">
                                         <span>live source: ${escapeHtml(safeHostname(fullViewUrl))}</span>
                                         <a href="${safeUrl(fullViewUrl)}" target="_blank" rel="noopener noreferrer">open in tab</a>

@@ -16,6 +16,7 @@ import re
 import secrets
 import time as _time
 import uuid
+from collections import deque
 
 _log = logging.getLogger("genomeui")
 from urllib.parse import quote_plus, urlparse
@@ -27,10 +28,10 @@ from .semantics import parse_semantic_command, parse_semantic_command_async, TAX
 from . import auth as _auth
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="GenomeUI Backend", version="1.0.0")
 app.add_middleware(
@@ -268,12 +269,40 @@ CONTINUITY_AUTOPILOT_POSTURE_ACTION_POLICY_HISTORY_MAX = int(os.getenv("CONTINUI
 CONTINUITY_ALERT_COOLDOWN_MS = int(os.getenv("CONTINUITY_ALERT_COOLDOWN_MS", "300000"))
 
 
+class _RateLimiter:
+    """Token-bucket rate limiter keyed by IP address. No external dependencies."""
+
+    def __init__(self, max_calls: int, period_s: float) -> None:
+        self._max = max_calls
+        self._period = period_s
+        self._buckets: dict[str, list[float]] = {}
+        self._lock = __import__("threading").Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self._period
+        with self._lock:
+            calls = self._buckets.get(key, [])
+            calls = [t for t in calls if t > cutoff]
+            if len(calls) >= self._max:
+                self._buckets[key] = calls
+                return False
+            calls.append(now)
+            self._buckets[key] = calls
+            return True
+
+
+# 60 turn requests per minute per IP; 10 auth begin requests per minute per IP
+_turn_limiter = _RateLimiter(max_calls=60, period_s=60)
+_auth_limiter = _RateLimiter(max_calls=10, period_s=60)
+
+
 class SessionInitBody(BaseModel):
     sessionId: str | None = None
 
 
 class TurnBody(BaseModel):
-    intent: str
+    intent: str = Field(max_length=2000)
     sessionId: str | None = None
     baseRevision: int | None = None
     deviceId: str | None = None
@@ -3127,7 +3156,10 @@ async def auth_status() -> dict[str, Any]:
     }
 
 @app.post("/api/auth/register/begin")
-async def auth_register_begin() -> dict[str, Any]:
+async def auth_register_begin(request: Request) -> dict[str, Any]:
+    client_ip = (request.client.host if request.client else "unknown")
+    if not _auth_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
     try:
         return _auth.registration_begin()
     except Exception as exc:
@@ -3148,7 +3180,10 @@ async def auth_register_complete(body: _RegCompleteBody) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 @app.post("/api/auth/login/begin")
-async def auth_login_begin() -> dict[str, Any]:
+async def auth_login_begin(request: Request) -> dict[str, Any]:
+    client_ip = (request.client.host if request.client else "unknown")
+    if not _auth_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
     if not _auth.passkey_registered():
         raise HTTPException(status_code=409, detail="No passkey registered — complete setup first")
     try:
@@ -7902,11 +7937,15 @@ async def ws_session(websocket: WebSocket):
 
 @app.post("/api/turn")
 async def turn(
+    request: Request,
     body: TurnBody,
     x_genome_auth: str | None = Header(default=None),
 ) -> dict[str, Any]:
     if not _auth.session_valid(x_genome_auth):
         raise HTTPException(status_code=401, detail="Authentication required")
+    client_ip = (request.client.host if request.client else "unknown")
+    if not _turn_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
     started_ms = now_ms()
     intent = (body.intent or "").strip()
