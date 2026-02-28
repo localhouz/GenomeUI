@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY  # noqa: F401 (re-exported for callers)
+from .semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY, extract_slots_for_op, classify_async  # noqa: F401 (re-exported for callers)
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -341,7 +341,7 @@ class ConnectorSecretBody(BaseModel):
 
 @dataclass
 class SessionState:
-    memory: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {"tasks": [], "expenses": [], "notes": []})
+    memory: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {"tasks": [], "expenses": [], "notes": [], "teams": []})
     graph: dict[str, Any] = field(default_factory=lambda: {"entities": [], "relations": [], "events": []})
     jobs: list[dict[str, Any]] = field(default_factory=list)
     presence: dict[str, Any] = field(default_factory=lambda: {"devices": {}, "updatedAt": 0})
@@ -2351,6 +2351,162 @@ def resolve_contact_target(query: str) -> dict[str, str] | None:
 
 _COORD_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$")
 
+# ---------------------------------------------------------------------------
+# ESPN unofficial API helpers
+# ---------------------------------------------------------------------------
+_ESPN_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ESPN_CACHE_TTL = 60.0  # seconds
+
+_ESPN_LEAGUES: dict[str, tuple[str, str]] = {
+    "nfl": ("football", "nfl"),
+    "nba": ("basketball", "nba"),
+    "mlb": ("baseball", "mlb"),
+    "nhl": ("hockey", "nhl"),
+    "ncaaf": ("football", "college-football"),
+    "ncaab": ("basketball", "mens-college-basketball"),
+    "ncaas": ("softball", "college-softball"),
+    "ncaabase": ("baseball", "college-baseball"),
+}
+
+
+def espn_fetch(league: str, endpoint: str = "scoreboard") -> dict[str, Any]:
+    """Fetch from ESPN unofficial API with a 60-second in-process cache."""
+    import time as _time
+    key = f"{league}:{endpoint}"
+    ts, cached = _ESPN_CACHE.get(key, (0.0, {}))
+    if cached and (_time.monotonic() - ts) < _ESPN_CACHE_TTL:
+        return cached
+    sport_pair = _ESPN_LEAGUES.get(league.lower())
+    if not sport_pair:
+        return {"ok": False, "error": f"Unknown league: {league}"}
+    sport, league_slug = sport_pair
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league_slug}/{endpoint}"
+    try:
+        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+            resp = client.get(url, headers={"User-Agent": "GenomeUI/1.0 (sports data)"})
+            resp.raise_for_status()
+            data = resp.json()
+            data["ok"] = True
+            _ESPN_CACHE[key] = (_time.monotonic(), data)
+            return data
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+_ESPN_VENUE_CACHE: dict[str, tuple[float, str]] = {}
+
+def espn_fetch_venue_image(venue_id: str) -> str:
+    """Return the best image URL for an ESPN venue, empty string if unavailable."""
+    import time as _time
+    if not venue_id:
+        return ""
+    ts, cached = _ESPN_VENUE_CACHE.get(venue_id, (0.0, ""))
+    if ts and (_time.monotonic() - ts) < 3600.0:   # 1-hour cache
+        return cached
+    url = f"https://site.api.espn.com/apis/site/v2/venues/{venue_id}"
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.get(url, headers={"User-Agent": "GenomeUI/1.0 (sports data)"})
+            resp.raise_for_status()
+            data = resp.json()
+        images = data.get("images") or []
+        # Prefer the widest image (best for panoramic background)
+        best = ""
+        best_w = 0
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            href = str(img.get("href", "") or "")
+            w = int(img.get("width", 0) or 0)
+            if href and w > best_w:
+                best = href
+                best_w = w
+        if not best and images:
+            best = str((images[0] or {}).get("href", "") or "")
+        _ESPN_VENUE_CACHE[venue_id] = (_time.monotonic(), best)
+        return best
+    except Exception:
+        _ESPN_VENUE_CACHE[venue_id] = (_time.monotonic(), "")
+        return ""
+
+
+def _resolve_team_filter(team_name: str, abbrev: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter ESPN events list to those where a competitor matches team_name or abbrev."""
+    if not team_name and not abbrev:
+        return events
+    name_lower = team_name.lower()
+    abbrev_upper = abbrev.upper()
+    filtered = []
+    for ev in events:
+        comps = []
+        for comp in ev.get("competitions", [{}]):
+            comps.extend(comp.get("competitors", []))
+        for c in comps:
+            team = c.get("team", {})
+            t_name = str(team.get("displayName", "") or team.get("name", "")).lower()
+            t_abbrev = str(team.get("abbreviation", "")).upper()
+            t_short = str(team.get("shortDisplayName", "")).lower()
+            if (name_lower and (name_lower in t_name or name_lower in t_short)) or \
+               (abbrev_upper and abbrev_upper == t_abbrev):
+                filtered.append(ev)
+                break
+    return filtered
+
+
+def _espn_game_label(ev: dict[str, Any]) -> str:
+    """Build a compact score/schedule line from an ESPN event dict."""
+    comps = ev.get("competitions", [{}])
+    comp = comps[0] if comps else {}
+    competitors = comp.get("competitors", [])
+    status = ev.get("status", {})
+    status_type = status.get("type", {})
+    state = str(status_type.get("state", "pre")).lower()
+    clock = str(status.get("displayClock", ""))
+    period = int(status.get("period", 0) or 0)
+    date_str = str(ev.get("date", ""))[:10]
+    parts = []
+    for c in competitors:
+        team = c.get("team", {})
+        abbr = str(team.get("abbreviation", "?"))
+        score = str(c.get("score", ""))
+        winner = bool(c.get("winner", False))
+        if state == "post" and score:
+            parts.append(f"{'*' if winner else ''}{abbr} {score}")
+        elif state == "in" and score:
+            parts.append(f"{abbr} {score}")
+        else:
+            parts.append(abbr)
+    teams_str = " vs ".join(parts) if len(parts) == 2 else " ".join(parts)
+    if state == "post":
+        return f"FINAL: {teams_str}"
+    elif state == "in":
+        period_label = f"Q{period}" if period else "LIVE"
+        return f"{period_label} {clock}: {teams_str}"
+    else:
+        return f"{date_str}: {teams_str}"
+
+
+def _espn_standings_lines(data: dict[str, Any], league: str) -> list[str]:
+    """Extract compact standings lines from ESPN standings response."""
+    lines = [f"{league.upper()} Standings"]
+    for group in (data.get("children") or data.get("standings", {}).get("entries", [])):
+        name = str(group.get("name", group.get("abbreviation", "")))
+        if name:
+            lines.append(f"--- {name} ---")
+        entries = group.get("standings", {}).get("entries", []) if isinstance(group.get("standings"), dict) else []
+        for entry in entries[:8]:
+            team = entry.get("team", {})
+            abbr = str(team.get("abbreviation", "?"))
+            stats = {s["name"]: s.get("displayValue", "") for s in entry.get("stats", []) if isinstance(s, dict)}
+            w = stats.get("wins", stats.get("wins", ""))
+            l = stats.get("losses", "")
+            pct = stats.get("winPercent", stats.get("gamesBehind", ""))
+            lines.append(f"  {abbr}: {w}-{l} ({pct})")
+        if len(lines) > 40:
+            break
+    return lines[:20]
+
+
 def weather_read_snapshot(location: str, provider_mode: str | None = None) -> dict[str, Any]:
     query = str(location or "").strip()
     if not query:
@@ -2943,6 +3099,7 @@ async def get_intent_taxonomy() -> dict[str, Any]:
             "op": intent.op,
             "description": intent.description,
             "examples": intent.examples,
+            "slots": intent.slots,
         }
         by_domain.setdefault(intent.domain, []).append(entry)
     return {"domains": by_domain, "total": len(TAXONOMY)}
@@ -7627,7 +7784,18 @@ async def turn(body: TurnBody) -> dict[str, Any]:
             reused["idempotency"] = {"reused": True, "key": idem_key}
             return reused
 
-    envelope = compile_intent_envelope(intent, nous_hint=body.nousIntent)
+    # Nous gateway sits above this backend and pre-classifies every turn.
+    # body.nousIntent is injected by the gateway before forwarding — trust it first.
+    # Only fall back to classify_async (rule-based) if the gateway didn't supply a hint.
+    nous_hint: dict[str, Any] | None = None
+    if body.nousIntent and body.nousIntent.get("op"):
+        nous_hint = body.nousIntent
+    else:
+        nous_match = await classify_async(intent)
+        if nous_match:
+            nous_hint = {"op": nous_match.op, "slots": nous_match.payload, "confidence": nous_match.confidence}
+
+    envelope = compile_intent_envelope(intent, nous_hint=nous_hint)
     clarification = envelope.get("clarification") or {}
     clarification_required = bool(clarification.get("required", False))
     parse_done_ms = now_ms()
@@ -12807,6 +12975,34 @@ def execute_scheduled_job(session: SessionState, session_id: str, job: dict[str,
             "createdAt": now_ms(),
         }
 
+    if kind == "timer":
+        label = str(job.get("text", "Timer")).strip() or "Timer"
+        duration_ms = int(job.get("durationMs", 0) or 0)
+        job["lastResult"] = f"timer fired: {label}"
+        job["active"] = False
+        graph_add_event(session.graph, "job_tick", {"jobId": job.get("id"), "kind": kind, "summary": f"timer fired: {label}"})
+        record_journal_entry(
+            session,
+            session_id,
+            {"type": "job_tick"},
+            {
+                "ok": True,
+                "message": f"timer fired: {label}",
+                "policy": {"allowed": True, "reason": "scheduled", "code": "scheduled"},
+                "capability": {"domain": "system", "risk": "low"},
+                "diff": zero_diff(),
+            },
+        )
+        return {
+            "type": "timer_fired",
+            "jobId": str(job.get("id", "")),
+            "kind": kind,
+            "title": "Timer complete",
+            "message": label,
+            "durationMs": duration_ms,
+            "createdAt": now_ms(),
+        }
+
     if kind == "audit_open_tasks":
         projection = graph_projection(session.graph)
         open_tasks = sum(1 for t in projection["tasks"] if not t.get("done"))
@@ -12879,7 +13075,12 @@ def compile_intent_envelope(text: str, nous_hint: "dict[str, Any] | None" = None
     if nous_hint and nous_hint.get("op") and float(nous_hint.get("confidence", 0)) >= 0.6:
         op = str(nous_hint["op"])
         domain = _op_to_domain(op)
-        writes = [{"type": op, "domain": domain, "payload": nous_hint.get("slots") or {}}]
+        nous_slots = nous_hint.get("slots") or {}
+        # Always run the local extractor so it can fill in fields the LLM missed.
+        # Nous-supplied slots take precedence; local extractor fills the gaps.
+        local_slots = extract_slots_for_op(op, normalized_text, lower)
+        merged = {**local_slots, **nous_slots}
+        writes = [{"type": op, "domain": domain, "payload": merged}]
     else:
         writes = parse_commands(normalized_text)
     clarification = build_clarification_signal(normalized_text, lower, writes)
@@ -17186,6 +17387,8 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "schedule_watch_task": {"domain": "system", "risk": "low"},
     "schedule_remind_note": {"domain": "system", "risk": "low"},
     "schedule_remind_once": {"domain": "system", "risk": "low"},
+    "timer_start": {"domain": "system", "risk": "low"},
+    "timer_stop": {"domain": "system", "risk": "low"},
     "list_reminders": {"domain": "system", "risk": "low"},
     "reminder_status": {"domain": "system", "risk": "low"},
     "cancel_reminder": {"domain": "system", "risk": "low"},
@@ -17316,6 +17519,12 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "location_status": {"domain": "system", "risk": "low"},
     "shop_catalog_search": {"domain": "shopping", "risk": "low"},
     "weather_forecast": {"domain": "weather", "risk": "low"},
+    "sports_scores": {"domain": "sports", "risk": "low"},
+    "sports_schedule": {"domain": "sports", "risk": "low"},
+    "sports_standings": {"domain": "sports", "risk": "low"},
+    "sports_follow_team": {"domain": "sports", "risk": "low"},
+    "sports_unfollow_team": {"domain": "sports", "risk": "low"},
+    "sports_my_teams": {"domain": "sports", "risk": "low"},
     "telephony_status": {"domain": "telephony", "risk": "low"},
     "telephony_call_start": {"domain": "telephony", "risk": "high"},
     "banking_status": {"domain": "bank", "risk": "low"},
@@ -17338,6 +17547,39 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "compact_journal": {"domain": "system", "risk": "high"},
     "retry_persist": {"domain": "system", "risk": "low"},
     "reset_memory": {"domain": "system", "risk": "high"},
+    # Content management
+    "content_find":         {"domain": "content", "risk": "low"},
+    "content_list":         {"domain": "content", "risk": "low"},
+    "content_history":      {"domain": "content", "risk": "low"},
+    "content_branch":       {"domain": "content", "risk": "low"},
+    "content_revert":       {"domain": "content", "risk": "medium"},
+    "content_share":        {"domain": "content", "risk": "low"},
+    # Documents
+    "document_create":      {"domain": "document", "risk": "low"},
+    "document_edit":        {"domain": "document", "risk": "low"},
+    # Spreadsheets
+    "spreadsheet_create":   {"domain": "spreadsheet", "risk": "low"},
+    "spreadsheet_edit":     {"domain": "spreadsheet", "risk": "low"},
+    # Presentations
+    "presentation_create":  {"domain": "presentation", "risk": "low"},
+    "presentation_edit":    {"domain": "presentation", "risk": "low"},
+    # Code / IDE
+    "code_create":          {"domain": "code", "risk": "low"},
+    "code_edit":            {"domain": "code", "risk": "low"},
+    "code_explain":         {"domain": "code", "risk": "low"},
+    "code_debug":           {"domain": "code", "risk": "low"},
+    "code_run":             {"domain": "code", "risk": "medium"},
+    # Terminal
+    "terminal_run":         {"domain": "terminal", "risk": "medium"},
+    # Calendar
+    "calendar_create":      {"domain": "calendar", "risk": "low"},
+    "calendar_list":        {"domain": "calendar", "risk": "low"},
+    "calendar_cancel":      {"domain": "calendar", "risk": "medium"},
+    # Email
+    "email_compose":        {"domain": "email", "risk": "medium"},
+    "email_read":           {"domain": "email", "risk": "low"},
+    "email_reply":          {"domain": "email", "risk": "medium"},
+    "email_search":         {"domain": "email", "risk": "low"},
 }
 COMMUTATIVE_MERGE_OPS = {"add_task", "add_note", "add_expense"}
 
@@ -18543,10 +18785,23 @@ def graph_to_memory(graph: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         for e in entities
         if e.get("kind") == "note"
     ]
+    teams = [
+        {
+            "id": e.get("id"),
+            "team": str(e.get("team", "")),
+            "abbrev": str(e.get("abbrev", "")),
+            "sport": str(e.get("sport", "")),
+            "league": str(e.get("league", "")),
+            "createdAt": int(e.get("createdAt", now_ms())),
+        }
+        for e in entities
+        if e.get("kind") == "followed_team"
+    ]
     tasks.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
     expenses.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
     notes.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
-    return {"tasks": tasks, "expenses": expenses, "notes": notes}
+    teams.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
+    return {"tasks": tasks, "expenses": expenses, "notes": notes, "teams": teams}
 
 
 def graph_projection(graph: dict[str, Any]) -> dict[str, Any]:
@@ -24446,6 +24701,18 @@ def memory_to_graph(memory: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
             graph,
             {"kind": "note", "text": str(note.get("text", "")), "createdAt": int(note.get("createdAt", now_ms()))},
         )
+    for team in memory.get("teams", []):
+        graph_add_entity(
+            graph,
+            {
+                "kind": "followed_team",
+                "team": str(team.get("team", "")),
+                "abbrev": str(team.get("abbrev", "")),
+                "sport": str(team.get("sport", "")),
+                "league": str(team.get("league", "")),
+                "createdAt": int(team.get("createdAt", now_ms())),
+            },
+        )
     return graph
 
 
@@ -26892,6 +27159,44 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         seconds = int(delay_ms // 1000)
         return {"ok": True, "message": f"Scheduled one-shot reminder in {seconds}s"}
 
+    if kind == "timer_start":
+        duration_ms = int(payload.get("durationMs", 0) or 0)
+        label = str(payload.get("text", "Timer")).strip() or "Timer"
+        if duration_ms <= 0:
+            return {"ok": False, "message": "Timer duration must be > 0. Try: set a timer for 5 minutes"}
+        duration_ms = max(1_000, min(duration_ms, 24 * 60 * 60 * 1_000))
+        job = upsert_job(
+            session.jobs,
+            {
+                "kind": "timer",
+                "intervalMinutes": 0,
+                "intervalMs": 0,
+                "oneShot": True,
+                "text": label,
+                "durationMs": duration_ms,
+            },
+            dedupe_key=f"timer:{label.lower()}:{int(duration_ms)}",
+        )
+        job["nextRunAt"] = now_ms() + duration_ms
+        graph_add_event(graph, "timer_start", {"jobId": job["id"], "durationMs": duration_ms})
+        seconds = int(duration_ms // 1_000)
+        mins, secs = divmod(seconds, 60)
+        human = f"{mins}m {secs}s" if mins else f"{secs}s"
+        return {"ok": True, "message": f"Timer started: {human}"}
+
+    if kind == "timer_stop":
+        active_timers = [
+            j for j in session.jobs
+            if str(j.get("kind", "")).strip() == "timer" and bool(j.get("active", True))
+        ]
+        if not active_timers:
+            return {"ok": False, "message": "No active timer to stop."}
+        target = max(active_timers, key=lambda j: int(j.get("createdAt", 0) or 0))
+        session.jobs[:] = [x for x in session.jobs if x.get("id") != target.get("id")]
+        graph_add_event(graph, "timer_stop", {"jobId": target.get("id")})
+        label = str(target.get("text", "Timer")).strip() or "Timer"
+        return {"ok": True, "message": f"Timer stopped: {label}"}
+
     if kind == "list_reminders":
         items = reminder_jobs(session.jobs)
         if not items:
@@ -29330,11 +29635,68 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             })
 
         graph_add_event(graph, "weather_forecast", {"location": resolved[:80], "source": source, "window": window})
-        # Build preview lines appropriate to the window.
-        if window == "7day" and daily_data:
-            lines = [f"location: {resolved}", f"7-day forecast:"]
+
+        # Resolve window → filter/slice data and compute display label.
+        local_hour = int(snapshot.get("localHour", -1) or -1)
+        window_label = window
+        display_hourly: list[dict[str, Any]] | None = None  # None = today's hourly (default)
+
+        _WX_WEEKDAY: dict[str, str] = {
+            "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+            "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
+        }
+        _WX_TOD: dict[str, tuple[int, int]] = {
+            "morning": (5, 12), "afternoon": (12, 18), "evening": (17, 23),
+        }
+
+        _m_nday = re.match(r"^(\d+)day$", window)
+        if _m_nday:
+            n = max(1, min(int(_m_nday.group(1)), len(daily_data)))
+            daily_data = daily_data[:n]
+            window_label = f"{n}-day"
+        elif window.lower() in _WX_WEEKDAY:
+            abbrev = _WX_WEEKDAY[window.lower()]
+            matched = [d for d in daily_data if d["dayName"][:3].lower() == abbrev]
+            daily_data = matched[:1] if matched else daily_data[:1]
+            window_label = window.capitalize()
+        elif window in _WX_TOD or window.startswith("tomorrow-"):
+            use_tomorrow = window.startswith("tomorrow-")
+            tod = window.replace("tomorrow-", "") if use_tomorrow else window
+            src = hourly_tomorrow_data if use_tomorrow else hourly_data
+            if tod in _WX_TOD and local_hour >= 0:
+                start, end = _WX_TOD[tod]
+                display_hourly = [
+                    h for h in src
+                    if start <= (local_hour + int(h.get("hourOffset", 0))) % 24 < end
+                ]
+            else:
+                display_hourly = list(src)
+            prefix = "Tomorrow" if use_tomorrow else "This"
+            window_label = f"{prefix} {tod}"
+        elif window == "weekend":
+            wknd = [d for d in daily_data if d["dayName"][:3].lower() in ("sat", "sun")]
+            daily_data = wknd if wknd else daily_data[:2]
+            window_label = "Weekend"
+        elif window == "7day":
+            window_label = "7-day"
+        elif window == "tomorrow":
+            window_label = "Tomorrow"
+        elif window == "tonight":
+            window_label = "Tonight"
+
+        # Build preview lines.
+        is_tod = display_hourly is not None
+        is_multi = not is_tod and window not in ("now", "tonight", "tomorrow")
+        if is_multi and daily_data:
+            lines = [f"location: {resolved}", f"{window_label} forecast:"]
             for day in daily_data:
                 lines.append(f"  {day['dayName']}: {day['condition']}, {round(day['minTempF'])}-{round(day['maxTempF'])}F")
+        elif is_tod and display_hourly:
+            temps = [float(h.get("tempF", temperature)) for h in display_hourly]
+            avg_t = round(sum(temps) / len(temps)) if temps else round(temperature)
+            conds = [str(h.get("condition", condition)) for h in display_hourly]
+            cond_summary = max(set(conds), key=conds.count) if conds else condition
+            lines = [f"location: {resolved}", f"{window_label}: {cond_summary}, ~{avg_t}F"]
         elif window in ("tomorrow", "tonight") and hourly_tomorrow_data:
             tmr = daily_data[1] if len(daily_data) > 1 else {}
             lines = [
@@ -29366,14 +29728,279 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "windMph": float(wind),
                 "source": source,
                 "window": window,
-                "forecast": hourly_data,
+                "windowLabel": window_label,
+                "forecast": display_hourly if display_hourly is not None else hourly_data,
                 "forecastTomorrow": hourly_tomorrow_data,
                 "daily": daily_data,
-                "localHour":   int(snapshot.get("localHour", -1) or -1),
+                "localHour":   local_hour,
                 "sunriseHour": int(snapshot.get("sunriseHour", 6) or 6),
                 "sunsetHour":  int(snapshot.get("sunsetHour", 19) or 19),
                 "sourceTarget": source_target,
             },
+        }
+
+    # ------------------------------------------------------------------
+    # Sports handlers
+    # ------------------------------------------------------------------
+    if kind in ("sports_scores", "sports_schedule", "sports_standings"):
+        team = str(payload.get("team", "")).strip()
+        abbrev = str(payload.get("abbrev", "")).strip()
+        league = str(payload.get("sport", "")).strip().lower() or "nfl"
+        if league not in _ESPN_LEAGUES:
+            # try to map sport nickname
+            _sport_map = {
+                "football": "nfl", "basketball": "nba", "baseball": "mlb", "hockey": "nhl",
+                "softball": "ncaas", "college football": "ncaaf", "college basketball": "ncaab",
+            }
+            league = _sport_map.get(league, "nfl")
+
+        if kind == "sports_standings":
+            raw = espn_fetch(league, "standings")
+            if not raw.get("ok"):
+                return {"ok": False, "message": f"Standings unavailable: {raw.get('error', 'ESPN error')}", "previewLines": [f"league: {league}", f"error: {raw.get('error', '')}[:100]"]}
+            lines = _espn_standings_lines(raw, league)
+            graph_add_event(graph, "sports_standings", {"league": league})
+            return {
+                "ok": True,
+                "message": f"{league.upper()} standings",
+                "previewLines": lines[:10],
+                "data": {"op": "sports_standings", "league": league, "standings": raw},
+            }
+
+        endpoint = "scoreboard"
+        raw = espn_fetch(league, endpoint)
+        if not raw.get("ok"):
+            return {"ok": False, "message": f"ESPN unavailable: {raw.get('error', 'ESPN error')}", "previewLines": [f"league: {league}", f"error: {str(raw.get('error', ''))[:100]}"]}
+
+        all_events = raw.get("events", [])
+        events = _resolve_team_filter(team, abbrev, all_events) if (team or abbrev) else all_events
+
+        if kind == "sports_scores":
+            # completed or in-progress games
+            scored = [e for e in events if str(e.get("status", {}).get("type", {}).get("state", "")).lower() in ("post", "in")]
+            display = scored or events
+            lines = [_espn_game_label(e) for e in display[:8]]
+            label = f"{league.upper()} scores" + (f" · {team or abbrev}" if (team or abbrev) else "")
+            graph_add_event(graph, "sports_scores", {"league": league, "team": team})
+            # Fetch venue image for the first (focused) game
+            venue_image_url = ""
+            if display:
+                first_comp = ((display[0].get("competitions") or [{}])[0] or {})
+                venue_id = str((first_comp.get("venue") or {}).get("id", "") or "").strip()
+                if venue_id:
+                    venue_image_url = espn_fetch_venue_image(venue_id)
+            return {
+                "ok": True,
+                "message": label,
+                "previewLines": lines[:8] or [f"No scores found for {league.upper()}"],
+                "data": {"op": "sports_scores", "league": league, "team": team, "abbrev": abbrev,
+                         "events": display[:8], "venueImageUrl": venue_image_url},
+            }
+        else:  # sports_schedule
+            upcoming = [e for e in events if str(e.get("status", {}).get("type", {}).get("state", "")).lower() == "pre"]
+            display = upcoming or events
+            lines = [_espn_game_label(e) for e in display[:8]]
+            label = f"{league.upper()} schedule" + (f" · {team or abbrev}" if (team or abbrev) else "")
+            graph_add_event(graph, "sports_schedule", {"league": league, "team": team})
+            return {
+                "ok": True,
+                "message": label,
+                "previewLines": lines[:8] or [f"No upcoming games found for {league.upper()}"],
+                "data": {"op": "sports_schedule", "league": league, "team": team, "abbrev": abbrev, "events": display[:8]},
+            }
+
+    if kind == "sports_follow_team":
+        team = str(payload.get("team", "")).strip()
+        abbrev = str(payload.get("abbrev", "")).strip()
+        league = str(payload.get("sport", "")).strip().lower() or ""
+        if not team and not abbrev:
+            return {"ok": False, "message": "No team specified.", "previewLines": ["error: team name required"]}
+        # Deduplicate: remove existing entity for same team before adding
+        entities = graph.get("entities", [])
+        graph["entities"] = [
+            e for e in entities
+            if not (e.get("kind") == "followed_team" and
+                    (str(e.get("abbrev", "")).upper() == abbrev.upper() or
+                     str(e.get("team", "")).lower() == team.lower()))
+        ]
+        graph_add_entity(graph, {"kind": "followed_team", "team": team, "abbrev": abbrev, "sport": league, "league": league, "createdAt": now_ms()})
+        graph_add_event(graph, "sports_follow_team", {"team": team, "league": league})
+        current_teams = [e for e in graph.get("entities", []) if e.get("kind") == "followed_team"]
+        teams_list = [{"team": e.get("team", ""), "abbrev": e.get("abbrev", ""), "sport": e.get("sport", "")} for e in current_teams]
+        return {
+            "ok": True,
+            "message": f"Now following the {team or abbrev}",
+            "previewLines": [f"following: {team or abbrev} ({league.upper()})", f"total followed: {len(teams_list)}"],
+            "data": {"op": "sports_follow_team", "team": team, "abbrev": abbrev, "sport": league, "teams": teams_list},
+        }
+
+    if kind == "sports_unfollow_team":
+        team = str(payload.get("team", "")).strip()
+        abbrev = str(payload.get("abbrev", "")).strip()
+        entities = graph.get("entities", [])
+        before = len([e for e in entities if e.get("kind") == "followed_team"])
+        graph["entities"] = [
+            e for e in entities
+            if not (e.get("kind") == "followed_team" and
+                    (str(e.get("abbrev", "")).upper() == abbrev.upper() or
+                     str(e.get("team", "")).lower() == team.lower()))
+        ]
+        after = len([e for e in graph.get("entities", []) if e.get("kind") == "followed_team"])
+        removed = before - after
+        graph_add_event(graph, "sports_unfollow_team", {"team": team})
+        current_teams = [e for e in graph.get("entities", []) if e.get("kind") == "followed_team"]
+        teams_list = [{"team": e.get("team", ""), "abbrev": e.get("abbrev", ""), "sport": e.get("sport", "")} for e in current_teams]
+        return {
+            "ok": True,
+            "message": f"{'Unfollowed' if removed else 'Not found:'} {team or abbrev}",
+            "previewLines": [f"unfollowed: {team or abbrev}", f"remaining: {after}"],
+            "data": {"op": "sports_unfollow_team", "team": team, "abbrev": abbrev, "removed": removed, "teams": teams_list},
+        }
+
+    if kind == "sports_my_teams":
+        current_teams = [e for e in graph.get("entities", []) if e.get("kind") == "followed_team"]
+        teams_list = [{"team": e.get("team", ""), "abbrev": e.get("abbrev", ""), "sport": e.get("sport", "")} for e in current_teams]
+        graph_add_event(graph, "sports_my_teams", {})
+        if not teams_list:
+            return {
+                "ok": True,
+                "message": "No teams followed yet.",
+                "previewLines": ["Say 'follow the Bears' to start tracking a team."],
+                "data": {"op": "sports_my_teams", "teams": []},
+            }
+        lines = [f"  {t['team'] or t['abbrev']} ({t['sport'].upper()})" for t in teams_list]
+        return {
+            "ok": True,
+            "message": f"Your teams ({len(teams_list)})",
+            "previewLines": [f"Following {len(teams_list)} team(s):"] + lines[:8],
+            "data": {"op": "sports_my_teams", "teams": teams_list},
+        }
+
+    # ------------------------------------------------------------------
+    # Computer-layer handlers (stubs — Nous generates content, OS stores it)
+    # ------------------------------------------------------------------
+
+    if kind in ("content_find", "content_list", "content_history",
+                "content_branch", "content_revert", "content_share"):
+        action    = str(payload.get("action", kind.replace("content_", ""))).strip()
+        name      = str(payload.get("name", "")).strip()
+        ctype     = str(payload.get("type", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "name": name, "type": ctype})
+        label = name or ctype or "content"
+        return {
+            "ok": True,
+            "message": f"Content {action}: {label}",
+            "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}", f"type: {ctype or 'any'}"],
+            "data": {"op": kind, "action": action, "name": name, "type": ctype},
+        }
+
+    if kind in ("document_create", "document_edit"):
+        action = str(payload.get("action", "create")).strip()
+        name   = str(payload.get("name", "")).strip()
+        topic  = str(payload.get("topic", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "name": name, "topic": topic})
+        return {
+            "ok": True,
+            "message": f"Document {action}: {name or topic or 'new document'}",
+            "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}", f"topic: {topic or '(unspecified)'}"],
+            "data": {"op": kind, "action": action, "name": name, "topic": topic},
+        }
+
+    if kind in ("spreadsheet_create", "spreadsheet_edit"):
+        action = str(payload.get("action", "create")).strip()
+        name   = str(payload.get("name", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "name": name})
+        return {
+            "ok": True,
+            "message": f"Spreadsheet {action}: {name or 'new spreadsheet'}",
+            "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}"],
+            "data": {"op": kind, "action": action, "name": name},
+        }
+
+    if kind in ("presentation_create", "presentation_edit"):
+        action = str(payload.get("action", "create")).strip()
+        name   = str(payload.get("name", "")).strip()
+        topic  = str(payload.get("topic", "")).strip()
+        slides = payload.get("slides")
+        graph_add_event(graph, kind, {"action": action, "name": name, "topic": topic})
+        lines  = [f"action: {action}", f"name: {name or '(unspecified)'}", f"topic: {topic or '(unspecified)'}"]
+        if slides:
+            lines.append(f"slides: {slides}")
+        return {
+            "ok": True,
+            "message": f"Presentation {action}: {name or topic or 'new presentation'}",
+            "previewLines": lines,
+            "data": {"op": kind, "action": action, "name": name, "topic": topic, "slides": slides},
+        }
+
+    if kind in ("code_create", "code_edit", "code_explain", "code_debug", "code_run"):
+        action   = str(payload.get("action", kind.replace("code_", ""))).strip()
+        language = str(payload.get("language", "")).strip()
+        name     = str(payload.get("name", "")).strip()
+        topic    = str(payload.get("topic", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "language": language, "name": name})
+        lines = [f"action: {action}"]
+        if language:
+            lines.append(f"language: {language}")
+        if name:
+            lines.append(f"name: {name}")
+        if topic:
+            lines.append(f"topic: {topic}")
+        return {
+            "ok": True,
+            "message": f"Code {action}" + (f" ({language})" if language else ""),
+            "previewLines": lines,
+            "data": {"op": kind, "action": action, "language": language, "name": name, "topic": topic},
+        }
+
+    if kind == "terminal_run":
+        command = str(payload.get("command", "")).strip()
+        graph_add_event(graph, "terminal_run", {"command": command or "(interactive)"})
+        return {
+            "ok": True,
+            "message": "Terminal" + (f": {command}" if command else " opened"),
+            "previewLines": [f"command: {command or '(interactive)'}"],
+            "data": {"op": "terminal_run", "command": command},
+        }
+
+    if kind in ("calendar_create", "calendar_list", "calendar_cancel"):
+        action = str(payload.get("action", kind.replace("calendar_", ""))).strip()
+        title  = str(payload.get("title", "")).strip()
+        date   = str(payload.get("date", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "title": title, "date": date})
+        lines  = [f"action: {action}"]
+        if title:
+            lines.append(f"event: {title}")
+        if date:
+            lines.append(f"when: {date}")
+        return {
+            "ok": True,
+            "message": f"Calendar {action}" + (f": {title}" if title else ""),
+            "previewLines": lines,
+            "data": {"op": kind, "action": action, "title": title, "date": date},
+        }
+
+    if kind in ("email_compose", "email_read", "email_reply", "email_search"):
+        action  = str(payload.get("action", kind.replace("email_", ""))).strip()
+        to      = str(payload.get("to", "")).strip()
+        subject = str(payload.get("subject", "")).strip()
+        query   = str(payload.get("query", "")).strip()
+        sender  = str(payload.get("from", "")).strip()
+        graph_add_event(graph, kind, {"action": action, "to": to, "subject": subject})
+        lines   = [f"action: {action}"]
+        if to:
+            lines.append(f"to: {to}")
+        if subject:
+            lines.append(f"subject: {subject}")
+        if sender:
+            lines.append(f"from: {sender}")
+        if query:
+            lines.append(f"query: {query}")
+        return {
+            "ok": True,
+            "message": f"Email {action}" + (f" → {to}" if to else ""),
+            "previewLines": lines,
+            "data": {"op": kind, "action": action, "to": to, "subject": subject, "query": query, "from": sender},
         }
 
     if kind == "mcp_tool_call":

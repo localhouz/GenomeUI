@@ -63,6 +63,7 @@ class Intent:
     patterns: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
+    slots: dict[str, str] = field(default_factory=dict)  # slot_name → hint for LLM
 
 
 @dataclass
@@ -97,14 +98,15 @@ _FILLER_RE = re.compile(
 
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace and strip leading filler phrases."""
+    """Collapse whitespace, strip trailing punctuation, and strip leading filler phrases."""
     s = re.sub(r"\s+", " ", text.strip())
+    s = re.sub(r"[?.!]+$", "", s).strip()  # trailing ? ! . don't affect matching
     return _FILLER_RE.sub("", s).strip()
 
 
 _LOC_PREP_RE = re.compile(
     r"\b(?:in|at|for)\s+(.+?)"
-    r"(?:\s+(?:today|tomorrow|tonight|now|right\s+now|this\s+week|next\s+week))?$",
+    r"(?:\s+(?:today|tomorrow|tonight|now|right\s+now|this\s+week|next\s+week|this\s+weekend|weekend))?$",
     re.IGNORECASE,
 )
 
@@ -115,7 +117,9 @@ def _extract_location(raw: str, lower: str) -> str:
     m = _LOC_PREP_RE.search(raw)
     if m:
         candidate = _normalize(m.group(1))
-        if candidate.lower() not in {"today", "tomorrow", "now", "right now", "tonight"}:
+        if candidate.lower() not in {"today", "tomorrow", "now", "right now", "tonight",
+                                     "weekend", "this weekend", "the weekend",
+                                     "this week", "next week", "the week"}:
             return candidate
 
     # "here / where I am / my location"
@@ -139,16 +143,53 @@ def _extract_location(raw: str, lower: str) -> str:
     return ""
 
 
+_WEEKDAY_FULL = frozenset({
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+_WEEKDAY_ABBREV: dict[str, str] = {
+    "mon": "monday", "tue": "tuesday", "tues": "tuesday",
+    "wed": "wednesday", "thu": "thursday", "thur": "thursday", "thurs": "thursday",
+    "fri": "friday", "sat": "saturday", "sun": "sunday",
+}
+
+
 def _extract_time_window(lower: str) -> str:
-    """Extract weather/forecast time window: now | tonight | tomorrow | 7day."""
-    if re.search(r"\b(tomorrow|tom(?:rw)?)\b", lower):
-        return "tomorrow"
+    """Extract weather/forecast time window.
+
+    Returns one of: now | tonight | tomorrow | weekend | Nday | <weekday> |
+                    morning | afternoon | evening |
+                    tomorrow-morning | tomorrow-afternoon | tomorrow-evening
+    """
+    # N-day forecast: "3 day", "5-day", "10 day forecast"
+    m = re.search(r"\b(\d+)[\s\-]?day\b", lower)
+    if m:
+        n = max(1, min(int(m.group(1)), 14))
+        return f"{n}day"
+
+    # Specific weekday (full names first so abbreviation loop won't double-match)
+    for full in _WEEKDAY_FULL:
+        if re.search(rf"\b{full}\b", lower):
+            return full
+    for abbrev, full in _WEEKDAY_ABBREV.items():
+        if re.search(rf"\b{abbrev}\b", lower):
+            return full
+
+    # Time-of-day, optionally combined with "tomorrow"
+    has_tomorrow = bool(re.search(r"\b(tomorrow|tom(?:rw)?)\b", lower))
+    if re.search(r"\bmorning\b", lower):
+        return "tomorrow-morning" if has_tomorrow else "morning"
+    if re.search(r"\bafternoon\b", lower):
+        return "tomorrow-afternoon" if has_tomorrow else "afternoon"
     if re.search(r"\b(tonight|this\s+(?:evening|night))\b", lower):
         return "tonight"
-    if re.search(
-        r"\b(this\s+week|next\s+week|weekend|7[\s\-]?day|weekly|extended|"
-        r"week(?:ly)?|this\s+weekend)\b", lower
-    ):
+    if re.search(r"\bevening\b", lower):
+        return "tomorrow-evening" if has_tomorrow else "evening"
+    if has_tomorrow:
+        return "tomorrow"
+
+    if re.search(r"\b(this\s+weekend|the\s+weekend|next\s+weekend|weekend)\b", lower):
+        return "weekend"
+    if re.search(r"\b(this\s+week|next\s+week|weekly|extended|week(?:ly)?)\b", lower):
         return "7day"
     return "now"
 
@@ -602,6 +643,872 @@ def _ext_web_summarize(raw: str, _lower: str) -> dict[str, Any] | None:
     return {"url": m.group(1).rstrip(".,;)")}
 
 
+# ─── Sports helpers ──────────────────────────────────────────────────────────
+
+# Mapping: lowercase key → (full_name, abbrev, sport_league)
+# sport_league matches _SPORT_LEAGUE keys in main.py
+_TEAM_LOOKUP: dict[str, tuple[str, str, str]] = {
+    # ── NFL ──────────────────────────────────────────────────────────────────
+    "bears": ("Chicago Bears", "CHI", "nfl"),
+    "chicago bears": ("Chicago Bears", "CHI", "nfl"),
+    "chi": ("Chicago Bears", "CHI", "nfl"),
+    "packers": ("Green Bay Packers", "GB", "nfl"),
+    "green bay packers": ("Green Bay Packers", "GB", "nfl"),
+    "gb": ("Green Bay Packers", "GB", "nfl"),
+    "vikings": ("Minnesota Vikings", "MIN", "nfl"),
+    "minnesota vikings": ("Minnesota Vikings", "MIN", "nfl"),
+    "lions": ("Detroit Lions", "DET", "nfl"),
+    "detroit lions": ("Detroit Lions", "DET", "nfl"),
+    "cowboys": ("Dallas Cowboys", "DAL", "nfl"),
+    "dallas cowboys": ("Dallas Cowboys", "DAL", "nfl"),
+    "dal": ("Dallas Cowboys", "DAL", "nfl"),
+    "eagles": ("Philadelphia Eagles", "PHI", "nfl"),
+    "philadelphia eagles": ("Philadelphia Eagles", "PHI", "nfl"),
+    "giants": ("New York Giants", "NYG", "nfl"),
+    "new york giants": ("New York Giants", "NYG", "nfl"),
+    "nyg": ("New York Giants", "NYG", "nfl"),
+    "commanders": ("Washington Commanders", "WSH", "nfl"),
+    "washington commanders": ("Washington Commanders", "WSH", "nfl"),
+    "patriots": ("New England Patriots", "NE", "nfl"),
+    "new england patriots": ("New England Patriots", "NE", "nfl"),
+    "bills": ("Buffalo Bills", "BUF", "nfl"),
+    "buffalo bills": ("Buffalo Bills", "BUF", "nfl"),
+    "dolphins": ("Miami Dolphins", "MIA", "nfl"),
+    "miami dolphins": ("Miami Dolphins", "MIA", "nfl"),
+    "jets": ("New York Jets", "NYJ", "nfl"),
+    "new york jets": ("New York Jets", "NYJ", "nfl"),
+    "nyj": ("New York Jets", "NYJ", "nfl"),
+    "steelers": ("Pittsburgh Steelers", "PIT", "nfl"),
+    "pittsburgh steelers": ("Pittsburgh Steelers", "PIT", "nfl"),
+    "ravens": ("Baltimore Ravens", "BAL", "nfl"),
+    "baltimore ravens": ("Baltimore Ravens", "BAL", "nfl"),
+    "browns": ("Cleveland Browns", "CLE", "nfl"),
+    "cleveland browns": ("Cleveland Browns", "CLE", "nfl"),
+    "bengals": ("Cincinnati Bengals", "CIN", "nfl"),
+    "cincinnati bengals": ("Cincinnati Bengals", "CIN", "nfl"),
+    "colts": ("Indianapolis Colts", "IND", "nfl"),
+    "indianapolis colts": ("Indianapolis Colts", "IND", "nfl"),
+    "texans": ("Houston Texans", "HOU", "nfl"),
+    "houston texans": ("Houston Texans", "HOU", "nfl"),
+    "jaguars": ("Jacksonville Jaguars", "JAX", "nfl"),
+    "jacksonville jaguars": ("Jacksonville Jaguars", "JAX", "nfl"),
+    "titans": ("Tennessee Titans", "TEN", "nfl"),
+    "tennessee titans": ("Tennessee Titans", "TEN", "nfl"),
+    "broncos": ("Denver Broncos", "DEN", "nfl"),
+    "denver broncos": ("Denver Broncos", "DEN", "nfl"),
+    "chiefs": ("Kansas City Chiefs", "KC", "nfl"),
+    "kansas city chiefs": ("Kansas City Chiefs", "KC", "nfl"),
+    "kc": ("Kansas City Chiefs", "KC", "nfl"),
+    "raiders": ("Las Vegas Raiders", "LV", "nfl"),
+    "las vegas raiders": ("Las Vegas Raiders", "LV", "nfl"),
+    "chargers": ("Los Angeles Chargers", "LAC", "nfl"),
+    "los angeles chargers": ("Los Angeles Chargers", "LAC", "nfl"),
+    "lac": ("Los Angeles Chargers", "LAC", "nfl"),
+    "49ers": ("San Francisco 49ers", "SF", "nfl"),
+    "niners": ("San Francisco 49ers", "SF", "nfl"),
+    "san francisco 49ers": ("San Francisco 49ers", "SF", "nfl"),
+    "seahawks": ("Seattle Seahawks", "SEA", "nfl"),
+    "seattle seahawks": ("Seattle Seahawks", "SEA", "nfl"),
+    "rams": ("Los Angeles Rams", "LAR", "nfl"),
+    "los angeles rams": ("Los Angeles Rams", "LAR", "nfl"),
+    "lar": ("Los Angeles Rams", "LAR", "nfl"),
+    "cardinals": ("Arizona Cardinals", "ARI", "nfl"),
+    "arizona cardinals": ("Arizona Cardinals", "ARI", "nfl"),
+    "falcons": ("Atlanta Falcons", "ATL", "nfl"),
+    "atlanta falcons": ("Atlanta Falcons", "ATL", "nfl"),
+    "panthers": ("Carolina Panthers", "CAR", "nfl"),
+    "carolina panthers": ("Carolina Panthers", "CAR", "nfl"),
+    "saints": ("New Orleans Saints", "NO", "nfl"),
+    "new orleans saints": ("New Orleans Saints", "NO", "nfl"),
+    "buccaneers": ("Tampa Bay Buccaneers", "TB", "nfl"),
+    "bucs": ("Tampa Bay Buccaneers", "TB", "nfl"),
+    "tampa bay buccaneers": ("Tampa Bay Buccaneers", "TB", "nfl"),
+    # ── NBA ──────────────────────────────────────────────────────────────────
+    "bulls": ("Chicago Bulls", "CHI", "nba"),
+    "chicago bulls": ("Chicago Bulls", "CHI", "nba"),
+    "bucks": ("Milwaukee Bucks", "MIL", "nba"),
+    "milwaukee bucks": ("Milwaukee Bucks", "MIL", "nba"),
+    "pacers": ("Indiana Pacers", "IND", "nba"),
+    "indiana pacers": ("Indiana Pacers", "IND", "nba"),
+    "pistons": ("Detroit Pistons", "DET", "nba"),
+    "detroit pistons": ("Detroit Pistons", "DET", "nba"),
+    "cavaliers": ("Cleveland Cavaliers", "CLE", "nba"),
+    "cavs": ("Cleveland Cavaliers", "CLE", "nba"),
+    "cleveland cavaliers": ("Cleveland Cavaliers", "CLE", "nba"),
+    "celtics": ("Boston Celtics", "BOS", "nba"),
+    "boston celtics": ("Boston Celtics", "BOS", "nba"),
+    "knicks": ("New York Knicks", "NYK", "nba"),
+    "new york knicks": ("New York Knicks", "NYK", "nba"),
+    "76ers": ("Philadelphia 76ers", "PHI", "nba"),
+    "sixers": ("Philadelphia 76ers", "PHI", "nba"),
+    "philadelphia 76ers": ("Philadelphia 76ers", "PHI", "nba"),
+    "nets": ("Brooklyn Nets", "BKN", "nba"),
+    "brooklyn nets": ("Brooklyn Nets", "BKN", "nba"),
+    "raptors": ("Toronto Raptors", "TOR", "nba"),
+    "toronto raptors": ("Toronto Raptors", "TOR", "nba"),
+    "heat": ("Miami Heat", "MIA", "nba"),
+    "miami heat": ("Miami Heat", "MIA", "nba"),
+    "hawks": ("Atlanta Hawks", "ATL", "nba"),
+    "atlanta hawks": ("Atlanta Hawks", "ATL", "nba"),
+    "hornets": ("Charlotte Hornets", "CHA", "nba"),
+    "charlotte hornets": ("Charlotte Hornets", "CHA", "nba"),
+    "magic": ("Orlando Magic", "ORL", "nba"),
+    "orlando magic": ("Orlando Magic", "ORL", "nba"),
+    "wizards": ("Washington Wizards", "WAS", "nba"),
+    "washington wizards": ("Washington Wizards", "WAS", "nba"),
+    "bucks": ("Milwaukee Bucks", "MIL", "nba"),
+    "lakers": ("Los Angeles Lakers", "LAL", "nba"),
+    "los angeles lakers": ("Los Angeles Lakers", "LAL", "nba"),
+    "lal": ("Los Angeles Lakers", "LAL", "nba"),
+    "clippers": ("Los Angeles Clippers", "LAC", "nba"),
+    "los angeles clippers": ("Los Angeles Clippers", "LAC", "nba"),
+    "warriors": ("Golden State Warriors", "GSW", "nba"),
+    "golden state warriors": ("Golden State Warriors", "GSW", "nba"),
+    "gsw": ("Golden State Warriors", "GSW", "nba"),
+    "suns": ("Phoenix Suns", "PHX", "nba"),
+    "phoenix suns": ("Phoenix Suns", "PHX", "nba"),
+    "nuggets": ("Denver Nuggets", "DEN", "nba"),
+    "denver nuggets": ("Denver Nuggets", "DEN", "nba"),
+    "jazz": ("Utah Jazz", "UTA", "nba"),
+    "utah jazz": ("Utah Jazz", "UTA", "nba"),
+    "trail blazers": ("Portland Trail Blazers", "POR", "nba"),
+    "blazers": ("Portland Trail Blazers", "POR", "nba"),
+    "portland trail blazers": ("Portland Trail Blazers", "POR", "nba"),
+    "thunder": ("Oklahoma City Thunder", "OKC", "nba"),
+    "oklahoma city thunder": ("Oklahoma City Thunder", "OKC", "nba"),
+    "okc": ("Oklahoma City Thunder", "OKC", "nba"),
+    "mavericks": ("Dallas Mavericks", "DAL", "nba"),
+    "mavs": ("Dallas Mavericks", "DAL", "nba"),
+    "dallas mavericks": ("Dallas Mavericks", "DAL", "nba"),
+    "rockets": ("Houston Rockets", "HOU", "nba"),
+    "houston rockets": ("Houston Rockets", "HOU", "nba"),
+    "grizzlies": ("Memphis Grizzlies", "MEM", "nba"),
+    "memphis grizzlies": ("Memphis Grizzlies", "MEM", "nba"),
+    "pelicans": ("New Orleans Pelicans", "NOP", "nba"),
+    "new orleans pelicans": ("New Orleans Pelicans", "NOP", "nba"),
+    "spurs": ("San Antonio Spurs", "SAS", "nba"),
+    "san antonio spurs": ("San Antonio Spurs", "SAS", "nba"),
+    "timberwolves": ("Minnesota Timberwolves", "MIN", "nba"),
+    "wolves": ("Minnesota Timberwolves", "MIN", "nba"),
+    "minnesota timberwolves": ("Minnesota Timberwolves", "MIN", "nba"),
+    "kings": ("Sacramento Kings", "SAC", "nba"),
+    "sacramento kings": ("Sacramento Kings", "SAC", "nba"),
+    # ── MLB ──────────────────────────────────────────────────────────────────
+    "cubs": ("Chicago Cubs", "CHC", "mlb"),
+    "chicago cubs": ("Chicago Cubs", "CHC", "mlb"),
+    "chc": ("Chicago Cubs", "CHC", "mlb"),
+    "white sox": ("Chicago White Sox", "CWS", "mlb"),
+    "chicago white sox": ("Chicago White Sox", "CWS", "mlb"),
+    "cws": ("Chicago White Sox", "CWS", "mlb"),
+    "yankees": ("New York Yankees", "NYY", "mlb"),
+    "new york yankees": ("New York Yankees", "NYY", "mlb"),
+    "nyy": ("New York Yankees", "NYY", "mlb"),
+    "mets": ("New York Mets", "NYM", "mlb"),
+    "new york mets": ("New York Mets", "NYM", "mlb"),
+    "nym": ("New York Mets", "NYM", "mlb"),
+    "red sox": ("Boston Red Sox", "BOS", "mlb"),
+    "boston red sox": ("Boston Red Sox", "BOS", "mlb"),
+    "dodgers": ("Los Angeles Dodgers", "LAD", "mlb"),
+    "los angeles dodgers": ("Los Angeles Dodgers", "LAD", "mlb"),
+    "lad": ("Los Angeles Dodgers", "LAD", "mlb"),
+    "giants": ("San Francisco Giants", "SF", "mlb"),
+    "san francisco giants": ("San Francisco Giants", "SF", "mlb"),
+    "astros": ("Houston Astros", "HOU", "mlb"),
+    "houston astros": ("Houston Astros", "HOU", "mlb"),
+    "braves": ("Atlanta Braves", "ATL", "mlb"),
+    "atlanta braves": ("Atlanta Braves", "ATL", "mlb"),
+    "phillies": ("Philadelphia Phillies", "PHI", "mlb"),
+    "philadelphia phillies": ("Philadelphia Phillies", "PHI", "mlb"),
+    "cardinals": ("St. Louis Cardinals", "STL", "mlb"),
+    "st. louis cardinals": ("St. Louis Cardinals", "STL", "mlb"),
+    "stl": ("St. Louis Cardinals", "STL", "mlb"),
+    "brewers": ("Milwaukee Brewers", "MIL", "mlb"),
+    "milwaukee brewers": ("Milwaukee Brewers", "MIL", "mlb"),
+    "reds": ("Cincinnati Reds", "CIN", "mlb"),
+    "cincinnati reds": ("Cincinnati Reds", "CIN", "mlb"),
+    "pirates": ("Pittsburgh Pirates", "PIT", "mlb"),
+    "pittsburgh pirates": ("Pittsburgh Pirates", "PIT", "mlb"),
+    "tigers": ("Detroit Tigers", "DET", "mlb"),
+    "detroit tigers": ("Detroit Tigers", "DET", "mlb"),
+    "indians": ("Cleveland Guardians", "CLE", "mlb"),
+    "guardians": ("Cleveland Guardians", "CLE", "mlb"),
+    "cleveland guardians": ("Cleveland Guardians", "CLE", "mlb"),
+    "twins": ("Minnesota Twins", "MIN", "mlb"),
+    "minnesota twins": ("Minnesota Twins", "MIN", "mlb"),
+    "royals": ("Kansas City Royals", "KC", "mlb"),
+    "kansas city royals": ("Kansas City Royals", "KC", "mlb"),
+    "athletics": ("Oakland Athletics", "OAK", "mlb"),
+    "a's": ("Oakland Athletics", "OAK", "mlb"),
+    "angels": ("Los Angeles Angels", "LAA", "mlb"),
+    "los angeles angels": ("Los Angeles Angels", "LAA", "mlb"),
+    "mariners": ("Seattle Mariners", "SEA", "mlb"),
+    "seattle mariners": ("Seattle Mariners", "SEA", "mlb"),
+    "rangers": ("Texas Rangers", "TEX", "mlb"),
+    "texas rangers": ("Texas Rangers", "TEX", "mlb"),
+    "padres": ("San Diego Padres", "SD", "mlb"),
+    "san diego padres": ("San Diego Padres", "SD", "mlb"),
+    "rockies": ("Colorado Rockies", "COL", "mlb"),
+    "colorado rockies": ("Colorado Rockies", "COL", "mlb"),
+    "diamondbacks": ("Arizona Diamondbacks", "ARI", "mlb"),
+    "dbacks": ("Arizona Diamondbacks", "ARI", "mlb"),
+    "arizona diamondbacks": ("Arizona Diamondbacks", "ARI", "mlb"),
+    "marlins": ("Miami Marlins", "MIA", "mlb"),
+    "miami marlins": ("Miami Marlins", "MIA", "mlb"),
+    "nationals": ("Washington Nationals", "WSH", "mlb"),
+    "washington nationals": ("Washington Nationals", "WSH", "mlb"),
+    "blue jays": ("Toronto Blue Jays", "TOR", "mlb"),
+    "toronto blue jays": ("Toronto Blue Jays", "TOR", "mlb"),
+    "orioles": ("Baltimore Orioles", "BAL", "mlb"),
+    "baltimore orioles": ("Baltimore Orioles", "BAL", "mlb"),
+    "rays": ("Tampa Bay Rays", "TB", "mlb"),
+    "tampa bay rays": ("Tampa Bay Rays", "TB", "mlb"),
+    # ── NHL ──────────────────────────────────────────────────────────────────
+    "blackhawks": ("Chicago Blackhawks", "CHI", "nhl"),
+    "chicago blackhawks": ("Chicago Blackhawks", "CHI", "nhl"),
+    "bruins": ("Boston Bruins", "BOS", "nhl"),
+    "boston bruins": ("Boston Bruins", "BOS", "nhl"),
+    "rangers": ("New York Rangers", "NYR", "nhl"),
+    "new york rangers": ("New York Rangers", "NYR", "nhl"),
+    "nyr": ("New York Rangers", "NYR", "nhl"),
+    "penguins": ("Pittsburgh Penguins", "PIT", "nhl"),
+    "pittsburgh penguins": ("Pittsburgh Penguins", "PIT", "nhl"),
+    "capitals": ("Washington Capitals", "WSH", "nhl"),
+    "caps": ("Washington Capitals", "WSH", "nhl"),
+    "washington capitals": ("Washington Capitals", "WSH", "nhl"),
+    "lightning": ("Tampa Bay Lightning", "TBL", "nhl"),
+    "tampa bay lightning": ("Tampa Bay Lightning", "TBL", "nhl"),
+    "maple leafs": ("Toronto Maple Leafs", "TOR", "nhl"),
+    "leafs": ("Toronto Maple Leafs", "TOR", "nhl"),
+    "toronto maple leafs": ("Toronto Maple Leafs", "TOR", "nhl"),
+    "canadiens": ("Montreal Canadiens", "MTL", "nhl"),
+    "habs": ("Montreal Canadiens", "MTL", "nhl"),
+    "montreal canadiens": ("Montreal Canadiens", "MTL", "nhl"),
+    "red wings": ("Detroit Red Wings", "DET", "nhl"),
+    "detroit red wings": ("Detroit Red Wings", "DET", "nhl"),
+    "golden knights": ("Vegas Golden Knights", "VGK", "nhl"),
+    "vegas golden knights": ("Vegas Golden Knights", "VGK", "nhl"),
+    "vgk": ("Vegas Golden Knights", "VGK", "nhl"),
+    "oilers": ("Edmonton Oilers", "EDM", "nhl"),
+    "edmonton oilers": ("Edmonton Oilers", "EDM", "nhl"),
+    "flames": ("Calgary Flames", "CGY", "nhl"),
+    "calgary flames": ("Calgary Flames", "CGY", "nhl"),
+    "canucks": ("Vancouver Canucks", "VAN", "nhl"),
+    "vancouver canucks": ("Vancouver Canucks", "VAN", "nhl"),
+    "avalanche": ("Colorado Avalanche", "COL", "nhl"),
+    "avs": ("Colorado Avalanche", "COL", "nhl"),
+    "colorado avalanche": ("Colorado Avalanche", "COL", "nhl"),
+    "stars": ("Dallas Stars", "DAL", "nhl"),
+    "dallas stars": ("Dallas Stars", "DAL", "nhl"),
+    "wild": ("Minnesota Wild", "MIN", "nhl"),
+    "minnesota wild": ("Minnesota Wild", "MIN", "nhl"),
+    "blues": ("St. Louis Blues", "STL", "nhl"),
+    "st. louis blues": ("St. Louis Blues", "STL", "nhl"),
+    "predators": ("Nashville Predators", "NSH", "nhl"),
+    "preds": ("Nashville Predators", "NSH", "nhl"),
+    "nashville predators": ("Nashville Predators", "NSH", "nhl"),
+    "hurricanes": ("Carolina Hurricanes", "CAR", "nhl"),
+    "carolina hurricanes": ("Carolina Hurricanes", "CAR", "nhl"),
+    "flyers": ("Philadelphia Flyers", "PHI", "nhl"),
+    "philadelphia flyers": ("Philadelphia Flyers", "PHI", "nhl"),
+    "sabres": ("Buffalo Sabres", "BUF", "nhl"),
+    "buffalo sabres": ("Buffalo Sabres", "BUF", "nhl"),
+    "senators": ("Ottawa Senators", "OTT", "nhl"),
+    "ottawa senators": ("Ottawa Senators", "OTT", "nhl"),
+    "islanders": ("New York Islanders", "NYI", "nhl"),
+    "new york islanders": ("New York Islanders", "NYI", "nhl"),
+    "nyi": ("New York Islanders", "NYI", "nhl"),
+    "jets": ("Winnipeg Jets", "WPG", "nhl"),
+    "winnipeg jets": ("Winnipeg Jets", "WPG", "nhl"),
+    "ducks": ("Anaheim Ducks", "ANA", "nhl"),
+    "anaheim ducks": ("Anaheim Ducks", "ANA", "nhl"),
+    "sharks": ("San Jose Sharks", "SJS", "nhl"),
+    "san jose sharks": ("San Jose Sharks", "SJS", "nhl"),
+    "kings": ("Los Angeles Kings", "LAK", "nhl"),
+    "los angeles kings": ("Los Angeles Kings", "LAK", "nhl"),
+    "lak": ("Los Angeles Kings", "LAK", "nhl"),
+    "coyotes": ("Utah Hockey Club", "UTA", "nhl"),
+    "utah hockey club": ("Utah Hockey Club", "UTA", "nhl"),
+    "devils": ("New Jersey Devils", "NJD", "nhl"),
+    "new jersey devils": ("New Jersey Devils", "NJD", "nhl"),
+    "njd": ("New Jersey Devils", "NJD", "nhl"),
+    "blue jackets": ("Columbus Blue Jackets", "CBJ", "nhl"),
+    "columbus blue jackets": ("Columbus Blue Jackets", "CBJ", "nhl"),
+    "cbj": ("Columbus Blue Jackets", "CBJ", "nhl"),
+    "panthers": ("Florida Panthers", "FLA", "nhl"),
+    "florida panthers": ("Florida Panthers", "FLA", "nhl"),
+    "fla": ("Florida Panthers", "FLA", "nhl"),
+    "kraken": ("Seattle Kraken", "SEA", "nhl"),
+    "seattle kraken": ("Seattle Kraken", "SEA", "nhl"),
+    # ── NCAAF (College Football) ──────────────────────────────────────────────
+    # SEC
+    "alabama crimson tide": ("Alabama Crimson Tide", "ALA", "ncaaf"),
+    "crimson tide": ("Alabama Crimson Tide", "ALA", "ncaaf"),
+    "alabama": ("Alabama Crimson Tide", "ALA", "ncaaf"),
+    "georgia bulldogs": ("Georgia Bulldogs", "UGA", "ncaaf"),
+    "uga": ("Georgia Bulldogs", "UGA", "ncaaf"),
+    "georgia": ("Georgia Bulldogs", "UGA", "ncaaf"),
+    "lsu tigers": ("LSU Tigers", "LSU", "ncaaf"),
+    "lsu": ("LSU Tigers", "LSU", "ncaaf"),
+    "tennessee volunteers": ("Tennessee Volunteers", "TENN", "ncaaf"),
+    "volunteers": ("Tennessee Volunteers", "TENN", "ncaaf"),
+    "vols": ("Tennessee Volunteers", "TENN", "ncaaf"),
+    "tennessee": ("Tennessee Volunteers", "TENN", "ncaaf"),
+    "auburn tigers": ("Auburn Tigers", "AUB", "ncaaf"),
+    "auburn": ("Auburn Tigers", "AUB", "ncaaf"),
+    "aub": ("Auburn Tigers", "AUB", "ncaaf"),
+    "texas a&m aggies": ("Texas A&M Aggies", "TAMU", "ncaaf"),
+    "texas a&m": ("Texas A&M Aggies", "TAMU", "ncaaf"),
+    "tamu": ("Texas A&M Aggies", "TAMU", "ncaaf"),
+    "aggies": ("Texas A&M Aggies", "TAMU", "ncaaf"),
+    "florida gators": ("Florida Gators", "UF", "ncaaf"),
+    "gators": ("Florida Gators", "UF", "ncaaf"),
+    "florida": ("Florida Gators", "UF", "ncaaf"),
+    "uf": ("Florida Gators", "UF", "ncaaf"),
+    "kentucky wildcats": ("Kentucky Wildcats", "UK", "ncaab"),
+    "uk": ("Kentucky Wildcats", "UK", "ncaab"),
+    "kentucky": ("Kentucky Wildcats", "UK", "ncaab"),
+    "ole miss rebels": ("Ole Miss Rebels", "MISS", "ncaaf"),
+    "ole miss": ("Ole Miss Rebels", "MISS", "ncaaf"),
+    "mississippi state bulldogs": ("Mississippi State Bulldogs", "MSST", "ncaaf"),
+    "mississippi state": ("Mississippi State Bulldogs", "MSST", "ncaaf"),
+    "msst": ("Mississippi State Bulldogs", "MSST", "ncaaf"),
+    "missouri tigers": ("Missouri Tigers", "MIZ", "ncaaf"),
+    "missouri": ("Missouri Tigers", "MIZ", "ncaaf"),
+    "mizzou": ("Missouri Tigers", "MIZ", "ncaaf"),
+    "miz": ("Missouri Tigers", "MIZ", "ncaaf"),
+    "arkansas razorbacks": ("Arkansas Razorbacks", "ARK", "ncaaf"),
+    "razorbacks": ("Arkansas Razorbacks", "ARK", "ncaaf"),
+    "hogs": ("Arkansas Razorbacks", "ARK", "ncaaf"),
+    "arkansas": ("Arkansas Razorbacks", "ARK", "ncaaf"),
+    "ark": ("Arkansas Razorbacks", "ARK", "ncaaf"),
+    "south carolina gamecocks": ("South Carolina Gamecocks", "SC", "ncaaf"),
+    "gamecocks": ("South Carolina Gamecocks", "SC", "ncaaf"),
+    "south carolina": ("South Carolina Gamecocks", "SC", "ncaaf"),
+    "vanderbilt commodores": ("Vanderbilt Commodores", "VAN", "ncaaf"),
+    "commodores": ("Vanderbilt Commodores", "VAN", "ncaaf"),
+    "vanderbilt": ("Vanderbilt Commodores", "VAN", "ncaaf"),
+    "vandy": ("Vanderbilt Commodores", "VAN", "ncaaf"),
+    # Big Ten
+    "ohio state buckeyes": ("Ohio State Buckeyes", "OSU", "ncaaf"),
+    "buckeyes": ("Ohio State Buckeyes", "OSU", "ncaaf"),
+    "ohio state": ("Ohio State Buckeyes", "OSU", "ncaaf"),
+    "michigan wolverines": ("Michigan Wolverines", "MICH", "ncaaf"),
+    "wolverines": ("Michigan Wolverines", "MICH", "ncaaf"),
+    "michigan": ("Michigan Wolverines", "MICH", "ncaaf"),
+    "penn state nittany lions": ("Penn State Nittany Lions", "PSU", "ncaaf"),
+    "nittany lions": ("Penn State Nittany Lions", "PSU", "ncaaf"),
+    "penn state": ("Penn State Nittany Lions", "PSU", "ncaaf"),
+    "psu": ("Penn State Nittany Lions", "PSU", "ncaaf"),
+    "michigan state spartans": ("Michigan State Spartans", "MSU", "ncaaf"),
+    "spartans": ("Michigan State Spartans", "MSU", "ncaaf"),
+    "michigan state": ("Michigan State Spartans", "MSU", "ncaaf"),
+    "msu": ("Michigan State Spartans", "MSU", "ncaaf"),
+    "wisconsin badgers": ("Wisconsin Badgers", "WIS", "ncaaf"),
+    "badgers": ("Wisconsin Badgers", "WIS", "ncaaf"),
+    "wisconsin": ("Wisconsin Badgers", "WIS", "ncaaf"),
+    "iowa hawkeyes": ("Iowa Hawkeyes", "IOWA", "ncaaf"),
+    "hawkeyes": ("Iowa Hawkeyes", "IOWA", "ncaaf"),
+    "iowa": ("Iowa Hawkeyes", "IOWA", "ncaaf"),
+    "indiana hoosiers": ("Indiana Hoosiers", "IU", "ncaab"),
+    "hoosiers": ("Indiana Hoosiers", "IU", "ncaab"),
+    "indiana hoosiers football": ("Indiana Hoosiers", "IU", "ncaaf"),
+    "iu": ("Indiana Hoosiers", "IU", "ncaab"),
+    "purdue boilermakers": ("Purdue Boilermakers", "PUR", "ncaab"),
+    "boilermakers": ("Purdue Boilermakers", "PUR", "ncaab"),
+    "boilers": ("Purdue Boilermakers", "PUR", "ncaab"),
+    "purdue": ("Purdue Boilermakers", "PUR", "ncaab"),
+    "pur": ("Purdue Boilermakers", "PUR", "ncaab"),
+    "minnesota golden gophers": ("Minnesota Golden Gophers", "MINN", "ncaaf"),
+    "golden gophers": ("Minnesota Golden Gophers", "MINN", "ncaaf"),
+    "gophers": ("Minnesota Golden Gophers", "MINN", "ncaaf"),
+    "nebraska cornhuskers": ("Nebraska Cornhuskers", "NEB", "ncaaf"),
+    "cornhuskers": ("Nebraska Cornhuskers", "NEB", "ncaaf"),
+    "huskers": ("Nebraska Cornhuskers", "NEB", "ncaaf"),
+    "nebraska": ("Nebraska Cornhuskers", "NEB", "ncaaf"),
+    "iowa state cyclones": ("Iowa State Cyclones", "ISU", "ncaaf"),
+    "cyclones": ("Iowa State Cyclones", "ISU", "ncaaf"),
+    "iowa state": ("Iowa State Cyclones", "ISU", "ncaaf"),
+    "isu": ("Iowa State Cyclones", "ISU", "ncaaf"),
+    "illinois fighting illini": ("Illinois Fighting Illini", "ILL", "ncaaf"),
+    "fighting illini": ("Illinois Fighting Illini", "ILL", "ncaaf"),
+    "illinois": ("Illinois Fighting Illini", "ILL", "ncaaf"),
+    "northwestern wildcats": ("Northwestern Wildcats", "NW", "ncaaf"),
+    "northwestern": ("Northwestern Wildcats", "NW", "ncaaf"),
+    "maryland terrapins": ("Maryland Terrapins", "MD", "ncaaf"),
+    "terrapins": ("Maryland Terrapins", "MD", "ncaaf"),
+    "terps": ("Maryland Terrapins", "MD", "ncaaf"),
+    "maryland": ("Maryland Terrapins", "MD", "ncaaf"),
+    "rutgers scarlet knights": ("Rutgers Scarlet Knights", "RUTG", "ncaaf"),
+    "scarlet knights": ("Rutgers Scarlet Knights", "RUTG", "ncaaf"),
+    "rutgers": ("Rutgers Scarlet Knights", "RUTG", "ncaaf"),
+    # Big 12
+    "texas longhorns": ("Texas Longhorns", "TEX", "ncaaf"),
+    "longhorns": ("Texas Longhorns", "TEX", "ncaaf"),
+    "texas": ("Texas Longhorns", "TEX", "ncaaf"),
+    "oklahoma sooners": ("Oklahoma Sooners", "OU", "ncaaf"),
+    "sooners": ("Oklahoma Sooners", "OU", "ncaaf"),
+    "oklahoma": ("Oklahoma Sooners", "OU", "ncaaf"),
+    "ou": ("Oklahoma Sooners", "OU", "ncaaf"),
+    "baylor bears": ("Baylor Bears", "BAY", "ncaaf"),
+    "baylor": ("Baylor Bears", "BAY", "ncaaf"),
+    "tcu horned frogs": ("TCU Horned Frogs", "TCU", "ncaaf"),
+    "horned frogs": ("TCU Horned Frogs", "TCU", "ncaaf"),
+    "tcu": ("TCU Horned Frogs", "TCU", "ncaaf"),
+    "kansas state wildcats": ("Kansas State Wildcats", "KSU", "ncaaf"),
+    "kansas state": ("Kansas State Wildcats", "KSU", "ncaaf"),
+    "ksu": ("Kansas State Wildcats", "KSU", "ncaaf"),
+    "oklahoma state cowboys": ("Oklahoma State Cowboys", "OKST", "ncaaf"),
+    "oklahoma state": ("Oklahoma State Cowboys", "OKST", "ncaaf"),
+    "okst": ("Oklahoma State Cowboys", "OKST", "ncaaf"),
+    "west virginia mountaineers": ("West Virginia Mountaineers", "WVU", "ncaaf"),
+    "mountaineers": ("West Virginia Mountaineers", "WVU", "ncaaf"),
+    "west virginia": ("West Virginia Mountaineers", "WVU", "ncaaf"),
+    "wvu": ("West Virginia Mountaineers", "WVU", "ncaaf"),
+    "cincinnati bearcats": ("Cincinnati Bearcats", "CIN", "ncaaf"),
+    "bearcats": ("Cincinnati Bearcats", "CIN", "ncaaf"),
+    "cincinnati": ("Cincinnati Bearcats", "CIN", "ncaaf"),
+    "houston cougars": ("Houston Cougars", "HOU", "ncaab"),
+    "uc": ("Cincinnati Bearcats", "CIN", "ncaaf"),
+    # ACC
+    "clemson tigers": ("Clemson Tigers", "CLEM", "ncaaf"),
+    "clemson": ("Clemson Tigers", "CLEM", "ncaaf"),
+    "clem": ("Clemson Tigers", "CLEM", "ncaaf"),
+    "florida state seminoles": ("Florida State Seminoles", "FSU", "ncaaf"),
+    "seminoles": ("Florida State Seminoles", "FSU", "ncaaf"),
+    "noles": ("Florida State Seminoles", "FSU", "ncaaf"),
+    "florida state": ("Florida State Seminoles", "FSU", "ncaaf"),
+    "fsu": ("Florida State Seminoles", "FSU", "ncaaf"),
+    "north carolina tar heels": ("North Carolina Tar Heels", "UNC", "ncaab"),
+    "tar heels": ("North Carolina Tar Heels", "UNC", "ncaab"),
+    "north carolina": ("North Carolina Tar Heels", "UNC", "ncaab"),
+    "unc": ("North Carolina Tar Heels", "UNC", "ncaab"),
+    "duke blue devils": ("Duke Blue Devils", "DUKE", "ncaab"),
+    "blue devils": ("Duke Blue Devils", "DUKE", "ncaab"),
+    "duke": ("Duke Blue Devils", "DUKE", "ncaab"),
+    "miami hurricanes": ("Miami Hurricanes", "MIA", "ncaaf"),
+    "virginia cavaliers": ("Virginia Cavaliers", "UVA", "ncaab"),
+    "cavaliers": ("Virginia Cavaliers", "UVA", "ncaab"),
+    "uva": ("Virginia Cavaliers", "UVA", "ncaab"),
+    "virginia tech hokies": ("Virginia Tech Hokies", "VT", "ncaaf"),
+    "hokies": ("Virginia Tech Hokies", "VT", "ncaaf"),
+    "virginia tech": ("Virginia Tech Hokies", "VT", "ncaaf"),
+    "vt": ("Virginia Tech Hokies", "VT", "ncaaf"),
+    "nc state wolfpack": ("NC State Wolfpack", "NCST", "ncaaf"),
+    "wolfpack": ("NC State Wolfpack", "NCST", "ncaaf"),
+    "nc state": ("NC State Wolfpack", "NCST", "ncaaf"),
+    "georgia tech yellow jackets": ("Georgia Tech Yellow Jackets", "GT", "ncaaf"),
+    "yellow jackets": ("Georgia Tech Yellow Jackets", "GT", "ncaaf"),
+    "georgia tech": ("Georgia Tech Yellow Jackets", "GT", "ncaaf"),
+    "gt": ("Georgia Tech Yellow Jackets", "GT", "ncaaf"),
+    "louisville cardinals": ("Louisville Cardinals", "LOU", "ncaab"),
+    "louisville": ("Louisville Cardinals", "LOU", "ncaab"),
+    "lou": ("Louisville Cardinals", "LOU", "ncaab"),
+    "pittsburgh panthers": ("Pittsburgh Panthers", "PITT", "ncaaf"),
+    "pitt": ("Pittsburgh Panthers", "PITT", "ncaaf"),
+    "pittsburgh": ("Pittsburgh Panthers", "PITT", "ncaaf"),
+    "boston college eagles": ("Boston College Eagles", "BC", "ncaaf"),
+    "boston college": ("Boston College Eagles", "BC", "ncaaf"),
+    "wake forest demon deacons": ("Wake Forest Demon Deacons", "WF", "ncaaf"),
+    "demon deacons": ("Wake Forest Demon Deacons", "WF", "ncaaf"),
+    "wake forest": ("Wake Forest Demon Deacons", "WF", "ncaaf"),
+    "syracuse orange": ("Syracuse Orange", "SYR", "ncaab"),
+    "syracuse": ("Syracuse Orange", "SYR", "ncaab"),
+    "syr": ("Syracuse Orange", "SYR", "ncaab"),
+    # Pac-12 / now Big Ten/Big 12
+    "usc trojans": ("USC Trojans", "USC", "ncaaf"),
+    "trojans": ("USC Trojans", "USC", "ncaaf"),
+    "usc": ("USC Trojans", "USC", "ncaaf"),
+    "notre dame fighting irish": ("Notre Dame Fighting Irish", "ND", "ncaaf"),
+    "fighting irish": ("Notre Dame Fighting Irish", "ND", "ncaaf"),
+    "notre dame": ("Notre Dame Fighting Irish", "ND", "ncaaf"),
+    "nd": ("Notre Dame Fighting Irish", "ND", "ncaaf"),
+    "oregon ducks": ("Oregon Ducks", "ORE", "ncaaf"),
+    "oregon": ("Oregon Ducks", "ORE", "ncaaf"),
+    "ore": ("Oregon Ducks", "ORE", "ncaaf"),
+    "washington huskies": ("Washington Huskies", "WASH", "ncaaf"),
+    "huskies": ("Washington Huskies", "WASH", "ncaaf"),
+    "washington": ("Washington Huskies", "WASH", "ncaaf"),
+    "utah utes": ("Utah Utes", "UTAH", "ncaaf"),
+    "utes": ("Utah Utes", "UTAH", "ncaaf"),
+    "utah": ("Utah Utes", "UTAH", "ncaaf"),
+    "colorado buffaloes": ("Colorado Buffaloes", "COLO", "ncaaf"),
+    "buffaloes": ("Colorado Buffaloes", "COLO", "ncaaf"),
+    "buffs": ("Colorado Buffaloes", "COLO", "ncaaf"),
+    "colorado": ("Colorado Buffaloes", "COLO", "ncaaf"),
+    "arizona state sun devils": ("Arizona State Sun Devils", "ASU", "ncaaf"),
+    "sun devils": ("Arizona State Sun Devils", "ASU", "ncaaf"),
+    "arizona state": ("Arizona State Sun Devils", "ASU", "ncaaf"),
+    "asu": ("Arizona State Sun Devils", "ASU", "ncaaf"),
+    "oregon state beavers": ("Oregon State Beavers", "ORST", "ncaaf"),
+    "beavers": ("Oregon State Beavers", "ORST", "ncaaf"),
+    "oregon state": ("Oregon State Beavers", "ORST", "ncaaf"),
+    "orst": ("Oregon State Beavers", "ORST", "ncaaf"),
+    "washington state cougars": ("Washington State Cougars", "WSU", "ncaaf"),
+    "wsu": ("Washington State Cougars", "WSU", "ncaaf"),
+    "washington state": ("Washington State Cougars", "WSU", "ncaaf"),
+    "ucla bruins": ("UCLA Bruins", "UCLA", "ncaab"),
+    "ucla": ("UCLA Bruins", "UCLA", "ncaab"),
+    "arizona wildcats": ("Arizona Wildcats", "ARIZ", "ncaab"),
+    "arizona": ("Arizona Wildcats", "ARIZ", "ncaab"),
+    "ariz": ("Arizona Wildcats", "ARIZ", "ncaab"),
+    "byu cougars": ("BYU Cougars", "BYU", "ncaaf"),
+    "byu": ("BYU Cougars", "BYU", "ncaaf"),
+    # Independent / other major programs
+    "kansas jayhawks": ("Kansas Jayhawks", "KAN", "ncaab"),
+    "jayhawks": ("Kansas Jayhawks", "KAN", "ncaab"),
+    "kansas": ("Kansas Jayhawks", "KAN", "ncaab"),
+    "ku": ("Kansas Jayhawks", "KAN", "ncaab"),
+    "kan": ("Kansas Jayhawks", "KAN", "ncaab"),
+    "gonzaga bulldogs": ("Gonzaga Bulldogs", "GONZ", "ncaab"),
+    "gonzaga": ("Gonzaga Bulldogs", "GONZ", "ncaab"),
+    "gonz": ("Gonzaga Bulldogs", "GONZ", "ncaab"),
+    "uconn huskies": ("UConn Huskies", "UCONN", "ncaab"),
+    "uconn": ("UConn Huskies", "UCONN", "ncaab"),
+    "connecticut": ("UConn Huskies", "UCONN", "ncaab"),
+    "villanova wildcats": ("Villanova Wildcats", "NOVA", "ncaab"),
+    "nova": ("Villanova Wildcats", "NOVA", "ncaab"),
+    "villanova": ("Villanova Wildcats", "NOVA", "ncaab"),
+    "marquette golden eagles": ("Marquette Golden Eagles", "MARQ", "ncaab"),
+    "marquette": ("Marquette Golden Eagles", "MARQ", "ncaab"),
+    "marq": ("Marquette Golden Eagles", "MARQ", "ncaab"),
+    "xavier musketeers": ("Xavier Musketeers", "XAV", "ncaab"),
+    "musketeers": ("Xavier Musketeers", "XAV", "ncaab"),
+    "xavier": ("Xavier Musketeers", "XAV", "ncaab"),
+    "xav": ("Xavier Musketeers", "XAV", "ncaab"),
+    "creighton bluejays": ("Creighton Bluejays", "CREI", "ncaab"),
+    "creighton": ("Creighton Bluejays", "CREI", "ncaab"),
+    "crei": ("Creighton Bluejays", "CREI", "ncaab"),
+    "san diego state aztecs": ("San Diego State Aztecs", "SDSU", "ncaab"),
+    "aztecs": ("San Diego State Aztecs", "SDSU", "ncaab"),
+    "san diego state": ("San Diego State Aztecs", "SDSU", "ncaab"),
+    "sdsu": ("San Diego State Aztecs", "SDSU", "ncaab"),
+    "memphis tigers": ("Memphis Tigers", "MEM", "ncaab"),
+    "dayton flyers": ("Dayton Flyers", "DAY", "ncaab"),
+    "dayton": ("Dayton Flyers", "DAY", "ncaab"),
+    "wichita state shockers": ("Wichita State Shockers", "WICH", "ncaab"),
+    "shockers": ("Wichita State Shockers", "WICH", "ncaab"),
+    "wichita state": ("Wichita State Shockers", "WICH", "ncaab"),
+    "st. john's red storm": ("St. John's Red Storm", "SJU", "ncaab"),
+    "red storm": ("St. John's Red Storm", "SJU", "ncaab"),
+    "st. john's": ("St. John's Red Storm", "SJU", "ncaab"),
+    "sju": ("St. John's Red Storm", "SJU", "ncaab"),
+    "butler bulldogs": ("Butler Bulldogs", "BUT", "ncaab"),
+    "butler": ("Butler Bulldogs", "BUT", "ncaab"),
+}
+
+# League keyword → sport_league key (longer keys checked first to avoid "basketball" → nba
+# swallowing "college basketball" → ncaab)
+_LEAGUE_SIGNALS: dict[str, str] = {
+    # College — must come before generic sport names so longer keys win
+    "college football": "ncaaf",
+    "college basketball": "ncaab",
+    "college softball": "ncaas",
+    "college baseball": "ncaabase",
+    "college hoops": "ncaab",
+    "ncaa football": "ncaaf",
+    "ncaa basketball": "ncaab",
+    "ncaa softball": "ncaas",
+    "ncaa baseball": "ncaabase",
+    "ncaa tournament": "ncaab",
+    "march madness": "ncaab",
+    "final four": "ncaab",
+    "sweet sixteen": "ncaab",
+    "sweet 16": "ncaab",
+    "elite eight": "ncaab",
+    "bowl game": "ncaaf",
+    "big east": "ncaab",
+    "cfb": "ncaaf",
+    "cbb": "ncaab",
+    "ncaaf": "ncaaf",
+    "ncaab": "ncaab",
+    "ncaas": "ncaas",
+    # Pro leagues
+    "nfl": "nfl",
+    "nba": "nba",
+    "mlb": "mlb",
+    "nhl": "nhl",
+    # Generic — lowest priority (checked last; "softball" always college, no pro equivalent)
+    "football": "nfl",
+    "basketball": "nba",
+    "baseball": "mlb",
+    "softball": "ncaas",
+    "hockey": "nhl",
+}
+
+
+def _ext_sports(raw: str, lower: str) -> dict[str, Any] | None:
+    """Extract team, sport, and abbreviation from a sports query."""
+    team_name = ""
+    abbrev = ""
+    sport = ""
+
+    # Try longest match first (multi-word names before single words)
+    for key in sorted(_TEAM_LOOKUP, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(key)}\b", lower):
+            team_name, abbrev, sport = _TEAM_LOOKUP[key]
+            break
+
+    # Infer sport from league keywords if not yet set.
+    # Iterate longest signal first so "college basketball" beats "basketball".
+    if not sport:
+        for sig, league in sorted(_LEAGUE_SIGNALS.items(), key=lambda x: len(x[0]), reverse=True):
+            if re.search(rf"\b{re.escape(sig)}\b", lower):
+                sport = league
+                break
+
+    # Certain sport keywords always override the team-lookup default.
+    # "softball" has no pro equivalent in this system, so it always wins.
+    # Checked longest-pattern first to avoid "softball" stomping "college softball".
+    _kw_overrides = [
+        (r"\bcollege\s+softball\b", "ncaas"),
+        (r"\bcollege\s+baseball\b", "ncaabase"),
+        (r"\bsoftball\b", "ncaas"),
+    ]
+    for _pat, _ov in _kw_overrides:
+        if re.search(_pat, lower):
+            sport = _ov
+            break
+    else:
+        # For college programs, allow an explicit sport keyword to switch
+        # the sport (e.g. "Ohio State basketball" → ncaab, "OU baseball" → ncaabase).
+        if sport in ("ncaaf", "ncaab", "ncaas", "ncaabase"):
+            if re.search(r"\bbasketball\b", lower):
+                sport = "ncaab"
+            elif re.search(r"\bfootball\b", lower):
+                sport = "ncaaf"
+            elif re.search(r"\bbaseball\b", lower):
+                sport = "ncaabase"
+
+    return {"team": team_name, "abbrev": abbrev, "sport": sport}
+
+
+# ─── Computer-layer helper data ────────────────────────────────────────────────
+
+_CONTENT_TYPE_SIGNALS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(?:document|doc|report|letter|memo|essay|paper)\b"), "document"),
+    (re.compile(r"\b(?:spreadsheet|sheet|workbook|table)\b"), "spreadsheet"),
+    (re.compile(r"\b(?:presentation|slide|slideshow|deck)\b"), "presentation"),
+    (re.compile(r"\b(?:code|script|program|function|class|module)\b"), "code"),
+    (re.compile(r"\b(?:note|notes)\b"), "note"),
+    (re.compile(r"\b(?:image|photo|picture|drawing|diagram)\b"), "image"),
+]
+
+_CODE_LANG_SIGNALS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bpython\b"), "python"),
+    (re.compile(r"\bjavascript\b|\bjs\b"), "javascript"),
+    (re.compile(r"\btypescript\b|\bts\b"), "typescript"),
+    (re.compile(r"\brust\b"), "rust"),
+    (re.compile(r"\bgolang\b|\bgo\s+(?:code|script|program)\b"), "go"),
+    (re.compile(r"\bjava\b"), "java"),
+    (re.compile(r"\bc\+\+\b|\bcpp\b"), "cpp"),
+    (re.compile(r"\bc#\b|\bcsharp\b"), "csharp"),
+    (re.compile(r"\bsql\b"), "sql"),
+    (re.compile(r"\bbash\b|\bshell\s+script\b"), "bash"),
+    (re.compile(r"\bhtml\b"), "html"),
+    (re.compile(r"\bcss\b"), "css"),
+    (re.compile(r"\bswift\b"), "swift"),
+    (re.compile(r"\bkotlin\b"), "kotlin"),
+]
+
+
+def _detect_content_type(lower: str) -> str | None:
+    for pat, ctype in _CONTENT_TYPE_SIGNALS:
+        if pat.search(lower):
+            return ctype
+    return None
+
+
+def _detect_code_language(lower: str) -> str | None:
+    for pat, lang in _CODE_LANG_SIGNALS:
+        if pat.search(lower):
+            return lang
+    return None
+
+
+def _extract_content_name(lower: str) -> str | None:
+    """Extract a named piece of content from quoted strings or 'called/named X'."""
+    m = re.search(r'(?:called|named|titled)\s+"?([^"]{2,40}?)"?\s*(?:$|[,.])', lower)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'"([^"]{2,60})"', lower)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_topic(lower: str) -> str | None:
+    """Extract a topic phrase following 'about', 'for', 'on', 'regarding'."""
+    m = re.search(r"\b(?:about|for|on|regarding)\s+(.{3,60}?)(?:\s*$|[,.])", lower)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+# ─── Computer-layer extractors ─────────────────────────────────────────────────
+
+def _ext_content(raw: str, lower: str) -> dict | None:
+    """Content management: find, list, history, branch, revert, share."""
+    action_map = [
+        (r"\b(?:history|versions?|revisions?|changes|changelog)\b", "history"),
+        (r"\b(?:branch|fork|duplicate|spin\s+off)\b", "branch"),
+        (r"\b(?:revert|rollback|restore|go\s+back)\b", "revert"),
+        (r"\b(?:share|export|publish|send|download)\b", "share"),
+        (r"\b(?:delete|remove|trash)\b", "delete"),
+        (r"\b(?:rename|move)\b", "rename"),
+        (r"\b(?:recent|all\s+my|show\s+all|list\s+all|what\s+have\s+i)\b", "list"),
+        (r"\b(?:find|search|locate|look\s+for|open|pull\s+up|bring\s+up)\b", "find"),
+    ]
+    action = None
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    if not action:
+        return None
+    return {
+        "action": action,
+        "name": _extract_content_name(lower),
+        "type": _detect_content_type(lower),
+    }
+
+
+def _ext_document(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:edit|update|revise|rewrite|modify|change|add\s+to)\b", "edit"),
+        (r"\b(?:create|new|start|write|draft|make|generate|open)\b", "create"),
+    ]
+    action = "create"
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    return {"action": action, "name": _extract_content_name(lower), "topic": _extract_topic(lower)}
+
+
+def _ext_spreadsheet(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:edit|update|modify|add\s+(?:a\s+)?(?:row|column))\b", "edit"),
+        (r"\b(?:create|new|start|make|build|generate)\b", "create"),
+    ]
+    action = "create"
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    return {"action": action, "name": _extract_content_name(lower)}
+
+
+def _ext_presentation(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:edit|update|modify|revise|add\s+a\s+slide)\b", "edit"),
+        (r"\b(?:create|new|start|make|build|generate|write)\b", "create"),
+    ]
+    action = "create"
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    slides = None
+    m = re.search(r"(\d+)\s+slides?", lower)
+    if m:
+        slides = int(m.group(1))
+    return {
+        "action": action,
+        "name": _extract_content_name(lower),
+        "slides": slides,
+        "topic": _extract_topic(lower),
+    }
+
+
+def _ext_code(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:explain|describe|what\s+does|how\s+does|walk\s+me\s+through)\b", "explain"),
+        (r"\b(?:debug|fix\s+the\s+bug|fix\s+(?:this|the)\s+(?:code|error))\b", "debug"),
+        (r"\b(?:run|execute|launch)\b", "run"),
+        (r"\b(?:review|audit|check|lint)\b", "review"),
+        (r"\b(?:test|write\s+tests?|unit\s+test)\b", "test"),
+        (r"\b(?:edit|update|refactor|modify|clean\s+up)\b", "edit"),
+        (r"\b(?:write|create|generate|implement|scaffold|build)\b", "create"),
+    ]
+    action = None
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    if not action:
+        return None
+    return {
+        "action": action,
+        "language": _detect_code_language(lower),
+        "name": _extract_content_name(lower),
+        "topic": _extract_topic(lower),
+    }
+
+
+def _ext_terminal(raw: str, lower: str) -> dict | None:
+    cmd = None
+    m = re.search(r'(?:run|execute)\s+(?:the\s+)?(?:command\s+)?"?(.+?)"?\s*$', lower)
+    if m:
+        cmd = m.group(1).strip()
+    return {"command": cmd}
+
+
+def _ext_calendar(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:cancel|delete|remove)\b", "cancel"),
+        (r"\b(?:edit|update|change|move|reschedule)\b", "edit"),
+        (r"\b(?:schedule|book|add|create|set\s+up|new)\b", "create"),
+        (r"\b(?:show|list|what(?:'s|\s+is)|upcoming|agenda|what\s+do\s+i\s+have)\b", "list"),
+    ]
+    action = "list"
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    date_hint = None
+    if re.search(r"\btoday\b", lower):
+        date_hint = "today"
+    elif re.search(r"\btomorrow\b", lower):
+        date_hint = "tomorrow"
+    elif re.search(r"\bthis\s+week\b", lower):
+        date_hint = "this_week"
+    elif re.search(r"\bnext\s+week\b", lower):
+        date_hint = "next_week"
+    else:
+        m = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower)
+        if m:
+            date_hint = m.group(1)
+    title = _extract_content_name(lower)
+    if not title:
+        m = re.search(r"(?:meeting|event|appointment|call|lunch|dinner|interview)\s+(?:with\s+)?([\w\s]+?)(?:\s+(?:at|on|tomorrow|today)|$)", lower)
+        if m:
+            title = m.group(0).strip()
+    return {"action": action, "date": date_hint, "title": title}
+
+
+def _ext_email(raw: str, lower: str) -> dict | None:
+    action_map = [
+        (r"\b(?:reply|respond|answer)\s+(?:to\s+)?(?:the\s+)?(?:email|message)\b", "reply"),
+        (r"\b(?:search|find|look\s+for)\s+(?:for\s+)?(?:emails?|messages?)\b", "search"),
+        (r"\bemails?\s+(?:about|from|with)\b", "search"),
+        (r"\b(?:archive|delete|trash)\b", "archive"),
+        (r"\b(?:check|read|show|open)\s+(?:my\s+)?(?:email|inbox|mail)\b", "read"),
+        (r"\b(?:send|write|compose|draft)\s+(?:an?\s+)?email\b", "compose"),
+    ]
+    action = None
+    for pat, act in action_map:
+        if re.search(pat, lower):
+            action = act
+            break
+    if not action:
+        return None
+    to = None
+    m = re.search(r"(?:to|email)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", raw)
+    if m:
+        to = m.group(1).strip()
+    return {"action": action, "to": to, "subject": _extract_content_name(lower)}
+
+
 # ─── Extractor registry ───────────────────────────────────────────────────────
 
 _EXTRACTORS: dict[str, ExtractorFn] = {
@@ -633,7 +1540,35 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "timer_start":          _ext_timer_start,
     "calc":                 _ext_calc,
     "unit_convert":         _ext_unit_convert,
+    "sports":               _ext_sports,
+    # Computer layer
+    "content":              _ext_content,
+    "document":             _ext_document,
+    "spreadsheet":          _ext_spreadsheet,
+    "presentation":         _ext_presentation,
+    "code":                 _ext_code,
+    "terminal":             _ext_terminal,
+    "calendar":             _ext_calendar,
+    "email":                _ext_email,
 }
+
+
+def extract_slots_for_op(op: str, raw: str, lower: str) -> "dict[str, Any]":
+    """Run the local slot extractor for *op* and return its result, or {} if none exists.
+
+    Intent.op (e.g. "weather_forecast") and Intent.extractor (e.g. "weather") can differ,
+    so we resolve op → extractor key via TAXONOMY before looking up in _EXTRACTORS.
+    """
+    extractor_key = op  # fallback: try op name directly
+    for intent in TAXONOMY.values():
+        if intent.op == op:
+            extractor_key = intent.extractor
+            break
+    fn = _EXTRACTORS.get(extractor_key)
+    if fn is None:
+        return {}
+    result = fn(raw, lower)
+    return result if isinstance(result, dict) else {}
 
 
 # ─── Intent taxonomy ──────────────────────────────────────────────────────────
@@ -655,6 +1590,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="weather",
         examples=["what's the weather", "will it rain tomorrow",
                   "weather in Denver this week", "is it cold outside"],
+        slots={"window": "now|tonight|tomorrow|morning|afternoon|evening|tomorrow-morning|tomorrow-afternoon|weekend|Nday (e.g. 3day)|weekday name (e.g. wednesday)", "location": "city name, or empty for current location"},
     ),
 
     # ── Shopping ──────────────────────────────────────────────────────────
@@ -682,6 +1618,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="shopping",
         examples=["show me Nike running shoes size 10", "I want to buy a laptop",
                   "find me a black hoodie", "order some AirPods"],
+        slots={"query": "full product search query"},
     ),
 
     # ── Location ──────────────────────────────────────────────────────────
@@ -713,6 +1650,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="news",
         examples=["what's in the news", "latest news about AI",
                   "top stories today", "what's happening in tech"],
+        slots={"query": "news topic or empty for general headlines"},
     ),
 
     # ── Finance ───────────────────────────────────────────────────────────
@@ -783,6 +1721,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="social_post",
         examples=["tweet that I just shipped a new feature",
                   "post: loving this new UI"],
+        slots={"text": "message body to post"},
     ),
 
     "social.feed": Intent(
@@ -806,6 +1745,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="expense_add",
         examples=["I spent $45 on groceries", "paid $12 for coffee",
                   "log expense $200 for new shoes"],
+        slots={"amount": "numeric dollar amount", "category": "category label", "note": "optional description"},
     ),
 
     "expense.list": Intent(
@@ -833,6 +1773,7 @@ TAXONOMY: dict[str, Intent] = {
         examples=["jot this down: the API key expires in March",
                   "note that we need to revisit auth",
                   "remember that the meeting is at 3pm"],
+        slots={"text": "full note content"},
     ),
 
     "note.list": Intent(
@@ -856,6 +1797,7 @@ TAXONOMY: dict[str, Intent] = {
         examples=["remind me to call dentist in 30 minutes",
                   "set a reminder for the standup in 2 hours",
                   "alert me to check email in 15 min"],
+        slots={"text": "what to remind about", "durationMs": "delay in milliseconds"},
     ),
 
     "reminder.list": Intent(
@@ -880,6 +1822,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="task_complete",
         examples=["I finished the grocery run", "mark the report task done",
                   "check off pick up dry cleaning"],
+        slots={"selector": "task title or identifying word"},
     ),
 
     "task.delete": Intent(
@@ -891,6 +1834,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="task_delete",
         blockers=["file", "folder", "expense", "note", "reminder"],
         examples=["delete my grocery task", "remove the dentist appointment task"],
+        slots={"selector": "task title or identifying word"},
     ),
 
     "task.clear_completed": Intent(
@@ -931,6 +1875,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="task_create",
         examples=["remind me to buy milk", "I need to call the dentist",
                   "add task: finish the report", "I should renew my passport"],
+        slots={"title": "task description"},
     ),
 
     # ── Contacts ──────────────────────────────────────────────────────────
@@ -944,6 +1889,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="contacts",
         examples=["find John's phone number", "look up contact for Dr. Kim",
                   "how do I reach Mike"],
+        slots={"query": "person name"},
     ),
 
     # ── Web ───────────────────────────────────────────────────────────────
@@ -956,6 +1902,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="web_summarize",
         examples=["summarize https://example.com/article",
                   "tldr this: https://news.ycombinator.com"],
+        slots={"url": "URL to summarize"},
     ),
 
     "web.fetch": Intent(
@@ -967,6 +1914,7 @@ TAXONOMY: dict[str, Intent] = {
         patterns=[r"https?://"],
         extractor="web_fetch",
         examples=["fetch https://example.com", "open https://api.github.com/zen"],
+        slots={"url": "URL to fetch"},
     ),
 
     # ── Utility ───────────────────────────────────────────────────────────
@@ -979,6 +1927,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="timer_start",
         examples=["set a timer for 5 minutes", "start a 30 second timer",
                   "timer for 1 hour"],
+        slots={"durationMs": "duration in milliseconds (e.g. 300000 for 5 minutes)"},
     ),
 
     "calc.evaluate": Intent(
@@ -992,6 +1941,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="calc",
         examples=["what is 15% of 120", "calculate 42 * 7",
                   "how much is 250 / 5"],
+        slots={"expression": "math expression to evaluate"},
     ),
 
     "unit.convert": Intent(
@@ -1008,6 +1958,7 @@ TAXONOMY: dict[str, Intent] = {
         extractor="unit_convert",
         examples=["how many miles is 10 km", "convert 72 fahrenheit to celsius",
                   "5 pounds in kg"],
+        slots={"value": "numeric amount", "fromUnit": "source unit", "toUnit": "target unit"},
     ),
 
     "web.search": Intent(
@@ -1025,13 +1976,526 @@ TAXONOMY: dict[str, Intent] = {
                  "why did", "why is", "why are", "why was",
                  "what's the difference", "what's the history",
                  "what's the definition", "find me"],
-        # Blockers: don't hijack personal data queries
+        # Blockers: don't hijack personal data or sports queries
         blockers=["my tasks", "my todos", "my notes", "my expenses",
-                  "my reminders", "my balance", "my account", "my feed"],
+                  "my reminders", "my balance", "my account", "my feed",
+                  # Sports blockers — yield to sports.* intents
+                  "score", "scores", "final score", "game score", "scoreboard",
+                  "standings", "win-loss", "did they win", "did we win",
+                  "who won", "game time", "next game", "play next", "play tonight",
+                  "schedule", "upcoming game", "last game", "last night's game",
+                  "ncaaf", "ncaab", "cfb", "cbb", "college football", "college basketball",
+                  "college hoops", "march madness", "final four", "bowl game",
+                  "softball", "college softball", "college baseball",
+                  # Calendar blockers — yield to calendar.* intents
+                  "my calendar", "on my calendar", "my schedule", "my agenda",
+                  "calendar today", "calendar tomorrow",
+                  # Code blockers — yield to code.* intents
+                  "explain this", "explain the code", "explain the function",
+                  "explain the script", "explain this code", "explain this function",
+                  "explain this script", "debug this", "fix the bug",
+                  # Email blockers — yield to email.* intents
+                  "my inbox", "my email", "check my email",
+                  "search for emails", "find emails", "look for emails",
+                  "emails from", "emails about",
+                  # Document/presentation blockers
+                  "write a letter", "write a memo", "draft a", "create a document",
+                  "create a presentation", "make a presentation", "make a spreadsheet"],
         extractor="web_search",
         examples=["what is quantum computing", "who was Alan Turing",
                   "how does DNS work", "explain neural networks",
                   "when did the Berlin Wall fall"],
+        slots={"query": "search query string"},
+    ),
+
+    # ── Sports ────────────────────────────────────────────────────────────────
+    "sports.scores": Intent(
+        id="sports.scores",
+        op="sports_scores",
+        domain="sports",
+        description="Get live or recent scores for a team or league",
+        signals=["score", "scores", "scoreboard", "final score", "game score",
+                 "did they win", "did we win", "who won", "how did they do",
+                 "how did the", "result", "results", "what happened in the game",
+                 "last night's game", "last game", "tonight's game",
+                 "ncaaf", "ncaab", "cfb", "cbb", "college football", "college basketball",
+                 "college hoops", "march madness", "final four", "bowl game",
+                 "softball", "college softball", "college baseball"],
+        blockers=["my tasks", "my notes", "my expenses",
+                  "presentation", "slide deck", "slideshow", "powerpoint"],
+        extractor="sports",
+        examples=["what's the Bears score", "did the Cubs win", "show me NBA scores",
+                  "who won the game last night", "what are tonight's scores",
+                  "did Ohio State win", "what's the Alabama score", "college football scores"],
+        slots={"team": "team name or empty for all teams", "sport": "nfl|nba|mlb|nhl|ncaaf|ncaab|''"},
+    ),
+
+    "sports.schedule": Intent(
+        id="sports.schedule",
+        op="sports_schedule",
+        domain="sports",
+        description="Get upcoming game schedule for a team",
+        signals=["schedule", "next game", "when do they play", "when do the",
+                 "when is the next", "upcoming games", "when does", "game time",
+                 "when are the", "play next", "next match"],
+        blockers=["my tasks", "my notes", "my expenses",
+                  "meeting", "appointment", "dentist", "calendar event",
+                  "add to calendar", "block time", "block off"],
+        extractor="sports",
+        examples=["when do the Bears play next", "show me the Cubs schedule",
+                  "when is the next Bulls game", "upcoming Bears games"],
+        slots={"team": "team name", "sport": "nfl|nba|mlb|nhl|ncaaf|ncaab"},
+    ),
+
+    "sports.standings": Intent(
+        id="sports.standings",
+        op="sports_standings",
+        domain="sports",
+        description="Get league or conference standings",
+        signals=["standings", "ranking", "rankings", "record", "place in the",
+                 "division standings", "conference standings", "in the standings",
+                 "league table", "where are the", "where do the", "how are the",
+                 "win-loss", "wins and losses"],
+        blockers=["my tasks", "my notes", "my expenses"],
+        extractor="sports",
+        examples=["show me NFL standings", "where are the Bears in the standings",
+                  "NBA standings", "what's Chicago's record"],
+        slots={"team": "team name or empty for full standings", "sport": "nfl|nba|mlb|nhl|ncaaf|ncaab"},
+    ),
+
+    "sports.follow_team": Intent(
+        id="sports.follow_team",
+        op="sports_follow_team",
+        domain="sports",
+        description="Add a team to the user's followed teams list",
+        signals=["follow", "track", "add to my teams", "save team", "subscribe to",
+                 "add the", "follow the", "i like the", "my team"],
+        patterns=[r"follow\s+(?:the\s+)?\w+", r"add\s+(?:the\s+)?\w+\s+to\s+my\s+teams?"],
+        blockers=["unfollow", "stop following", "remove"],
+        extractor="sports",
+        examples=["follow the Bears", "add the Cubs to my teams", "track the Bulls",
+                  "I like the Bears"],
+        slots={"team": "team name", "sport": "nfl|nba|mlb|nhl|ncaaf|ncaab"},
+    ),
+
+    "sports.unfollow_team": Intent(
+        id="sports.unfollow_team",
+        op="sports_unfollow_team",
+        domain="sports",
+        description="Remove a team from the user's followed teams list",
+        signals=["unfollow", "stop following", "remove from my teams", "remove the",
+                 "drop the", "stop tracking"],
+        patterns=[r"unfollow\s+(?:the\s+)?\w+", r"remove\s+(?:the\s+)?\w+\s+from\s+my\s+teams?"],
+        extractor="sports",
+        examples=["unfollow the Bears", "remove the Cubs from my teams",
+                  "stop following the Bulls"],
+        slots={"team": "team name", "sport": "nfl|nba|mlb|nhl|ncaaf|ncaab"},
+    ),
+
+    "sports.my_teams": Intent(
+        id="sports.my_teams",
+        op="sports_my_teams",
+        domain="sports",
+        description="Show the user's followed sports teams",
+        signals=["my teams", "my sports teams", "teams i follow", "teams i track",
+                 "show my teams", "what teams", "which teams do i follow"],
+        patterns=[r"(?:show|list|what are)\s+my\s+(?:sports\s+)?teams?"],
+        extractor="sports",
+        examples=["show my teams", "what teams do I follow", "my sports teams"],
+        slots={},
+    ),
+
+    # ── Content management ────────────────────────────────────────────────
+    # Git-style OS content layer: named content, flat namespace, auto-versioned.
+
+    "content.history": Intent(
+        id="content.history",
+        op="content_history",
+        domain="content",
+        description="Show version history of a piece of content",
+        signals=["history of", "versions of", "revisions of", "what changed", "changelog",
+                 "previous versions", "old version", "show changes"],
+        patterns=[r"\bhistory\s+(?:of|for)\b", r"\bversions?\s+of\b",
+                  r"\bwhat\s+changed\s+(?:in|to)\b"],
+        extractor="content",
+        examples=["show history of Q4 Report", "what versions of the budget exist",
+                  "what changed in the proposal"],
+        slots={"action": "history", "name": "content name"},
+    ),
+
+    "content.branch": Intent(
+        id="content.branch",
+        op="content_branch",
+        domain="content",
+        description="Create a divergent copy (branch) of a piece of content",
+        signals=["branch", "fork", "create a copy", "make a copy", "duplicate",
+                 "spin off", "draft version of", "new version of"],
+        patterns=[r"\b(?:branch|fork|duplicate)\s+(?:the\s+)?\w",
+                  r"\b(?:create|make)\s+(?:a\s+)?(?:copy|draft|version)\s+of\b"],
+        extractor="content",
+        examples=["branch the Q4 Report", "create a draft version of the proposal",
+                  "fork the budget into a 2027 version"],
+        slots={"action": "branch", "name": "source content name", "branch_name": "new name"},
+    ),
+
+    "content.revert": Intent(
+        id="content.revert",
+        op="content_revert",
+        domain="content",
+        description="Revert content to a previous version",
+        signals=["revert", "rollback", "restore", "undo changes", "go back to",
+                 "previous version", "older version"],
+        patterns=[r"\brevert\s+(?:the\s+)?\w", r"\bgo\s+back\s+to\s+(?:the\s+)?(?:previous|last|old)\b"],
+        extractor="content",
+        examples=["revert the proposal to yesterday's version", "undo changes to the report",
+                  "restore the budget from last week"],
+        slots={"action": "revert", "name": "content name", "version_hint": "version description"},
+    ),
+
+    "content.share": Intent(
+        id="content.share",
+        op="content_share",
+        domain="content",
+        description="Share or export a piece of content",
+        signals=["share the", "export the", "publish the", "download the"],
+        patterns=[r"\b(?:share|export|publish)\s+(?:the\s+)?\w"],
+        blockers=["share screen", "share my location", "share my location"],
+        extractor="content",
+        examples=["share the Q4 Report", "export the budget as PDF",
+                  "send the proposal to Mike"],
+        slots={"action": "share", "name": "content name", "format": "pdf|docx|xlsx|pptx"},
+    ),
+
+    "content.list": Intent(
+        id="content.list",
+        op="content_list",
+        domain="content",
+        description="List recent or all content",
+        signals=["recent files", "recent documents", "my documents", "my files",
+                 "everything i've been working on", "show all my", "what have i been",
+                 "what did i work on"],
+        patterns=[r"\bshow\s+(?:all\s+)?(?:my\s+)?(?:recent\s+)?(?:files|documents|content|work)\b",
+                  r"\blist\s+(?:my\s+)?(?:files|documents|content)\b"],
+        extractor="content",
+        examples=["show my recent documents", "list all my files",
+                  "what have I been working on"],
+        slots={"action": "list", "type": "document|spreadsheet|presentation|code|note"},
+    ),
+
+    "content.find": Intent(
+        id="content.find",
+        op="content_find",
+        domain="content",
+        description="Find and open a named piece of content",
+        signals=["open my", "find my", "pull up", "bring up", "where is my",
+                 "look for my", "locate my"],
+        patterns=[r"\b(?:open|find|pull\s+up|bring\s+up|locate)\s+(?:my\s+)?[\"']?[\w\s]{2,}[\"']?"],
+        blockers=["search the web", "google", "search online", "find a store",
+                  "terminal", "command line", "shell", "a terminal"],
+        extractor="content",
+        examples=["open Q4 Report", "find my budget spreadsheet",
+                  "pull up the project proposal"],
+        slots={"action": "find", "name": "content name", "type": "content type"},
+    ),
+
+    # ── Documents ─────────────────────────────────────────────────────────
+
+    "document.create": Intent(
+        id="document.create",
+        op="document_create",
+        domain="document",
+        description="Create a new document",
+        signals=["write a letter", "write a memo", "write an essay", "write a report",
+                 "write a proposal", "write an article", "write a contract",
+                 "draft a letter", "draft a memo", "draft a proposal", "draft an essay",
+                 "create a document", "new document", "cover letter", "resume",
+                 "write me a", "start a document"],
+        patterns=[r"\b(?:write|draft|create|start)\s+(?:a|an)\s+(?:letter|memo|essay|report|proposal|article|contract|agreement|cover\s+letter|resume|document)\b"],
+        blockers=["edit the", "update the", "change the", "modify the"],
+        extractor="document",
+        examples=["write a cover letter for a software engineer role",
+                  "draft a proposal for the client",
+                  "create a memo about the policy change"],
+        slots={"action": "create", "name": "document name", "topic": "topic or purpose"},
+    ),
+
+    "document.edit": Intent(
+        id="document.edit",
+        op="document_edit",
+        domain="document",
+        description="Edit an existing document",
+        signals=["edit the document", "edit the report", "edit the letter",
+                 "update the document", "revise the", "rewrite the", "modify the document"],
+        patterns=[r"\b(?:edit|update|revise|rewrite|modify)\s+(?:the\s+)?[\"']?[\w\s]+[\"']?\s+(?:document|doc|report|letter|memo|essay|proposal)\b"],
+        extractor="document",
+        examples=["edit the Q4 report", "update the proposal", "revise my cover letter"],
+        slots={"action": "edit", "name": "document name"},
+    ),
+
+    # ── Spreadsheets ──────────────────────────────────────────────────────
+
+    "spreadsheet.create": Intent(
+        id="spreadsheet.create",
+        op="spreadsheet_create",
+        domain="spreadsheet",
+        description="Create a new spreadsheet",
+        signals=["create a spreadsheet", "new spreadsheet", "make a spreadsheet",
+                 "build a spreadsheet", "budget spreadsheet", "expense tracker",
+                 "tracking spreadsheet", "data table", "make a table"],
+        patterns=[r"\b(?:create|make|build|start|new)\s+(?:a\s+)?spreadsheet\b",
+                  r"\bspreadsheet\s+(?:for|to\s+track)\b"],
+        blockers=["edit the spreadsheet", "open the spreadsheet", "update the spreadsheet"],
+        extractor="spreadsheet",
+        examples=["create a budget spreadsheet", "make a spreadsheet to track expenses",
+                  "build a project data table"],
+        slots={"action": "create", "name": "spreadsheet name"},
+    ),
+
+    "spreadsheet.edit": Intent(
+        id="spreadsheet.edit",
+        op="spreadsheet_edit",
+        domain="spreadsheet",
+        description="Edit an existing spreadsheet",
+        signals=["edit the spreadsheet", "update the spreadsheet", "add a row",
+                 "add a column", "modify the spreadsheet", "change the spreadsheet"],
+        patterns=[r"\b(?:edit|update|modify|change)\s+(?:the\s+)?spreadsheet\b",
+                  r"\badd\s+(?:a\s+)?(?:row|column)\s+to\b"],
+        extractor="spreadsheet",
+        examples=["edit the budget spreadsheet", "add a row to the expense tracker",
+                  "update the project table"],
+        slots={"action": "edit", "name": "spreadsheet name"},
+    ),
+
+    # ── Presentations ─────────────────────────────────────────────────────
+
+    "presentation.create": Intent(
+        id="presentation.create",
+        op="presentation_create",
+        domain="presentation",
+        description="Create a new presentation or slide deck",
+        signals=["create a presentation", "make a presentation", "build a deck",
+                 "slide deck", "slideshow", "build slides", "make slides",
+                 "powerpoint", "keynote", "make a deck"],
+        patterns=[r"\b(?:create|make|build|write|generate)\s+(?:a\s+)?(?:presentation|slideshow|deck|slides)\b",
+                  r"\bpresentation\s+(?:for|on|about)\b"],
+        blockers=["edit the presentation", "update the slides", "add a slide to"],
+        extractor="presentation",
+        examples=["create a 10-slide presentation on the Q4 results",
+                  "make a sales pitch deck", "build a presentation for the board meeting"],
+        slots={"action": "create", "name": "presentation name", "topic": "topic", "slides": "slide count"},
+    ),
+
+    "presentation.edit": Intent(
+        id="presentation.edit",
+        op="presentation_edit",
+        domain="presentation",
+        description="Edit an existing presentation",
+        signals=["edit the presentation", "update the slides", "add a slide",
+                 "modify the deck", "revise the presentation", "change the slides"],
+        patterns=[r"\b(?:edit|update|modify|revise)\s+(?:the\s+)?(?:presentation|deck|slides)\b",
+                  r"\badd\s+a\s+slide\s+to\b"],
+        extractor="presentation",
+        examples=["edit the Q4 presentation", "add a slide to the deck",
+                  "update the sales pitch"],
+        slots={"action": "edit", "name": "presentation name"},
+    ),
+
+    # ── Code / IDE ────────────────────────────────────────────────────────
+
+    "code.create": Intent(
+        id="code.create",
+        op="code_create",
+        domain="code",
+        description="Write new code — a function, script, class, or program",
+        signals=["write a script", "write a function", "write code", "create a script",
+                 "generate code", "implement", "scaffold", "write a class",
+                 "write a program", "write a component", "write an api"],
+        patterns=[r"\b(?:write|create|generate|implement|build|scaffold)\s+(?:a\s+)?(?:\w+\s+)?(?:script|function|class|module|program|api|endpoint|component|app)\b"],
+        blockers=["edit", "fix", "debug", "explain", "review", "run", "test"],
+        extractor="code",
+        examples=["write a Python script to parse a CSV",
+                  "create a function that validates email addresses",
+                  "generate a REST API endpoint"],
+        slots={"action": "create", "language": "language", "topic": "what it should do"},
+    ),
+
+    "code.explain": Intent(
+        id="code.explain",
+        op="code_explain",
+        domain="code",
+        description="Explain what a piece of code does",
+        signals=["explain this", "explain the code", "what does this do",
+                 "how does this work", "walk me through", "what is this code",
+                 "describe the code", "understand this"],
+        patterns=[r"\b(?:explain|describe|walk\s+me\s+through)\s+(?:this\s+)?(?:code|script|function|class)\b",
+                  r"\bwhat\s+does\s+(?:this\s+)?(?:code|function|script)\s+do\b"],
+        extractor="code",
+        examples=["explain this function", "what does this script do",
+                  "walk me through the auth module"],
+        slots={"action": "explain", "language": "language"},
+    ),
+
+    "code.debug": Intent(
+        id="code.debug",
+        op="code_debug",
+        domain="code",
+        description="Debug or fix broken code",
+        signals=["debug", "fix the bug", "there's an error", "error in the code",
+                 "why is it failing", "broken", "not working", "fix the code",
+                 "fix this error", "fix this bug"],
+        patterns=[r"\b(?:debug|fix)\s+(?:this\s+)?(?:code|script|function|error|bug)\b",
+                  r"\bwhy\s+(?:is|isn't)\s+(?:this\s+)?(?:code|function|script)\s+working\b"],
+        extractor="code",
+        examples=["debug this Python script", "fix the bug in my function",
+                  "why is this code not working"],
+        slots={"action": "debug", "language": "language"},
+    ),
+
+    "code.run": Intent(
+        id="code.run",
+        op="code_run",
+        domain="code",
+        description="Run or execute a script or program",
+        signals=["run the script", "execute the code", "run this code",
+                 "execute this", "run it", "run the program"],
+        patterns=[r"\b(?:run|execute|launch)\s+(?:the\s+)?(?:script|code|program|file)\b"],
+        extractor="code",
+        examples=["run the Python script", "execute this code", "run it"],
+        slots={"action": "run", "name": "script or file name"},
+    ),
+
+    # ── Terminal ──────────────────────────────────────────────────────────
+
+    "terminal.run": Intent(
+        id="terminal.run",
+        op="terminal_run",
+        domain="terminal",
+        description="Open a terminal or run a shell command",
+        signals=["open terminal", "open the terminal", "command line", "shell",
+                 "run command", "open a terminal", "command prompt", "open cli"],
+        patterns=[r"\b(?:open|launch|start)\s+(?:a\s+)?(?:terminal|shell|command\s+line|cli)\b",
+                  r"\brun\s+(?:the\s+)?command\b"],
+        extractor="terminal",
+        examples=["open a terminal", "run git status", "open the command line"],
+        slots={"command": "shell command to run"},
+    ),
+
+    # ── Calendar ──────────────────────────────────────────────────────────
+
+    "calendar.create": Intent(
+        id="calendar.create",
+        op="calendar_create",
+        domain="calendar",
+        description="Create a calendar event",
+        signals=["schedule a meeting", "book a meeting", "add to calendar",
+                 "set up a meeting", "calendar event", "add an event",
+                 "create an event", "block time", "block off", "appointment at",
+                 "meeting at", "lunch with", "dinner with", "call with"],
+        patterns=[r"\b(?:schedule|book|add|create|set\s+up)\s+(?:a\s+)?(?:meeting|event|appointment|call|lunch|dinner|interview)\b",
+                  r"\bblock\s+(?:off\s+)?(?:time|my\s+calendar)\b"],
+        blockers=["cancel", "delete the meeting", "remove from calendar", "what's on"],
+        extractor="calendar",
+        examples=["schedule a meeting with Sarah tomorrow at 2pm",
+                  "add a dentist appointment on Friday at 10am",
+                  "block off Tuesday afternoon for deep work"],
+        slots={"action": "create", "title": "event title", "date": "date/time", "with": "attendees"},
+    ),
+
+    "calendar.list": Intent(
+        id="calendar.list",
+        op="calendar_list",
+        domain="calendar",
+        description="Show upcoming calendar events or agenda",
+        signals=["what's on my calendar", "show my calendar", "upcoming events",
+                 "what do i have", "my schedule", "agenda", "what meetings do i have",
+                 "any meetings", "what's scheduled", "calendar today", "calendar tomorrow",
+                 "show my schedule"],
+        patterns=[r"\bwhat(?:'s|\s+is)\s+on\s+(?:my\s+)?(?:calendar|schedule)\b",
+                  r"\bshow\s+(?:my\s+)?(?:calendar|schedule|agenda)\b",
+                  r"\bwhat\s+(?:meetings?|events?|appointments?)\s+do\s+i\s+have\b"],
+        extractor="calendar",
+        examples=["what's on my calendar today", "show my schedule for next week",
+                  "what meetings do I have tomorrow", "my agenda for Friday"],
+        slots={"action": "list", "date": "date/time range"},
+    ),
+
+    "calendar.cancel": Intent(
+        id="calendar.cancel",
+        op="calendar_cancel",
+        domain="calendar",
+        description="Cancel or delete a calendar event",
+        signals=["cancel the meeting", "cancel my appointment", "delete the event",
+                 "remove from calendar", "cancel the call", "cancel lunch",
+                 "cancel the interview"],
+        patterns=[r"\b(?:cancel|delete|remove)\s+(?:the\s+)?(?:meeting|event|appointment|call|lunch|dinner|interview)\b"],
+        extractor="calendar",
+        examples=["cancel the meeting with Sarah", "delete the dentist appointment",
+                  "remove the Friday call from my calendar"],
+        slots={"action": "cancel", "title": "event title", "date": "date/time"},
+    ),
+
+    # ── Email ─────────────────────────────────────────────────────────────
+
+    "email.compose": Intent(
+        id="email.compose",
+        op="email_compose",
+        domain="email",
+        description="Compose and send an email",
+        signals=["send an email", "write an email", "compose an email",
+                 "draft an email", "email to", "send a message to"],
+        patterns=[r"\b(?:send|write|compose|draft)\s+(?:an?\s+)?email\b",
+                  r"\bemail\s+(?:to\s+)?\w"],
+        blockers=["check email", "read email", "show email", "my inbox",
+                  "emails from", "search email", "reply to"],
+        extractor="email",
+        examples=["send an email to John about the meeting",
+                  "compose an email to the team about the update"],
+        slots={"action": "compose", "to": "recipient", "subject": "subject"},
+    ),
+
+    "email.read": Intent(
+        id="email.read",
+        op="email_read",
+        domain="email",
+        description="Read or check email inbox",
+        signals=["check email", "read email", "check my email", "my inbox",
+                 "my email", "new emails", "unread emails", "show my email",
+                 "any new email", "emails from"],
+        patterns=[r"\b(?:check|read|show|open)\s+(?:my\s+)?(?:email|inbox|mail)\b",
+                  r"\bany\s+(?:new|unread)\s+(?:email|messages?)\b"],
+        blockers=["send", "write", "compose", "draft", "reply to"],
+        extractor="email",
+        examples=["check my email", "show my inbox", "any new emails", "emails from Mike"],
+        slots={"action": "read", "from": "sender filter"},
+    ),
+
+    "email.reply": Intent(
+        id="email.reply",
+        op="email_reply",
+        domain="email",
+        description="Reply to an email",
+        signals=["reply to", "respond to the email", "answer the email",
+                 "reply back", "write a reply", "send a reply"],
+        patterns=[r"\b(?:reply|respond|answer)\s+(?:to\s+)?(?:the\s+)?(?:email|message)\b"],
+        extractor="email",
+        examples=["reply to Mike's email", "respond to the meeting request",
+                  "write a reply to Sarah"],
+        slots={"action": "reply", "to": "recipient"},
+    ),
+
+    "email.search": Intent(
+        id="email.search",
+        op="email_search",
+        domain="email",
+        description="Search emails",
+        signals=["search email", "find email", "look for email", "email about",
+                 "find the email", "search my inbox", "emails about"],
+        patterns=[r"\b(?:search|find|look\s+for)\s+(?:emails?|messages?)\b",
+                  r"\bemails?\s+(?:about|from|with)\b"],
+        extractor="email",
+        examples=["find emails from Sarah about the project",
+                  "search my inbox for the invoice"],
+        slots={"action": "search", "query": "search terms", "from": "sender"},
     ),
 }
 
@@ -1135,6 +2599,7 @@ def _taxonomy_for_nous() -> list[dict[str, Any]]:
             "op": intent.op,
             "description": intent.description,
             "examples": intent.examples[:3],  # keep payload small
+            "slots": intent.slots,
         }
         for intent in TAXONOMY.values()
     ]

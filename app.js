@@ -52,8 +52,7 @@ const RemoteTurnService = {
     },
 
     async process(intent, sessionId, baseRevision, deviceId, onConflict = 'rebase_if_commutative', idempotencyKey = null) {
-        const NOUS_URL = window.NOUS_URL || 'http://localhost:7700';
-        const response = await fetch(`${NOUS_URL}/api/turn`, {
+        const response = await fetch(`/api/turn`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ intent, sessionId, baseRevision, deviceId, onConflict, idempotencyKey })
@@ -584,8 +583,7 @@ const UIEngine = {
             this._ws = null;
         }
 
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`;
+        const wsUrl = `ws://${location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`;
         const ws = new WebSocket(wsUrl);
         this._ws = ws;
 
@@ -780,18 +778,7 @@ const UIEngine = {
                 return;
             }
 
-            if (event.altKey && event.key === 'ArrowLeft') {
-                event.preventDefault();
-                this.stepHistory(-1);
-                return;
-            }
-
-            if (event.altKey && event.key === 'ArrowRight') {
-                event.preventDefault();
-                this.stepHistory(1);
-                return;
-            }
-
+            // Shift variants must be checked BEFORE plain Alt variants
             if (event.altKey && event.shiftKey && event.key === 'ArrowLeft') {
                 event.preventDefault();
                 this.stepSceneDomain(-1);
@@ -801,6 +788,18 @@ const UIEngine = {
             if (event.altKey && event.shiftKey && event.key === 'ArrowRight') {
                 event.preventDefault();
                 this.stepSceneDomain(1);
+                return;
+            }
+
+            if (event.altKey && event.key === 'ArrowLeft') {
+                event.preventDefault();
+                this.stepHistory(-1);
+                return;
+            }
+
+            if (event.altKey && event.key === 'ArrowRight') {
+                event.preventDefault();
+                this.stepHistory(1);
                 return;
             }
 
@@ -819,24 +818,26 @@ const UIEngine = {
                 }
             }
 
-            if (event.key === 'Escape') {
-                this.toggleHelp(false);
-                return;
-            }
-
-            if (event.key === '?' || event.key === 'F1') {
-                event.preventDefault();
-                this.toggleHelp();
-                return;
-            }
-
-            if (event.key !== '/') return;
             const active = document.activeElement;
             const isEditable = active && (
                 active.tagName === 'INPUT'
                 || active.tagName === 'TEXTAREA'
                 || active.isContentEditable
             );
+
+            if (event.key === 'Escape') {
+                this.toggleHelp(false);
+                return;
+            }
+
+            // '?' only toggles help when NOT typing in a field; F1 always works
+            if (event.key === 'F1' || (event.key === '?' && !isEditable)) {
+                event.preventDefault();
+                this.toggleHelp();
+                return;
+            }
+
+            if (event.key !== '/') return;
             if (isEditable) return;
             event.preventDefault();
             this.input.focus();
@@ -1260,7 +1261,7 @@ const UIEngine = {
         this.state.sceneDock.lastTransition = this.computeSceneTransition(priorDomain, nextDomain);
         this.state.sceneDock.activeDomain = nextDomain;
         const sceneDock = this.renderSceneDock(nextDomain);
-        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes'].includes(core.kind);
+        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow'].includes(core.kind);
         const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
         const railBlocks = this.buildImmersiveRailBlocks(blocks);
         this.container.innerHTML = `
@@ -2018,9 +2019,13 @@ const UIEngine = {
                         ? 'theme-sun'
                         : 'theme-cloud';
             const window = String(weatherData.window || 'now');
-            const kind = window === '7day' ? 'weather_7day'
-                       : (window === 'tomorrow' || window === 'tonight') ? 'weather_tomorrow'
-                       : 'weather';
+            const _isMultiDay = window === '7day' || window === 'weekend'
+                || /^\d+day$/.test(window)
+                || /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/.test(window);
+            const _isTodHourly = window === 'tomorrow' || window === 'tonight'
+                || /^tomorrow-/.test(window)
+                || window === 'morning' || window === 'afternoon' || window === 'evening';
+            const kind = _isMultiDay ? 'weather_7day' : _isTodHourly ? 'weather_tomorrow' : 'weather';
             const mergedInfo = {
                 ...info, ...weatherData,
                 forecast: Array.isArray(weatherData.forecast) ? weatherData.forecast : [],
@@ -2028,6 +2033,18 @@ const UIEngine = {
                 daily: Array.isArray(weatherData.daily) ? weatherData.daily : [],
             };
             return { headline, summary: summaryParts.join(' | '), variant: 'result', kind, theme, info: mergedInfo };
+        }
+        if (['sports_scores', 'sports_schedule', 'sports_standings', 'sports_my_teams'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const league = String(d.league || d.sport || '').toUpperCase() || 'Sports';
+            const headline = latest.message || `${league} ${latest.op.replace('sports_', '').replace('_', ' ')}`;
+            const kind = 'sports';
+            return { headline, summary: league, variant: 'result', kind, theme: 'theme-sports', info: d };
+        }
+        if (['sports_follow_team', 'sports_unfollow_team'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const headline = latest.message || (latest.op === 'sports_follow_team' ? 'Following team' : 'Unfollowed team');
+            return { headline, summary: String(d.sport || '').toUpperCase(), variant: 'result', kind: 'sports_manage', theme: 'theme-sports', info: d };
         }
         if (latest.op === 'location_status') {
             const info = this.parsePreviewMap(latest.previewLines);
@@ -2671,7 +2688,7 @@ const UIEngine = {
             const weatherTarget = (info.sourceTarget && typeof info.sourceTarget === 'object') ? info.sourceTarget : null;
             const weatherTargetUrl   = String(weatherTarget?.url   || '').trim();
             const weatherTargetLabel = String(weatherTarget?.label || 'open forecast').trim();
-            const dayCards = daily.slice(0, 7).map((d, i) => {
+            const dayCards = daily.map((d, i) => {
                 const precip = Number(d.precipChance || 0);
                 const wet = precip >= 50 ? 'wet' : precip >= 25 ? 'mixed' : 'dry';
                 const icon = this.conditionIcon(d.condition);
@@ -2701,11 +2718,301 @@ const UIEngine = {
                     <div class="scene-orb orb-a"></div>
                     <div class="scene-grid"></div>
                     <div class="wx7-header">
-                        <div class="wx7-title">7-day forecast</div>
+                        <div class="wx7-title">${escapeHtml(String(info.windowLabel || '7-day forecast'))}</div>
                         <div class="wx7-location">${escapeHtml(location)}</div>
                         ${weatherTargetUrl ? `<a class="wh-link" href="${escapeAttr(weatherTargetUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(weatherTargetLabel)}</a>` : ''}
                     </div>
                     <div class="wx7-strip">${dayCards}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'sports') {
+            const info = core.info || {};
+            const league = String(info.league || info.sport || '').toUpperCase() || 'Sports';
+            const op = String(info.op || '');
+            const events = Array.isArray(info.events) ? info.events : [];
+            const standings = info.standings || null;
+            const focusTeam = String(info.team || info.abbrev || '').toLowerCase();
+
+            // Helper: pull validated hex (no #) from ESPN team object
+            const teamHex = (team) => {
+                const c = String(team.color || '').replace(/^#/, '').trim();
+                return /^[0-9a-fA-F]{6}$/.test(c) ? c : null;
+            };
+
+            // Extract both competitors' colors + venue from the first event for the canvas
+            let awayHex = null, homeHex = null, venueImgUrl = '';
+            if (events.length > 0) {
+                const firstComp0 = (events[0].competitions || [{}])[0] || {};
+                const firstComps = firstComp0.competitors || [];
+                const awayC = firstComps.find(c => c.homeAway === 'away') || firstComps[0];
+                const homeC = firstComps.find(c => c.homeAway === 'home') || firstComps[1];
+                if (awayC) awayHex = teamHex(awayC.team || {});
+                if (homeC) homeHex = teamHex(homeC.team || {});
+            }
+            // Prefer backend-resolved venue image URL (from ESPN venues API)
+            venueImgUrl = String(info.venueImageUrl || '').trim();
+
+            // ── Duel layout: full-width dramatic two-halves for a single focused game ──
+            // Shared game data extraction
+            const gameData = (ev) => {
+                const comps = (ev.competitions || [{}])[0] || {};
+                const competitors = comps.competitors || [];
+                const status = ev.status || {};
+                const statusType = status.type || {};
+                const state = String(statusType.state || 'pre').toLowerCase();
+                const isFinal = state === 'post';
+                const isLive = state === 'in';
+                const clock = String(status.displayClock || '');
+                const period = Number(status.period || 0);
+                const shortDetail = String(statusType.shortDetail || '');
+                const venue = String((comps.venue || {}).fullName || '');
+                const away = competitors.find(c => c.homeAway === 'away') || competitors[0] || {};
+                const home = competitors.find(c => c.homeAway === 'home') || competitors[1] || {};
+                const statusText = isFinal ? (shortDetail || 'FINAL')
+                    : isLive ? `${period ? `${period}P` : 'LIVE'} ${clock}`.trim()
+                    : (shortDetail || String(ev.date || '').slice(0, 10));
+                const statusClass = isFinal ? 'sp-duel-status-final' : isLive ? 'sp-duel-status-live' : 'sp-duel-status-pre';
+                return { comps, competitors, isFinal, isLive, clock, period, shortDetail, venue, away, home, statusText, statusClass };
+            };
+
+            // ── Box score: full-screen layout when no venue image ──
+            const renderBoxScore = (ev) => {
+                const { isFinal, isLive, venue, away, home, statusText, statusClass } = gameData(ev);
+                const mkTeam = (comp, align) => {
+                    const t = comp.team || {};
+                    const name  = escapeHtml(String(t.displayName || t.shortDisplayName || t.abbreviation || '?'));
+                    const abbr  = escapeHtml(String(t.abbreviation || '?'));
+                    const score = escapeHtml(String(comp.score || '–'));
+                    const winner = Boolean(comp.winner);
+                    const hex   = teamHex(t);
+                    const logo  = String(t.logo || '').trim();
+                    const logoEl = logo
+                        ? `<img class="sp-bs-logo" src="${escapeAttr(logo)}" alt="${abbr}" onerror="this.style.display='none'">`
+                        : `<div class="sp-bs-logo-fb" style="${hex ? `background:#${hex}` : ''}">${abbr}</div>`;
+                    const accentStyle = hex ? `style="--tc:#${hex}"` : '';
+                    return `<div class="sp-bs-team sp-bs-${align}${winner ? ' sp-bs-winner' : ''}" ${accentStyle}>
+                        ${logoEl}
+                        <div class="sp-bs-names">
+                            <div class="sp-bs-fullname">${name}</div>
+                            <div class="sp-bs-abbr-label">${abbr} · ${align === 'away' ? 'AWAY' : 'HOME'}</div>
+                        </div>
+                        <div class="sp-bs-score">${score}</div>
+                    </div>`;
+                };
+
+                // Line score (inning/period breakdown) — ESPN provides linescores per competitor
+                const mkLinescore = () => {
+                    const awayLs = Array.isArray(away.linescores) ? away.linescores : [];
+                    const homeLs = Array.isArray(home.linescores) ? home.linescores : [];
+                    if (!awayLs.length && !homeLs.length) return '';
+                    const periods = Math.max(awayLs.length, homeLs.length);
+                    const awayAbbr = escapeHtml(String((away.team || {}).abbreviation || 'AWY'));
+                    const homeAbbr = escapeHtml(String((home.team || {}).abbreviation || 'HME'));
+                    const awayHex2 = teamHex(away.team || {});
+                    const homeHex2 = teamHex(home.team || {});
+                    const headerCells = Array.from({length: periods}, (_, i) => `<th>${i + 1}</th>`).join('');
+                    const awayScoreCells = awayLs.map(ls => `<td>${escapeHtml(String(ls.value ?? ls.displayValue ?? ''))}</td>`).join('');
+                    const homeScoreCells = homeLs.map(ls => `<td>${escapeHtml(String(ls.value ?? ls.displayValue ?? ''))}</td>`).join('');
+                    // Final totals from main score
+                    const awayTot = escapeHtml(String(away.score || ''));
+                    const homeTot = escapeHtml(String(home.score || ''));
+                    const awayStyle = awayHex2 ? `style="color:#${awayHex2}"` : '';
+                    const homeStyle = homeHex2 ? `style="color:#${homeHex2}"` : '';
+                    return `<div class="sp-bs-linescore-wrap">
+                        <table class="sp-bs-linescore">
+                            <thead><tr><th></th>${headerCells}<th class="sp-bs-ls-total">R</th></tr></thead>
+                            <tbody>
+                                <tr><td class="sp-bs-ls-team" ${awayStyle}>${awayAbbr}</td>${awayScoreCells}<td class="sp-bs-ls-total">${awayTot}</td></tr>
+                                <tr><td class="sp-bs-ls-team" ${homeStyle}>${homeAbbr}</td>${homeScoreCells}<td class="sp-bs-ls-total">${homeTot}</td></tr>
+                            </tbody>
+                        </table>
+                    </div>`;
+                };
+
+                // Score bar
+                const awayN = Number(away.score || 0), homeN = Number(home.score || 0), tot = awayN + homeN;
+                const barHtml = (isFinal || isLive) && tot > 0 ? (() => {
+                    const pct = Math.round((awayN / tot) * 100);
+                    const aHex = teamHex(away.team || {}) || 'ffffff';
+                    const hHex = teamHex(home.team || {}) || 'ffffff';
+                    return `<div class="sp-score-bar">
+                        <div class="sp-score-bar-away" style="width:${pct}%;background:#${aHex}"></div>
+                        <div class="sp-score-bar-home" style="width:${100-pct}%;background:#${hHex}"></div>
+                    </div>`;
+                })() : '';
+
+                return `<div class="sp-boxscore">
+                    ${mkTeam(away, 'away')}
+                    <div class="sp-bs-divider">
+                        <div class="sp-duel-status ${statusClass}">${escapeHtml(statusText)}</div>
+                        ${venue ? `<div class="sp-duel-venue">${escapeHtml(venue)}</div>` : ''}
+                    </div>
+                    ${mkTeam(home, 'home')}
+                    ${mkLinescore()}
+                    ${barHtml}
+                </div>`;
+            };
+
+            // ── Duel layout: overlaid on stadium image ──
+            const renderDuel = (ev) => {
+                const { isFinal, isLive, clock, period, shortDetail, venue, away, home, statusText, statusClass } = gameData(ev);
+
+                const renderHalf = (comp, side) => {
+                    const t = comp.team || {};
+                    const name = escapeHtml(String(t.shortDisplayName || t.displayName || t.abbreviation || '?'));
+                    const abbr = escapeHtml(String(t.abbreviation || '?'));
+                    const score = String(comp.score || '');
+                    const winner = Boolean(comp.winner);
+                    const hex = teamHex(t) || (side === 'away' ? '1a1a2e' : '0f2027');
+                    const logoUrl = String(t.logo || '').trim();
+                    const logoHtml = logoUrl
+                        ? `<img class="sp-duel-logo" src="${escapeAttr(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">`
+                        : `<div class="sp-duel-abbr">${abbr}</div>`;
+                    return `<div class="sp-duel-half sp-duel-${side}${winner ? ' sp-duel-winner' : ''}" style="--tc:#${hex}">
+                        <div class="sp-duel-glow"></div>
+                        ${logoHtml}
+                        <div class="sp-duel-name">${name}</div>
+                        <div class="sp-duel-score${score ? '' : ' sp-duel-score-empty'}">${escapeHtml(score) || '–'}</div>
+                        <div class="sp-duel-ha">${side === 'away' ? 'AWAY' : 'HOME'}</div>
+                    </div>`;
+                };
+
+                const awayN = Number(away.score || 0), homeN = Number(home.score || 0), tot = awayN + homeN;
+                const barHtml = (isFinal || isLive) && tot > 0 ? (() => {
+                    const pct = Math.round((awayN / tot) * 100);
+                    const aHex = teamHex(away.team || {}) || 'ffffff';
+                    const hHex = teamHex(home.team || {}) || 'ffffff';
+                    return `<div class="sp-score-bar">
+                        <div class="sp-score-bar-away" style="width:${pct}%;background:#${aHex}"></div>
+                        <div class="sp-score-bar-home" style="width:${100-pct}%;background:#${hHex}"></div>
+                    </div>`;
+                })() : '';
+
+                return `<div class="sp-duel">
+                    ${renderHalf(away, 'away')}
+                    <div class="sp-duel-center">
+                        <div class="sp-duel-status ${statusClass}">${escapeHtml(statusText)}</div>
+                        ${venue ? `<div class="sp-duel-venue">${escapeHtml(venue)}</div>` : ''}
+                    </div>
+                    ${renderHalf(home, 'home')}
+                    ${barHtml}
+                </div>`;
+            };
+
+            // ── Compact card for multi-game list ──
+            const renderCompactCard = (ev) => {
+                const comps = (ev.competitions || [{}])[0] || {};
+                const competitors = comps.competitors || [];
+                const status = ev.status || {};
+                const statusType = status.type || {};
+                const state = String(statusType.state || 'pre').toLowerCase();
+                const isFinal = state === 'post';
+                const isLive = state === 'in';
+                const clock = String(status.displayClock || '');
+                const period = Number(status.period || 0);
+                const shortDetail = escapeHtml(String(statusType.shortDetail || ''));
+
+                const away = competitors.find(c => c.homeAway === 'away') || competitors[0] || {};
+                const home = competitors.find(c => c.homeAway === 'home') || competitors[1] || {};
+
+                const renderTeamRow = (comp, align) => {
+                    const t = comp.team || {};
+                    const abbr = escapeHtml(String(t.abbreviation || '?'));
+                    const name = escapeHtml(String(t.shortDisplayName || t.displayName || abbr));
+                    const score = escapeHtml(String(comp.score || ''));
+                    const winner = Boolean(comp.winner);
+                    const hex = teamHex(t);
+                    const logoUrl = String(t.logo || '').trim();
+                    const borderSide = align === 'away' ? 'border-left' : 'border-right';
+                    const borderStyle = hex ? `${borderSide}:3px solid #${hex}` : '';
+                    return `<div class="sp-compact-team sp-compact-${align}${winner ? ' sp-compact-winner' : ''}" style="${borderStyle}">
+                        ${logoUrl ? `<img class="sp-compact-logo" src="${escapeAttr(logoUrl)}" alt="${abbr}" onerror="this.style.display='none'">` : ''}
+                        <span class="sp-compact-name">${name}</span>
+                        ${score ? `<span class="sp-compact-score">${score}</span>` : ''}
+                    </div>`;
+                };
+
+                const stateLabel = isFinal
+                    ? `<span class="sp-compact-state sp-compact-final">${shortDetail || 'F'}</span>`
+                    : isLive
+                        ? `<span class="sp-compact-state sp-compact-live">● ${period ? `${period}P` : ''} ${clock}</span>`
+                        : `<span class="sp-compact-state sp-compact-pre">${shortDetail || String(ev.date || '').slice(0, 10)}</span>`;
+
+                return `<div class="sp-compact-card">
+                    ${renderTeamRow(away, 'away')}
+                    <div class="sp-compact-mid">${stateLabel}</div>
+                    ${renderTeamRow(home, 'home')}
+                </div>`;
+            };
+
+            let contentHtml = '';
+            if (op === 'sports_standings' && standings) {
+                const groups = standings.children || [];
+                const rows = groups.flatMap(g => {
+                    const groupName = escapeHtml(String(g.name || g.abbreviation || ''));
+                    const entries = (g.standings && Array.isArray(g.standings.entries)) ? g.standings.entries.slice(0, 8) : [];
+                    const entryRows = entries.map(entry => {
+                        const team = entry.team || {};
+                        const abbr = escapeHtml(String(team.abbreviation || '?'));
+                        const fullName = escapeHtml(String(team.shortDisplayName || team.displayName || abbr));
+                        const hex = teamHex(team);
+                        const dotStyle = hex ? `style="background:#${hex}"` : '';
+                        const stats = {};
+                        (entry.stats || []).forEach(s => { if (s && s.name) stats[s.name] = s.displayValue || ''; });
+                        const w = escapeHtml(stats.wins || '');
+                        const l = escapeHtml(stats.losses || '');
+                        const pct = escapeHtml(stats.winPercent || stats.gamesBehind || '');
+                        return `<tr><td><span class="sp-dot" ${dotStyle}></span>${abbr}</td><td>${fullName}</td><td class="sp-wl">${w}-${l}</td><td class="sp-pct">${pct}</td></tr>`;
+                    }).join('');
+                    return groupName ? [`<tr class="sp-group-hdr"><td colspan="4">${groupName}</td></tr>`, entryRows] : [entryRows];
+                }).join('');
+                contentHtml = `<table class="sp-table">${rows}</table>`;
+            } else if (op === 'sports_schedule') {
+                contentHtml = events.map(ev => renderCompactCard(ev)).join('') || `<div class="sp-empty">No upcoming games found</div>`;
+            } else {
+                // scores: single focused game → duel (with venue img) or box score (fallback); multi → compact list
+                if (events.length === 1) {
+                    contentHtml = venueImgUrl ? renderDuel(events[0]) : renderBoxScore(events[0]);
+                } else {
+                    contentHtml = events.map(ev => renderCompactCard(ev)).join('') || `<div class="sp-empty">No scores found</div>`;
+                }
+            }
+
+            const titleMap = { sports_scores: 'Scores', sports_schedule: 'Schedule', sports_standings: 'Standings', sports_my_teams: 'My Teams' };
+            const titleSuffix = titleMap[op] || op.replace('sports_', '').replace(/_/g, ' ');
+            const focusLabel = focusTeam ? escapeHtml(info.team || info.abbrev || '') : '';
+            return `
+                <div class="scene scene-sports ${escapeAttr(core.theme || '')}${events.length === 1 && op === 'sports_scores' ? ' scene-sports-duel' : ''}">
+                    <canvas class="scene-canvas" data-scene="sports"
+                        data-away="${escapeAttr(awayHex || '')}"
+                        data-home="${escapeAttr(homeHex || '')}"
+                        data-venue-img="${escapeAttr(venueImgUrl)}"></canvas>
+                    <div class="sp-header">
+                        <span class="sp-league">${escapeHtml(league)}</span>
+                        <span class="sp-title">${escapeHtml(titleSuffix)}${focusLabel ? ` · ${focusLabel}` : ''}</span>
+                    </div>
+                    <div class="sp-content">${contentHtml}</div>
+                </div>
+            `;
+        }
+        if (core.kind === 'sports_manage') {
+            const info = core.info || {};
+            const team = escapeHtml(String(info.team || ''));
+            const sport = escapeHtml(String(info.sport || '').toUpperCase());
+            const op = String(info.op || '');
+            const teams = Array.isArray(info.teams) ? info.teams : [];
+            const actionLabel = op === 'sports_follow_team' ? `Now following the ${team || 'team'}` : `Unfollowed ${team || 'team'}`;
+            const chipHtml = teams.map(t => `<div class="sp-chip">${escapeHtml(String(t.team || t.abbrev || ''))} <span class="sp-chip-sport">${escapeHtml(String(t.sport || '').toUpperCase())}</span></div>`).join('');
+            return `
+                <div class="scene scene-sports-manage ${escapeAttr(core.theme || '')}">
+                    <div class="scene-orb orb-a"></div>
+                    <div class="scene-grid"></div>
+                    <div class="sp-manage-card">
+                        <div class="sp-manage-action">${escapeHtml(actionLabel)}</div>
+                        ${sport ? `<div class="sp-manage-badge">${sport}</div>` : ''}
+                        ${teams.length ? `<div class="sp-chip-row">${chipHtml}</div>` : '<div class="sp-empty">No teams followed</div>'}
+                    </div>
                 </div>
             `;
         }
@@ -3382,6 +3689,8 @@ const UIEngine = {
             this._sceneRenderer = this.makeWebdeckRenderer(canvas);
         } else if (scene === 'mcp') {
             this._sceneRenderer = this.makeMcpRenderer(canvas);
+        } else if (scene === 'sports') {
+            this._sceneRenderer = this.makeSportsRenderer(canvas);
         } else {
             this._sceneRenderer = this.makeGenericRenderer(canvas);
         }
@@ -3424,6 +3733,126 @@ const UIEngine = {
         return { dpr, w, h };
     },
 
+    makeSportsRenderer(canvas) {
+        let t = 0;
+        const parseHex = (hex) => {
+            const h = String(hex || '').trim();
+            if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+            return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+        };
+        const away = parseHex(canvas.dataset.away) || [30, 30, 60];
+        const home = parseHex(canvas.dataset.home) || [60, 15, 15];
+
+        // Two spotlights — slow independent oscillation
+        const spots = [
+            { side: 0, phase: 0,    speed: 0.0028, swing: 0.18 },
+            { side: 1, phase: 1.9,  speed: 0.0021, swing: 0.18 },
+        ];
+
+        // Load venue photo asynchronously — draw as base layer once ready
+        let venueImg = null;
+        const venueUrl = String(canvas.dataset.venueImg || '').trim();
+        if (venueUrl) {
+            const img = new Image();
+            img.onload = () => { venueImg = img; };
+            img.onerror = () => {};  // silent fallback to canvas-only atmosphere
+            img.src = venueUrl;
+        }
+
+        // Helper: draw venue photo cover-cropped onto canvas
+        const drawVenuePhoto = (ctx, w, h) => {
+            if (!venueImg || !venueImg.naturalWidth) return false;
+            const iw = venueImg.naturalWidth, ih = venueImg.naturalHeight;
+            const ir = iw / ih, cr = w / h;
+            let sx = 0, sy = 0, sw = iw, sh = ih;
+            if (ir > cr) { sw = Math.round(ih * cr); sx = Math.round((iw - sw) / 2); }
+            else         { sh = Math.round(iw / cr); sy = Math.round((ih - sh) * 0.3); }
+            ctx.drawImage(venueImg, sx, sy, sw, sh, 0, 0, w, h);
+            return true;
+        };
+
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+            // ── Layer 1: Stadium photo or deep fill ──
+            ctx.fillStyle = 'rgba(4,4,12,1)';
+            ctx.fillRect(0, 0, w, h);
+            if (venueImg) {
+                ctx.save();
+                ctx.globalAlpha = 0.32;
+                drawVenuePhoto(ctx, w, h);
+                ctx.restore();
+                // Darken heavily so content stays readable
+                ctx.fillStyle = 'rgba(4,4,12,0.60)';
+                ctx.fillRect(0, 0, w, h);
+            }
+
+            // ── Layer 2: Team color radial blooms ──
+            const drawBloom = (rgb, cx, cy, r, alpha) => {
+                const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+                g.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`);
+                g.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+                ctx.fillStyle = g;
+                ctx.fillRect(0, 0, w, h);
+            };
+            // Photo present → subtler bloom (photo carries the color); no photo → stronger
+            const bloomStr = venueImg ? 0.28 : 0.42;
+            drawBloom(away, w * 0.20, h * 0.55, w * 0.65, bloomStr);
+            drawBloom(home, w * 0.80, h * 0.55, w * 0.65, bloomStr);
+
+            // ── Layer 3: Vertical center fade (photo blur seam) ──
+            const seam = ctx.createLinearGradient(w * 0.44, 0, w * 0.56, 0);
+            seam.addColorStop(0, 'rgba(4,4,12,0)');
+            seam.addColorStop(0.5, venueImg ? 'rgba(4,4,12,0.18)' : 'rgba(255,255,255,0.04)');
+            seam.addColorStop(1, 'rgba(4,4,12,0)');
+            ctx.fillStyle = seam;
+            ctx.fillRect(0, 0, w, h);
+
+            // ── Layer 4: Animated stadium spotlights ──
+            ctx.save();
+            for (const sp of spots) {
+                sp.phase += sp.speed;
+                const baseX = sp.side === 0 ? w * 0.25 : w * 0.75;
+                const sweepX = baseX + Math.sin(sp.phase) * w * sp.swing;
+                const rgb = sp.side === 0 ? away : home;
+                const apexX = sweepX, apexY = -h * 0.06;
+                const coneW = w * 0.20, coneH = h * 1.12;
+                const footX = apexX + Math.sin(sp.phase * 0.3) * w * 0.03;
+                // Cone body
+                const spotGrad = ctx.createRadialGradient(apexX, apexY, 0, footX, apexY + coneH, coneH);
+                spotGrad.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${venueImg ? 0.22 : 0.18})`);
+                spotGrad.addColorStop(0.45, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.07)`);
+                spotGrad.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+                ctx.beginPath();
+                ctx.moveTo(apexX, apexY);
+                ctx.lineTo(footX - coneW / 2, apexY + coneH);
+                ctx.lineTo(footX + coneW / 2, apexY + coneH);
+                ctx.closePath();
+                ctx.fillStyle = spotGrad;
+                ctx.fill();
+                // Apex hotspot
+                const dot = ctx.createRadialGradient(apexX, apexY + 3, 0, apexX, apexY + 3, 16);
+                dot.addColorStop(0, 'rgba(255,255,255,0.28)');
+                dot.addColorStop(1, 'rgba(255,255,255,0)');
+                ctx.fillStyle = dot;
+                ctx.beginPath();
+                ctx.arc(apexX, apexY + 3, 16, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.restore();
+
+            // ── Layer 5: Subtle vignette to keep edges dark ──
+            const vig = ctx.createRadialGradient(w/2, h*0.45, h*0.1, w/2, h*0.45, w*0.82);
+            vig.addColorStop(0, 'rgba(0,0,0,0)');
+            vig.addColorStop(1, 'rgba(0,0,0,0.55)');
+            ctx.fillStyle = vig;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
     makeGenericRenderer(canvas) {
         let t = 0;
         return () => {
