@@ -1535,6 +1535,65 @@ def _ext_weather_alert(raw: str, lower: str) -> dict[str, Any] | None:
     return {"location": _extract_location(raw, lower) or "__current__", "type": "alert"}
 
 
+def _ext_location_directions(raw: str, lower: str) -> dict[str, Any] | None:
+    # "directions to X", "navigate to X", "how do I get to X", "take me to X"
+    m = re.search(
+        r"(?:directions?\s+to|navigate\s+to|take\s+me\s+to|get\s+to|"
+        r"how\s+(?:do\s+i|to)\s+get\s+to|way\s+to|route\s+to)\s+(.+?)$",
+        lower,
+    )
+    destination = m.group(1).strip() if m else ""
+    origin_m = re.search(r"\bfrom\s+(.+?)\s+to\b", lower)
+    origin = origin_m.group(1).strip() if origin_m else "__current__"
+    mode_m = re.search(r"\b(walking|walk|driving|drive|cycling|bike|transit|bus|train)\b", lower)
+    mode_map = {"walk": "walking", "drive": "driving", "bike": "cycling",
+                "bus": "transit", "train": "transit"}
+    raw_mode = mode_m.group(1) if mode_m else None
+    mode = mode_map.get(raw_mode, raw_mode) if raw_mode else "driving"
+    return {"destination": destination, "origin": origin, "mode": mode} if destination else None
+
+
+def _ext_location_distance(raw: str, lower: str) -> dict[str, Any] | None:
+    # "how far is X from Y", "distance from X to Y", "how far to X"
+    m = re.search(r"how\s+far\s+(?:is\s+)?(.+?)\s+from\s+(.+?)$", lower)
+    if m:
+        return {"from": m.group(2).strip(), "to": m.group(1).strip()}
+    m2 = re.search(r"distance\s+(?:from\s+)?(.+?)\s+to\s+(.+?)$", lower)
+    if m2:
+        return {"from": m2.group(1).strip(), "to": m2.group(2).strip()}
+    m3 = re.search(r"how\s+far\s+(?:is\s+it\s+)?to\s+(.+?)$", lower)
+    if m3:
+        return {"from": "__current__", "to": m3.group(1).strip()}
+    return None
+
+
+def _ext_location_traffic(raw: str, lower: str) -> dict[str, Any] | None:
+    route_m = re.search(
+        r"(?:traffic\s+(?:on|to|toward|for|heading\s+to)|"
+        r"how(?:'s|\s+is)\s+traffic\s+(?:on|to|for))\s+(.+?)$",
+        lower,
+    )
+    route = route_m.group(1).strip() if route_m else ""
+    return {"route": route, "location": _extract_location(raw, lower) or "__current__"}
+
+
+def _ext_location_share(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_location_saved(raw: str, lower: str) -> dict[str, Any] | None:
+    action = "list"
+    if re.search(r"\b(?:add|save|set|update)\b", lower):
+        action = "add"
+    elif re.search(r"\b(?:remove|delete|clear)\b", lower):
+        action = "remove"
+    label_m = re.search(r"\b(?:set|save|add|update)\s+(?:my\s+)?(\w+)\s+(?:as|to|address)", lower)
+    label = label_m.group(1) if label_m else ""
+    addr_m = re.search(r"(?:as|to)\s+(.+?)$", lower)
+    address = addr_m.group(1).strip() if addr_m else ""
+    return {"action": action, "label": label, "address": address}
+
+
 def _ext_location_nearby(raw: str, lower: str) -> dict[str, Any] | None:
     place_m = re.search(
         r"\b([a-z][a-z\s]{2,30}?)"
@@ -1798,6 +1857,11 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     # Extended extractors
     "weather_alert":        _ext_weather_alert,
     "location_nearby":      _ext_location_nearby,
+    "location_directions":  _ext_location_directions,
+    "location_distance":    _ext_location_distance,
+    "location_traffic":     _ext_location_traffic,
+    "location_share":       _ext_location_share,
+    "location_saved":       _ext_location_saved,
     "shopping_track":       _ext_shopping_track,
     "shopping_wishlist":    _ext_shopping_wishlist,
     "news_saved":           _ext_news_saved,
@@ -2880,6 +2944,85 @@ TAXONOMY: dict[str, Intent] = {
         examples=["restaurants near me", "coffee shops nearby",
                   "find a gas station near me", "what's around me"],
         slots={"query": "type of place", "location": "location or current"},
+    ),
+
+    "location.directions": Intent(
+        id="location.directions",
+        op="location_directions",
+        domain="system",
+        description="Get directions or navigate from one place to another",
+        signals=["directions to", "navigate to", "take me to", "how do i get to",
+                 "get directions", "route to", "way to", "navigate me to"],
+        patterns=[
+            r"\b(?:directions?|navigate|navigation)\s+to\b",
+            r"\bhow\s+(?:do\s+i|to)\s+get\s+to\b",
+        ],
+        blockers=["nearby", "near me", "around me"],
+        extractor="location_directions",
+        examples=["directions to O'Hare airport", "navigate to Wrigley Field",
+                  "how do I get to downtown Chicago", "route to work"],
+        slots={"destination": "where to go", "origin": "starting point",
+               "mode": "driving|walking|cycling|transit"},
+    ),
+
+    "location.distance": Intent(
+        id="location.distance",
+        op="location_distance",
+        domain="system",
+        description="Find the distance between two places",
+        signals=["how far is", "how far to", "distance from", "distance to",
+                 "how many miles", "how many km", "how long to drive",
+                 "how long to walk"],
+        extractor="location_distance",
+        examples=["how far is it to O'Hare", "distance from here to downtown",
+                  "how far is New York from Chicago",
+                  "how long to drive to Milwaukee"],
+        slots={"from": "origin", "to": "destination"},
+    ),
+
+    "location.traffic": Intent(
+        id="location.traffic",
+        op="location_traffic",
+        domain="system",
+        description="Check traffic conditions on a route or to a destination",
+        signals=["traffic", "how's traffic", "traffic conditions", "traffic report",
+                 "congestion", "traffic on", "traffic to", "rush hour",
+                 "how bad is traffic", "is there traffic"],
+        blockers=["weather", "news"],
+        extractor="location_traffic",
+        examples=["how's traffic to work", "traffic on I-94",
+                  "is there traffic downtown", "traffic report for my commute"],
+        slots={"route": "road or destination", "location": "area"},
+    ),
+
+    "location.share": Intent(
+        id="location.share",
+        op="location_share",
+        domain="system",
+        description="Share the user's current location with someone",
+        signals=["share my location", "send my location", "share location with",
+                 "let them know where i am", "send where i am"],
+        patterns=[r"\bshare\s+(?:my\s+)?location\b"],
+        blockers=["share my screen", "share my feed"],
+        extractor="location_share",
+        examples=["share my location with Sarah",
+                  "send my location to John", "let Mike know where I am"],
+        slots={"with": "person to share with"},
+    ),
+
+    "location.saved": Intent(
+        id="location.saved",
+        op="location_saved",
+        domain="system",
+        description="View or manage saved places like home, work, and favorites",
+        signals=["saved places", "my saved places", "saved locations", "my locations",
+                 "set my home", "set home address", "set work address",
+                 "add a saved place", "my home address", "my work address"],
+        extractor="location_saved",
+        examples=["show my saved places", "set my home to 123 Main St",
+                  "update my work address", "my saved locations"],
+        slots={"action": "list|add|remove", "label": "home|work|label name",
+               "address": "address string"},
     ),
 
     # ── Contacts extended ──────────────────────────────────────────────────
