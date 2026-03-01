@@ -1578,6 +1578,14 @@ const UIEngine = {
             { id: 'weather', label: 'weather' },
             { id: 'location', label: 'location' },
             { id: 'shopping', label: 'shopping' },
+            { id: 'music', label: 'music' },
+            { id: 'messaging', label: 'messages' },
+            { id: 'health', label: 'health' },
+            { id: 'smarthome', label: 'home' },
+            { id: 'travel', label: 'travel' },
+            { id: 'payments', label: 'pay' },
+            { id: 'focus', label: 'focus' },
+            { id: 'notifications', label: 'alerts' },
             { id: 'webdeck', label: 'web' },
             { id: 'social', label: 'social' },
             { id: 'banking', label: 'banking' },
@@ -1648,6 +1656,14 @@ const UIEngine = {
             weather: weatherHint ? `show weather in ${weatherHint}` : "what's the weather where i am",
             location: 'where am i',
             shopping: 'show me running shoes',
+            music: 'play my top songs',
+            messaging: 'show my messages',
+            health: 'show my health summary',
+            smarthome: 'show home status',
+            travel: 'show my travel itinerary',
+            payments: 'show my payment history',
+            focus: 'show my screen time stats',
+            notifications: 'show my notifications',
             webdeck: 'open example.com',
             social: 'show my social feed',
             banking: 'show account balances',
@@ -2505,6 +2521,48 @@ const UIEngine = {
         if (domain === 'calendar')     return { headline: 'Calendar',     summary: 'Generated calendar workspace',     variant: 'result', kind: 'calendar',     theme: 'theme-calendar'     };
         if (domain === 'email')        return { headline: 'Email',        summary: 'Generated email workspace',        variant: 'result', kind: 'email',        theme: 'theme-email'        };
         if (domain === 'content')      return { headline: 'Content',      summary: 'Generated content workspace',      variant: 'result', kind: 'content',      theme: 'theme-content'      };
+        // ── Wave-3 domain fallbacks ──────────────────────────────────────────────────
+        if (domain === 'music')         return { headline: 'Music',         summary: 'Music player',            variant: 'result', kind: 'music',         theme: 'theme-music'         };
+        if (domain === 'messaging')     return { headline: 'Messages',      summary: 'Messaging',               variant: 'result', kind: 'messaging',     theme: 'theme-messaging'     };
+        if (domain === 'phone')         return { headline: 'Phone',         summary: 'Phone & calls',           variant: 'result', kind: 'phone',         theme: 'theme-phone'         };
+        if (domain === 'camera')        return { headline: 'Camera',        summary: 'Camera',                  variant: 'result', kind: 'camera',        theme: 'theme-camera'        };
+        if (domain === 'photos')        return { headline: 'Photos',        summary: 'Photo library',           variant: 'result', kind: 'photos',        theme: 'theme-photos'        };
+        if (domain === 'smarthome')     return { headline: 'Home',          summary: 'Smart home controls',    variant: 'result', kind: 'smarthome',     theme: 'theme-smarthome'     };
+        if (domain === 'payments')      return { headline: 'Payments',      summary: 'Payments & transfers',   variant: 'result', kind: 'payments',      theme: 'theme-payments'      };
+        if (domain === 'food_delivery') return { headline: 'Food Delivery', summary: 'Food delivery',          variant: 'result', kind: 'food_delivery', theme: 'theme-food'          };
+        if (domain === 'rideshare')     return { headline: 'Ride',          summary: 'Rideshare',              variant: 'result', kind: 'rideshare',     theme: 'theme-rideshare'     };
+        if (domain === 'travel')        return { headline: 'Travel',        summary: 'Travel & trips',         variant: 'result', kind: 'travel',        theme: 'theme-travel'        };
+        if (domain === 'video')         return { headline: 'Video',         summary: 'Video streaming',        variant: 'result', kind: 'video',         theme: 'theme-video'         };
+        if (domain === 'health')        return { headline: 'Health',        summary: 'Health & fitness',       variant: 'result', kind: 'health',        theme: 'theme-health'        };
+        if (domain === 'alarm')         return { headline: 'Alarm',         summary: 'Alarms & clock',         variant: 'result', kind: 'alarm',         theme: 'theme-alarm'         };
+        if (domain === 'clock')         return { headline: 'Clock',         summary: 'Clock & timers',         variant: 'result', kind: 'clock',         theme: 'theme-clock'         };
+        if (domain === 'podcast')       return { headline: 'Podcasts',      summary: 'Podcast player',         variant: 'result', kind: 'podcast',       theme: 'theme-podcast'       };
+        if (domain === 'recipe')        return { headline: 'Recipes',       summary: 'Recipes & cooking',      variant: 'result', kind: 'recipe',        theme: 'theme-recipe'        };
+        if (domain === 'grocery')       return { headline: 'Grocery',       summary: 'Grocery list',           variant: 'result', kind: 'grocery',       theme: 'theme-grocery'       };
+        if (domain === 'translate')     return { headline: 'Translate',     summary: 'Translation',            variant: 'result', kind: 'translate',     theme: 'theme-translate'     };
+        if (domain === 'book')          return { headline: 'Books',         summary: 'Books & reading',        variant: 'result', kind: 'book',          theme: 'theme-book'          };
+        // ── Wave-4 domain fallbacks ──────────────────────────────────────────────────
+        if (domain === 'notifications') return { headline: 'Notifications', summary: 'Notification center',    variant: 'result', kind: 'notifications', theme: 'theme-notifications' };
+        if (domain === 'handoff')       return { headline: 'Continuity',    summary: 'Cross-device handoff',   variant: 'result', kind: 'handoff',       theme: 'theme-handoff'       };
+        if (domain === 'jira')          return { headline: 'Jira',          summary: 'Issue tracker',          variant: 'result', kind: 'enterprise',    theme: 'theme-enterprise'    };
+        if (domain === 'github')        return { headline: 'GitHub',        summary: 'Code & pull requests',   variant: 'result', kind: 'enterprise',    theme: 'theme-enterprise'    };
+        if (domain === 'slack')         return { headline: 'Slack',         summary: 'Team messaging',         variant: 'result', kind: 'enterprise',    theme: 'theme-enterprise'    };
+        if (domain === 'notion')        return { headline: 'Notion',        summary: 'Pages & databases',      variant: 'result', kind: 'enterprise',    theme: 'theme-enterprise'    };
+        if (domain === 'asana')         return { headline: 'Asana',         summary: 'Project management',     variant: 'result', kind: 'enterprise',    theme: 'theme-enterprise'    };
+        if (domain === 'wallet')        return { headline: 'Wallet',        summary: 'Passes & cards',         variant: 'result', kind: 'wallet',        theme: 'theme-wallet'        };
+        if (domain === 'vpn')           return { headline: 'VPN',           summary: 'VPN connection',         variant: 'result', kind: 'vpn',           theme: 'theme-vpn'           };
+        if (domain === 'focus')         return { headline: 'Focus',         summary: 'Focus & screen time',    variant: 'result', kind: 'focus',         theme: 'theme-focus'         };
+        if (domain === 'dictionary')    return { headline: 'Dictionary',    summary: 'Word lookup',            variant: 'result', kind: 'dictionary',    theme: 'theme-dictionary'    };
+        if (domain === 'password')      return { headline: 'Passwords',     summary: 'Password manager',       variant: 'result', kind: 'password',      theme: 'theme-password'      };
+        if (domain === 'app')           return { headline: 'App Store',     summary: 'Apps',                   variant: 'result', kind: 'app',           theme: 'theme-app'           };
+        if (domain === 'reading')       return { headline: 'Reading List',  summary: 'Saved articles',         variant: 'result', kind: 'reading',       theme: 'theme-reading'       };
+        if (domain === 'date')          return { headline: 'Date',          summary: 'Date calculator',        variant: 'result', kind: 'date',          theme: 'theme-date'          };
+        if (domain === 'screen')        return { headline: 'Screen',        summary: 'Screen capture',         variant: 'result', kind: 'screen',        theme: 'theme-screen'        };
+        if (domain === 'print')         return { headline: 'Print',         summary: 'Print & scan',           variant: 'result', kind: 'print',         theme: 'theme-print'         };
+        if (domain === 'backup')        return { headline: 'Backup',        summary: 'Device backup',          variant: 'result', kind: 'backup',        theme: 'theme-backup'        };
+        if (domain === 'accessibility') return { headline: 'Accessibility', summary: 'Accessibility settings', variant: 'result', kind: 'accessibility', theme: 'theme-accessibility' };
+        if (domain === 'shortcuts')     return { headline: 'Shortcuts',     summary: 'Automations',            variant: 'result', kind: 'shortcuts',     theme: 'theme-shortcuts'     };
+        if (domain === 'currency')      return { headline: 'Currency',      summary: 'Exchange rates',         variant: 'result', kind: 'currency',      theme: 'theme-currency'      };
         return { headline: summary, summary: fallbackSummary, variant: 'result', kind: 'generic', theme: 'theme-neutral' };
     },
 
@@ -4192,6 +4250,27 @@ const UIEngine = {
         } else if (scene === 'sports') {
             this._sceneRenderer = this.makeSportsRenderer(canvas);
         } else if (['document','spreadsheet','presentation','code','terminal','calendar','email','content'].includes(scene)) {
+            this._sceneRenderer = this.makeComputerRenderer(canvas);
+        } else if (scene === 'music') {
+            this._sceneRenderer = this.makeMusicRenderer(canvas);
+        } else if (scene === 'smarthome') {
+            this._sceneRenderer = this.makeSmarthomeRenderer(canvas);
+        } else if (scene === 'health') {
+            this._sceneRenderer = this.makeHealthRenderer(canvas);
+        } else if (scene === 'messaging') {
+            this._sceneRenderer = this.makeMessagingRenderer(canvas);
+        } else if (scene === 'travel') {
+            this._sceneRenderer = this.makeTravelRenderer(canvas);
+        } else if (scene === 'payments') {
+            this._sceneRenderer = this.makePaymentsRenderer(canvas);
+        } else if (scene === 'focus') {
+            this._sceneRenderer = this.makeFocusRenderer(canvas);
+        } else if (['notifications','handoff','wallet','vpn','dictionary','password',
+                    'app','reading','date','screen','print','backup',
+                    'accessibility','shortcuts','currency','phone','camera',
+                    'photos','food_delivery','rideshare','video','alarm','clock',
+                    'podcast','recipe','grocery','translate','book',
+                    'enterprise'].includes(scene)) {
             this._sceneRenderer = this.makeComputerRenderer(canvas);
         } else {
             this._sceneRenderer = this.makeGenericRenderer(canvas);
@@ -6353,6 +6432,392 @@ const UIEngine = {
         }
         // Default: atmospheric landscape
         return 'https://picsum.photos/seed/weather-default/1800/900';
+    },
+
+    // ── Wave-3/4 scene renderers ────────────────────────────────────────────
+
+    makeMusicRenderer(canvas) {
+        // Deep violet-to-indigo field with slow radial pulse rings and floating
+        // note-like particles suggesting audio waveform energy.
+        let t = 0;
+        const particles = Array.from({ length: 22 }, (_, i) => ({
+            x: Math.random(), y: Math.random(),
+            r: 1.5 + Math.random() * 3,
+            phase: i * 0.41,
+            speed: 0.002 + Math.random() * 0.003,
+            amp: 0.05 + Math.random() * 0.1,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.014;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#0d0420');
+            bg.addColorStop(0.5, '#1a0a3a');
+            bg.addColorStop(1, '#0a0d28');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Pulse rings from center
+            const cx = w * 0.5, cy = h * 0.5;
+            for (let ring = 0; ring < 5; ring++) {
+                const prog = ((t * 0.3 + ring * 0.2) % 1);
+                const radius = prog * Math.min(w, h) * 0.6;
+                const alpha = (1 - prog) * 0.22;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(167, 100, 255, ${alpha})`;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+            // Floating particles
+            for (const p of particles) {
+                const px = (p.x + Math.sin(t * p.speed * 40 + p.phase) * p.amp) * w;
+                const py = (p.y + Math.cos(t * p.speed * 30 + p.phase) * p.amp) * h;
+                const alpha = 0.4 + 0.3 * Math.sin(t * 2 + p.phase);
+                ctx.beginPath();
+                ctx.arc(px, py, p.r, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(200, 140, 255, ${alpha})`;
+                ctx.fill();
+            }
+            // Waveform bar in lower third
+            const barCount = 40;
+            const barW = w / barCount;
+            for (let i = 0; i < barCount; i++) {
+                const barH = (0.04 + 0.1 * Math.abs(Math.sin(t * 3 + i * 0.4))) * h;
+                const alpha = 0.5 + 0.3 * Math.sin(t * 2 + i * 0.3);
+                ctx.fillStyle = `rgba(180, 110, 255, ${alpha})`;
+                ctx.fillRect(i * barW + 1, h * 0.75 - barH, barW - 2, barH);
+            }
+        };
+    },
+
+    makeSmarthomeRenderer(canvas) {
+        // Warm amber-to-teal gradient with slow-breathing light orbs representing
+        // individual smart devices coming alive.
+        let t = 0;
+        const orbs = [
+            { x: 0.2, y: 0.35, phase: 0,    color: [255, 180, 60],  r: 14 },
+            { x: 0.5, y: 0.25, phase: 1.2,  color: [60,  200, 200], r: 10 },
+            { x: 0.78, y: 0.4, phase: 2.4,  color: [255, 140, 40],  r: 12 },
+            { x: 0.35, y: 0.65, phase: 0.7, color: [100, 220, 180], r: 8  },
+            { x: 0.65, y: 0.7, phase: 1.9,  color: [255, 200, 80],  r: 10 },
+        ];
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#0c1a14');
+            bg.addColorStop(1, '#0a1520');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Subtle grid (floor plan suggestion)
+            ctx.strokeStyle = 'rgba(80, 120, 100, 0.08)';
+            ctx.lineWidth = 1;
+            for (let x = 0; x <= w; x += 48) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+            }
+            for (let y = 0; y <= h; y += 48) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+            }
+            // Breathing light orbs
+            for (const orb of orbs) {
+                const pulse = 0.7 + 0.3 * Math.sin(t * 1.5 + orb.phase);
+                const [r, g, b] = orb.color;
+                const px = orb.x * w, py = orb.y * h;
+                const grad = ctx.createRadialGradient(px, py, 0, px, py, orb.r * 6 * pulse);
+                grad.addColorStop(0, `rgba(${r},${g},${b},${0.5 * pulse})`);
+                grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.arc(px, py, orb.r * 6 * pulse, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(px, py, orb.r * pulse, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
+                ctx.fill();
+            }
+        };
+    },
+
+    makeHealthRenderer(canvas) {
+        // Deep green biometric aesthetic — slow ECG-style line across midscreen
+        // with circular ring progress indicators in the background.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#041410');
+            bg.addColorStop(1, '#061a12');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Background rings (activity ring style)
+            const rings = [
+                { cx: w * 0.15, cy: h * 0.3, r: 40, color: '255,80,100',  progress: 0.75 },
+                { cx: w * 0.15, cy: h * 0.3, r: 28, color: '80,210,140',  progress: 0.60 },
+                { cx: w * 0.15, cy: h * 0.3, r: 16, color: '80,180,255',  progress: 0.85 },
+            ];
+            for (const ring of rings) {
+                ctx.beginPath();
+                ctx.arc(ring.cx, ring.cy, ring.r, -Math.PI / 2, Math.PI * 2 * ring.progress - Math.PI / 2);
+                ctx.strokeStyle = `rgba(${ring.color}, 0.25)`;
+                ctx.lineWidth = 5;
+                ctx.stroke();
+                const prog = (ring.progress + Math.sin(t + ring.r) * 0.05) % 1;
+                ctx.beginPath();
+                ctx.arc(ring.cx, ring.cy, ring.r, -Math.PI / 2, Math.PI * 2 * prog - Math.PI / 2);
+                ctx.strokeStyle = `rgba(${ring.color}, 0.8)`;
+                ctx.lineWidth = 5;
+                ctx.stroke();
+            }
+            // ECG line across center
+            ctx.beginPath();
+            const lineY = h * 0.62;
+            const speed = t * 60;
+            ctx.moveTo(0, lineY);
+            for (let x = 0; x <= w; x += 2) {
+                const phase = (x + speed) % w;
+                let y = lineY;
+                // QRS complex shape — spike near phase 120-180
+                const localPhase = phase % 200;
+                if (localPhase > 100 && localPhase < 110) y = lineY - 28;
+                else if (localPhase > 110 && localPhase < 118) y = lineY + 14;
+                else if (localPhase > 118 && localPhase < 130) y = lineY - 8;
+                else y = lineY + Math.sin(phase * 0.04) * 3;
+                ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = 'rgba(80, 220, 140, 0.7)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            // Subtle glow under ECG
+            ctx.beginPath();
+            ctx.moveTo(0, lineY);
+            for (let x = 0; x <= w; x += 2) {
+                const phase = (x + speed) % w;
+                const localPhase = phase % 200;
+                let y = lineY;
+                if (localPhase > 100 && localPhase < 110) y = lineY - 28;
+                else if (localPhase > 110 && localPhase < 118) y = lineY + 14;
+                else if (localPhase > 118 && localPhase < 130) y = lineY - 8;
+                else y = lineY + Math.sin(phase * 0.04) * 3;
+                ctx.lineTo(x, y);
+            }
+            ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+            ctx.fillStyle = 'rgba(80, 220, 140, 0.06)';
+            ctx.fill();
+        };
+    },
+
+    makeMessagingRenderer(canvas) {
+        // Soft blue-grey chat bubble aesthetic — floating rounded rectangles
+        // drift upward like a conversation in motion.
+        let t = 0;
+        const bubbles = Array.from({ length: 10 }, (_, i) => ({
+            x: 0.08 + Math.random() * 0.84,
+            y: 0.2 + Math.random() * 0.7,
+            w: 0.15 + Math.random() * 0.25,
+            h: 0.04 + Math.random() * 0.04,
+            side: i % 2,   // 0 = left, 1 = right
+            phase: i * 0.63,
+            speed: 0.0008 + Math.random() * 0.0006,
+        }));
+        const rr = (ctx, x, y, bw, bh, r) => {
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.lineTo(x + bw - r, y);
+            ctx.quadraticCurveTo(x + bw, y, x + bw, y + r);
+            ctx.lineTo(x + bw, y + bh - r);
+            ctx.quadraticCurveTo(x + bw, y + bh, x + bw - r, y + bh);
+            ctx.lineTo(x + r, y + bh);
+            ctx.quadraticCurveTo(x, y + bh, x, y + bh - r);
+            ctx.lineTo(x, y + r);
+            ctx.quadraticCurveTo(x, y, x + r, y);
+            ctx.closePath();
+        };
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.006;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#0a0f1a');
+            bg.addColorStop(1, '#0d1428');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            for (const b of bubbles) {
+                const drift = (b.phase + t * b.speed * 40) % 1.2 - 0.1;
+                const by = (1 - drift) * h;
+                const bx = b.side === 1 ? (1 - b.x - b.w) * w : b.x * w;
+                const bw2 = b.w * w, bh2 = b.h * h;
+                const alpha = 0.08 + 0.06 * Math.sin(t * 2 + b.phase);
+                const color = b.side === 1 ? `rgba(80,140,255,${alpha})` : `rgba(60,200,180,${alpha})`;
+                rr(ctx, bx, by, bw2, bh2, 10);
+                ctx.fillStyle = color;
+                ctx.fill();
+            }
+        };
+    },
+
+    makeTravelRenderer(canvas) {
+        // Dark navy with a slow star-field and a horizon glow — suggests
+        // looking out an airplane window over city lights at night.
+        let t = 0;
+        const stars = Array.from({ length: 80 }, () => ({
+            x: Math.random(), y: Math.random() * 0.6,
+            r: 0.5 + Math.random() * 1.5,
+            twinkle: Math.random() * Math.PI * 2,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#02040f');
+            bg.addColorStop(0.55, '#050d20');
+            bg.addColorStop(0.75, '#0a1a2e');
+            bg.addColorStop(1, '#091420');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Stars
+            for (const s of stars) {
+                const alpha = 0.5 + 0.4 * Math.sin(t * 1.5 + s.twinkle);
+                ctx.beginPath();
+                ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(220,230,255,${alpha})`;
+                ctx.fill();
+            }
+            // Horizon glow (city lights)
+            const horizonY = h * 0.72;
+            const glow = ctx.createLinearGradient(0, horizonY - 30, 0, horizonY + 60);
+            glow.addColorStop(0, 'rgba(255,180,60,0)');
+            glow.addColorStop(0.5, 'rgba(255,160,40,0.18)');
+            glow.addColorStop(1, 'rgba(255,120,20,0.08)');
+            ctx.fillStyle = glow;
+            ctx.fillRect(0, horizonY - 30, w, 90);
+            // Silhouette ground
+            const ground = ctx.createLinearGradient(0, horizonY + 30, 0, h);
+            ground.addColorStop(0, 'rgba(5,12,28,0.9)');
+            ground.addColorStop(1, 'rgba(2,6,16,1)');
+            ctx.fillStyle = ground;
+            ctx.fillRect(0, horizonY + 30, w, h - horizonY - 30);
+            // Scattered city light dots
+            for (let i = 0; i < 50; i++) {
+                const lx = ((i * 0.618033 + t * 0.01) % 1) * w;
+                const ly = horizonY + 35 + (i % 5) * 6;
+                const alpha = 0.3 + 0.4 * Math.sin(t * 3 + i * 0.7);
+                ctx.beginPath();
+                ctx.arc(lx, ly, 1, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255,200,120,${alpha})`;
+                ctx.fill();
+            }
+        };
+    },
+
+    makePaymentsRenderer(canvas) {
+        // Dark emerald with floating card silhouettes and a subtle radial
+        // glow suggesting tap-to-pay proximity.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#030e0a');
+            bg.addColorStop(1, '#04140c');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Tap-to-pay ripple rings
+            const cx = w * 0.72, cy = h * 0.42;
+            for (let ring = 0; ring < 4; ring++) {
+                const prog = ((t * 0.5 + ring * 0.25) % 1);
+                const radius = 20 + prog * 80;
+                const alpha = (1 - prog) * 0.3;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(60,220,140,${alpha})`;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+            // Card shape at left
+            const cardX = w * 0.06, cardY = h * 0.28, cardW = w * 0.42, cardH = h * 0.22;
+            const cardRad = 12;
+            ctx.beginPath();
+            ctx.moveTo(cardX + cardRad, cardY);
+            ctx.lineTo(cardX + cardW - cardRad, cardY);
+            ctx.quadraticCurveTo(cardX + cardW, cardY, cardX + cardW, cardY + cardRad);
+            ctx.lineTo(cardX + cardW, cardY + cardH - cardRad);
+            ctx.quadraticCurveTo(cardX + cardW, cardY + cardH, cardX + cardW - cardRad, cardY + cardH);
+            ctx.lineTo(cardX + cardRad, cardY + cardH);
+            ctx.quadraticCurveTo(cardX, cardY + cardH, cardX, cardY + cardH - cardRad);
+            ctx.lineTo(cardX, cardY + cardRad);
+            ctx.quadraticCurveTo(cardX, cardY, cardX + cardRad, cardY);
+            ctx.closePath();
+            const cardGrad = ctx.createLinearGradient(cardX, cardY, cardX + cardW, cardY + cardH);
+            cardGrad.addColorStop(0, 'rgba(30,80,60,0.5)');
+            cardGrad.addColorStop(1, 'rgba(20,60,44,0.3)');
+            ctx.fillStyle = cardGrad;
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(60,180,120,0.3)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            // Chip
+            ctx.fillStyle = 'rgba(180,200,160,0.25)';
+            ctx.fillRect(cardX + 16, cardY + cardH * 0.3, 28, 20);
+        };
+    },
+
+    makeFocusRenderer(canvas) {
+        // Minimal dark slate with a single breathing orb and slow concentric
+        // rings — Pomodoro / deep-work atmosphere.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.007;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.fillStyle = '#060810';
+            ctx.fillRect(0, 0, w, h);
+            const cx = w * 0.5, cy = h * 0.45;
+            // Concentric rings (timer / progress feel)
+            for (let ring = 5; ring >= 1; ring--) {
+                const radius = ring * 28 + Math.sin(t * 0.8 + ring) * 3;
+                const alpha = 0.04 + 0.02 * ring;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(140,180,255,${alpha})`;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+            // Breathing central orb
+            const breathe = 0.85 + 0.15 * Math.sin(t * 0.9);
+            const orbR = 22 * breathe;
+            const orbGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, orbR * 3);
+            orbGrad.addColorStop(0, `rgba(120,160,255,${0.55 * breathe})`);
+            orbGrad.addColorStop(0.4, `rgba(100,140,220,${0.2 * breathe})`);
+            orbGrad.addColorStop(1, 'rgba(80,100,180,0)');
+            ctx.fillStyle = orbGrad;
+            ctx.beginPath();
+            ctx.arc(cx, cy, orbR * 3, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(cx, cy, orbR, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(160,200,255,${0.7 * breathe})`;
+            ctx.fill();
+        };
     },
 };
 

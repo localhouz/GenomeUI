@@ -3424,6 +3424,370 @@ def _ext_settings_notification(raw: str, lower: str) -> dict[str, Any] | None:
     }
 
 
+# ── Wave-4 extractors ─────────────────────────────────────────────────────────
+
+# ── Notifications ──────────────────────────────────────────────────────────────
+def _ext_notif_view(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_notif_clear(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_notif_clear_app(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:clear|dismiss|remove)\s+(?:all\s+)?notifications?\s+(?:from|for)\s+(.+)", lower)
+    return {"app": m.group(1).strip() if m else ""}
+
+def _ext_notif_mark_read(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_notif_settings(raw: str, lower: str) -> dict | None:
+    m = re.search(r"notification\s+settings?\s+(?:for\s+)?(.+)", lower)
+    return {"app": m.group(1).strip() if m else ""}
+
+# ── Handoff / Continuity ───────────────────────────────────────────────────────
+def _ext_handoff_airdrop(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:airdrop|air\s+drop)\s+(?:this|it|\w+)?\s*(?:to\s+(.+))?", lower)
+    return {"target": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_handoff_clipboard(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_handoff_continue(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:continue|hand\s*off|pick\s+up)\s+(?:on|from|to)\s+(.+)", lower)
+    return {"device": m.group(1).strip() if m else ""}
+
+def _ext_handoff_screen_share(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Enterprise — Jira ──────────────────────────────────────────────────────────
+def _ext_jira_create(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:create|new|file|open)\s+(?:a\s+)?(?:jira\s+)?(?:ticket|issue|bug|story)\s+(?:for|about)?\s*(.+)?", lower)
+    return {"title": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_jira_view(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:view|show|open)\s+(?:jira\s+)?(?:ticket|issue)?\s*([A-Za-z]+-\d+)", raw)
+    return {"ticket": m.group(1).upper() if m else ""}
+
+def _ext_jira_update(raw: str, lower: str) -> dict | None:
+    m = re.search(r"([A-Za-z]+-\d+)", raw)
+    return {"ticket": m.group(1).upper() if m else ""}
+
+def _ext_jira_my_issues(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_jira_sprint(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Enterprise — GitHub ────────────────────────────────────────────────────────
+def _ext_github_pr_view(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:pr|pull\s+request)\s+#?(\d+)", lower)
+    return {"pr": m.group(1) if m else ""}
+
+def _ext_github_issue_create(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:open|create|file)\s+(?:a\s+)?(?:github\s+)?issue\s+(?:for|about)?\s*(.+)?", lower)
+    return {"title": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_github_my_prs(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_github_repo_search(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:find|search)\s+(?:a\s+)?(?:github\s+)?repo(?:sitory)?\s+(?:for|named|about)?\s*(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_github_commit(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Enterprise — Slack ─────────────────────────────────────────────────────────
+def _ext_slack_send(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:send|message|dm)\s+(?:in\s+|to\s+)?#?(\S+)\s+(?:on\s+slack\s+)?(?:saying\s+|that\s+)?(.*)", lower)
+    ch = m.group(1).strip() if m else ""
+    msg = m.group(2).strip() if m and m.group(2) else ""
+    return {"channel": ch, "message": msg}
+
+def _ext_slack_read(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:check|read|show)\s+(?:my\s+)?(?:slack\s+)?#?(\S+)?(?:\s+channel)?", lower)
+    return {"channel": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_slack_search(raw: str, lower: str) -> dict | None:
+    m = re.search(r"search\s+(?:for\s+)?(.+?)(?:\s+in\s+slack)?$", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_slack_status(raw: str, lower: str) -> dict | None:
+    m = re.search(r"set\s+(?:my\s+)?(?:slack\s+)?status\s+(?:to\s+)?(.+)", lower)
+    return {"status": m.group(1).strip() if m else ""}
+
+def _ext_slack_reaction(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:react|reaction|emoji)\s+(.+)", lower)
+    return {"emoji": m.group(1).strip() if m else ""}
+
+# ── Enterprise — Notion ────────────────────────────────────────────────────────
+def _ext_notion_create(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:create|new|add)\s+(?:a\s+)?(?:notion\s+)?(?:page|note|doc)\s+(?:about|for|titled)?\s*(.+)?", lower)
+    return {"title": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_notion_find(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:find|search|open)\s+(?:my\s+)?(?:notion\s+)?(?:page|note|doc)\s+(?:about|on|for)?\s*(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_notion_update(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:update|edit)\s+(?:the\s+)?(?:notion\s+)?(?:page|note)\s+(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_notion_database(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:notion|my)\s+database\s+(?:for|about)?\s*(.+)?", lower)
+    return {"name": m.group(1).strip() if m and m.group(1) else ""}
+
+# ── Enterprise — Asana ────────────────────────────────────────────────────────
+def _ext_asana_create(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:create|add|new)\s+(?:an?\s+)?(?:asana\s+)?task\s+(?:for|about)?\s*(.+)?", lower)
+    return {"title": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_asana_my_tasks(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_asana_update(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:update|complete|mark|close)\s+(?:asana\s+)?task\s+(.+)", lower)
+    return {"task": m.group(1).strip() if m else ""}
+
+def _ext_asana_project(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:show|open|view)\s+(?:asana\s+)?project\s+(.+)", lower)
+    return {"project": m.group(1).strip() if m else ""}
+
+# ── Wallet / Passes ────────────────────────────────────────────────────────────
+def _ext_wallet_passes(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_wallet_loyalty(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:loyalty|rewards?|points|membership)\s+(?:card\s+)?(?:for|at|from)?\s*(.+)?", lower)
+    return {"brand": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_wallet_gift_card(raw: str, lower: str) -> dict | None:
+    m = re.search(r"gift\s+card\s+(?:for|at|from)?\s*(.+)?", lower)
+    return {"brand": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_wallet_coupon(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:coupon|promo|discount|deal|offer)\s+(?:for|at|from)?\s*(.+)?", lower)
+    return {"brand": m.group(1).strip() if m and m.group(1) else ""}
+
+# ── VPN ────────────────────────────────────────────────────────────────────────
+def _ext_vpn_connect(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:connect|enable|turn\s+on|start)\s+vpn\s*(?:to\s+)?(.+)?", lower)
+    return {"server": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_vpn_disconnect(raw: str, lower: str) -> dict | None:
+    return {"action": "disconnect"}
+
+def _ext_vpn_status(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Focus / Productivity ───────────────────────────────────────────────────────
+def _ext_focus_pomodoro(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(\d+)\s*(?:minute|min)", lower)
+    return {"duration": int(m.group(1)) if m else 25, "type": "pomodoro"}
+
+def _ext_focus_session(raw: str, lower: str) -> dict | None:
+    dur_m = re.search(r"(\d+)\s*(?:hours?|hr|minutes?|min)", lower)
+    return {"duration": dur_m.group(1) if dur_m else ""}
+
+def _ext_focus_block(raw: str, lower: str) -> dict | None:
+    m = re.search(r"block\s+(.+?)(?:\s+(?:for\s+\d+|during|until))?$", lower)
+    return {"app": m.group(1).strip() if m else ""}
+
+def _ext_focus_stats(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Dictionary / Reference ─────────────────────────────────────────────────────
+def _ext_dict_define(raw: str, lower: str) -> dict | None:
+    m = re.search(r"\bdefine\s+(\w+)", lower)
+    if not m:
+        m = re.search(r"(?:meaning|definition)\s+of\s+(\w+)", lower)
+    if not m:
+        m = re.search(r"what\s+does\s+(\w+)\s+mean", lower)
+    word = m.group(1).strip() if m else ""
+    return {"word": word} if word else None
+
+def _ext_dict_thesaurus(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:synonyms?\s+(?:for|of)|another\s+word\s+for|thesaurus\s+(?:for|of)?)\s+(\w+)", lower)
+    word = m.group(1).strip() if m else ""
+    return {"word": word} if word else None
+
+def _ext_dict_wikipedia(raw: str, lower: str) -> dict | None:
+    m = re.search(r"wikipedia\s+(?:article\s+)?(?:about|for|on)?\s*(.+)", lower)
+    if not m:
+        m = re.search(r"(?:look\s+up|tell\s+me\s+about)\s+(.+)\s+on\s+wikipedia", lower)
+    query = m.group(1).strip() if m else ""
+    return {"query": query} if query else None
+
+def _ext_dict_etymology(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:etymology|origin|history\s+of\s+the\s+word)\s+(\w+)", lower)
+    word = m.group(1).strip() if m else ""
+    return {"word": word} if word else None
+
+# ── Password Manager ───────────────────────────────────────────────────────────
+def _ext_password_find(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:password|login|credentials?)\s+(?:for|to)\s+(.+)", lower)
+    return {"service": m.group(1).strip() if m else ""}
+
+def _ext_password_generate(raw: str, lower: str) -> dict | None:
+    length_m = re.search(r"(\d+)\s*(?:character|char|digit)", lower)
+    svc_m = re.search(r"(?:for|to)\s+(.+)", lower)
+    return {"service": svc_m.group(1).strip() if svc_m else "", "length": int(length_m.group(1)) if length_m else 16}
+
+def _ext_password_2fa(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:2fa|two[\-\s]factor|totp|authenticator|verification\s+code)\s+(?:code\s+)?(?:for\s+)?(.+)?", lower)
+    return {"service": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_password_update(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:update|change|reset|rotate)\s+(?:my\s+)?password\s+(?:for|to)\s+(.+)", lower)
+    return {"service": m.group(1).strip() if m else ""}
+
+# ── App Store ──────────────────────────────────────────────────────────────────
+def _ext_app_find(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:find|search|look\s+for)\s+(?:an?\s+)?app\s+(?:for|that|to)?\s*(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_app_install(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:install|download|get)\s+(?:the\s+)?(.+?)(?:\s+app)?$", lower)
+    name = m.group(1).strip() if m else ""
+    return {"name": name} if name else None
+
+def _ext_app_update_apps(raw: str, lower: str) -> dict | None:
+    m = re.search(r"update\s+(?:my\s+)?(?:all\s+)?apps?|(?:app\s+updates?)", lower)
+    return {} if m else None
+
+# ── Reading List ───────────────────────────────────────────────────────────────
+def _ext_reading_save(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_reading_list_view(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_reading_mark_read(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Date Calculator ────────────────────────────────────────────────────────────
+def _ext_date_days_until(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:how\s+many\s+days?\s+(?:until|till|to)|days?\s+(?:until|till|to)|countdown\s+to)\s+(.+)", lower)
+    return {"event": m.group(1).strip() if m else ""}
+
+def _ext_date_countdown(raw: str, lower: str) -> dict | None:
+    m = re.search(r"countdown\s+(?:to|until|till)\s+(.+)", lower)
+    return {"event": m.group(1).strip() if m else ""}
+
+def _ext_date_day_of(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:what\s+day\s+(?:is|was|will)|day\s+of\s+(?:the\s+)?week)\s+(?:is\s+)?(.+)", lower)
+    return {"date": m.group(1).strip() if m else ""}
+
+def _ext_date_age(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:how\s+old\s+(?:am\s+i|is|was|will)|born\s+(?:in|on))\s*(.+)?", lower)
+    return {"dob": m.group(1).strip() if m and m.group(1) else ""}
+
+# ── Screen ─────────────────────────────────────────────────────────────────────
+def _ext_screen_screenshot(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_screen_record(raw: str, lower: str) -> dict | None:
+    action = "stop" if re.search(r"\bstop\b", lower) else "start"
+    return {"action": action}
+
+def _ext_screen_mirror(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:mirror|cast|project|airplay)\s+(?:my\s+)?(?:screen|display)\s+(?:to\s+)?(.+)?", lower)
+    return {"target": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_screen_split(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Print / Scan ───────────────────────────────────────────────────────────────
+def _ext_print_document(raw: str, lower: str) -> dict | None:
+    m = re.search(r"print\s+(?:this\s+)?(?:document|file|page|report)?\s*(.+)?", lower)
+    return {"name": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_print_photo(raw: str, lower: str) -> dict | None:
+    m = re.search(r"print\s+(?:this\s+)?(?:photo|picture|image)\s*(.+)?", lower)
+    return {"name": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_print_scan(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Backup ─────────────────────────────────────────────────────────────────────
+def _ext_backup_now(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_backup_status(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Accessibility ──────────────────────────────────────────────────────────────
+def _ext_access_font(raw: str, lower: str) -> dict | None:
+    action = "increase" if re.search(r"\b(?:larger?|bigger?|increase|up)\b", lower) else "decrease"
+    return {"action": action}
+
+def _ext_access_voice(raw: str, lower: str) -> dict | None:
+    action = "off" if re.search(r"\b(?:off|disable|turn\s+off)\b", lower) else "on"
+    return {"action": action}
+
+def _ext_access_zoom(raw: str, lower: str) -> dict | None:
+    action = "out" if "out" in lower else "in"
+    return {"action": action}
+
+def _ext_access_display(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(bold\s+text|invert\s+colors?|reduce\s+motion|color\s+filter|high\s+contrast)", lower)
+    return {"feature": m.group(1) if m else ""}
+
+# ── Shortcuts / Automations ────────────────────────────────────────────────────
+def _ext_shortcut_run(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:run|execute|activate)\s+(?:the\s+)?(.+?)(?:\s+shortcut)?$", lower)
+    name = m.group(1).strip() if m else ""
+    return {"name": name} if name else None
+
+def _ext_shortcut_create(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:create|make|new)\s+(?:a\s+)?shortcut\s+(?:to|for|that)?\s*(.+)?", lower)
+    return {"description": m.group(1).strip() if m and m.group(1) else ""}
+
+def _ext_shortcut_list(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Currency ───────────────────────────────────────────────────────────────────
+_CURRENCY_NAMES = {
+    "dollar": "USD", "dollars": "USD", "usd": "USD",
+    "euro": "EUR", "euros": "EUR", "eur": "EUR",
+    "pound": "GBP", "pounds": "GBP", "gbp": "GBP",
+    "yen": "JPY", "jpy": "JPY",
+    "yuan": "CNY", "cny": "CNY",
+    "rupee": "INR", "rupees": "INR", "inr": "INR",
+    "peso": "MXN", "pesos": "MXN", "mxn": "MXN",
+    "cad": "CAD", "canadian": "CAD",
+    "aud": "AUD", "australian": "AUD",
+    "chf": "CHF", "franc": "CHF", "francs": "CHF",
+    "bitcoin": "BTC", "btc": "BTC",
+    "ethereum": "ETH", "eth": "ETH",
+}
+
+def _ext_currency_convert(raw: str, lower: str) -> dict | None:
+    amount_m = re.search(r"(\d+(?:\.\d+)?)", lower)
+    amount = float(amount_m.group(1)) if amount_m else None
+    found = []
+    for name, code in _CURRENCY_NAMES.items():
+        if re.search(r"\b" + re.escape(name) + r"\b", lower) and code not in found:
+            found.append(code)
+    return {"amount": amount, "from": found[0] if found else "", "to": found[1] if len(found) > 1 else ""}
+
+def _ext_currency_rates(raw: str, lower: str) -> dict | None:
+    return {}
+
+# ── Health extensions ──────────────────────────────────────────────────────────
+def _ext_health_cycle(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_health_streak(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_health_goals(raw: str, lower: str) -> dict | None:
+    return {}
+
+def _ext_health_hrv(raw: str, lower: str) -> dict | None:
+    return {}
+
+
 # ─── Extractor registry ───────────────────────────────────────────────────────
 
 _EXTRACTORS: dict[str, ExtractorFn] = {
@@ -3657,6 +4021,90 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "settings_battery":         _ext_settings_battery,
     "settings_storage":         _ext_settings_storage,
     "settings_notification":    _ext_settings_notification,
+    # wave-4
+    "notif_view":               _ext_notif_view,
+    "notif_clear":              _ext_notif_clear,
+    "notif_clear_app":          _ext_notif_clear_app,
+    "notif_mark_read":          _ext_notif_mark_read,
+    "notif_settings":           _ext_notif_settings,
+    "handoff_airdrop":          _ext_handoff_airdrop,
+    "handoff_clipboard":        _ext_handoff_clipboard,
+    "handoff_continue":         _ext_handoff_continue,
+    "handoff_screen_share":     _ext_handoff_screen_share,
+    "jira_create":              _ext_jira_create,
+    "jira_view":                _ext_jira_view,
+    "jira_update":              _ext_jira_update,
+    "jira_my_issues":           _ext_jira_my_issues,
+    "jira_sprint":              _ext_jira_sprint,
+    "github_pr_view":           _ext_github_pr_view,
+    "github_issue_create":      _ext_github_issue_create,
+    "github_my_prs":            _ext_github_my_prs,
+    "github_repo_search":       _ext_github_repo_search,
+    "github_commit":            _ext_github_commit,
+    "slack_send":               _ext_slack_send,
+    "slack_read":               _ext_slack_read,
+    "slack_search":             _ext_slack_search,
+    "slack_status":             _ext_slack_status,
+    "slack_reaction":           _ext_slack_reaction,
+    "notion_create":            _ext_notion_create,
+    "notion_find":              _ext_notion_find,
+    "notion_update":            _ext_notion_update,
+    "notion_database":          _ext_notion_database,
+    "asana_create":             _ext_asana_create,
+    "asana_my_tasks":           _ext_asana_my_tasks,
+    "asana_update":             _ext_asana_update,
+    "asana_project":            _ext_asana_project,
+    "wallet_passes":            _ext_wallet_passes,
+    "wallet_loyalty":           _ext_wallet_loyalty,
+    "wallet_gift_card":         _ext_wallet_gift_card,
+    "wallet_coupon":            _ext_wallet_coupon,
+    "vpn_connect":              _ext_vpn_connect,
+    "vpn_disconnect":           _ext_vpn_disconnect,
+    "vpn_status":               _ext_vpn_status,
+    "focus_pomodoro":           _ext_focus_pomodoro,
+    "focus_session":            _ext_focus_session,
+    "focus_block":              _ext_focus_block,
+    "focus_stats":              _ext_focus_stats,
+    "dict_define":              _ext_dict_define,
+    "dict_thesaurus":           _ext_dict_thesaurus,
+    "dict_wikipedia":           _ext_dict_wikipedia,
+    "dict_etymology":           _ext_dict_etymology,
+    "password_find":            _ext_password_find,
+    "password_generate":        _ext_password_generate,
+    "password_2fa":             _ext_password_2fa,
+    "password_update":          _ext_password_update,
+    "app_find":                 _ext_app_find,
+    "app_install":              _ext_app_install,
+    "app_update":               _ext_app_update_apps,
+    "reading_save":             _ext_reading_save,
+    "reading_list":             _ext_reading_list_view,
+    "reading_mark_read":        _ext_reading_mark_read,
+    "date_days_until":          _ext_date_days_until,
+    "date_countdown":           _ext_date_countdown,
+    "date_day_of":              _ext_date_day_of,
+    "date_age":                 _ext_date_age,
+    "screen_screenshot":        _ext_screen_screenshot,
+    "screen_record":            _ext_screen_record,
+    "screen_mirror":            _ext_screen_mirror,
+    "screen_split":             _ext_screen_split,
+    "print_document":           _ext_print_document,
+    "print_photo":              _ext_print_photo,
+    "print_scan":               _ext_print_scan,
+    "backup_now":               _ext_backup_now,
+    "backup_status":            _ext_backup_status,
+    "access_font":              _ext_access_font,
+    "access_voice":             _ext_access_voice,
+    "access_zoom":              _ext_access_zoom,
+    "access_display":           _ext_access_display,
+    "shortcut_run":             _ext_shortcut_run,
+    "shortcut_create":          _ext_shortcut_create,
+    "shortcut_list":            _ext_shortcut_list,
+    "currency_convert":         _ext_currency_convert,
+    "currency_rates":           _ext_currency_rates,
+    "health_cycle":             _ext_health_cycle,
+    "health_streak":            _ext_health_streak,
+    "health_goals":             _ext_health_goals,
+    "health_hrv":               _ext_health_hrv,
 }
 
 
@@ -3878,6 +4326,8 @@ TAXONOMY: dict[str, Intent] = {
         signals=["jot", "note that", "write down", "remember that", "log this",
                  "save this", "keep this", "add a note", "add note", "make a note",
                  "make note"],
+        blockers=["reading list", "read later", "save article", "save to reading",
+                  "bookmark this article", "save for later"],
         extractor="note_create",
         examples=["jot this down: the API key expires in March",
                   "note that we need to revisit auth",
@@ -4109,7 +4559,11 @@ TAXONOMY: dict[str, Intent] = {
                   "emails from", "emails about",
                   # Document/presentation blockers
                   "write a letter", "write a memo", "draft a", "create a document",
-                  "create a presentation", "make a presentation", "make a spreadsheet"],
+                  "create a presentation", "make a presentation", "make a spreadsheet",
+                  # Dictionary / password / health blockers — yield to domain intents
+                  "define ", "my password", "password for", "generate password",
+                  "generate a password", "my hrv", "heart rate variability",
+                  "readiness score", "body battery"],
         extractor="web_search",
         examples=["what is quantum computing", "who was Alan Turing",
                   "how does DNS work", "explain neural networks",
@@ -4305,7 +4759,9 @@ TAXONOMY: dict[str, Intent] = {
         blockers=["search the web", "google", "search online", "find a store",
                   "terminal", "command line", "shell", "a terminal",
                   "hotel", "hotels", "flight", "flights", "podcast", "recipe",
-                  "restaurant", "book by", "novel", "book about"],
+                  "restaurant", "book by", "novel", "book about",
+                  "github", "pull request", "my prs", "open prs",
+                  "an app for", "find an app", "app for"],
         extractor="content",
         examples=["open Q4 Report", "find my budget spreadsheet",
                   "pull up the project proposal"],
@@ -5443,8 +5899,10 @@ TAXONOMY: dict[str, Intent] = {
         domain="social",
         description="View social media notifications",
         signals=["social notifications", "my notifications", "check notifications",
-                 "notification center", "who liked my post", "who followed me"],
-        blockers=["app notification", "system notification", "email notification"],
+                 "who liked my post", "who followed me"],
+        blockers=["app notification", "system notification", "email notification",
+                  "show my notifications", "show notifications", "open notifications",
+                  "view notifications", "clear notifications", "notification settings"],
         extractor="social_notifications",
         examples=["check my social notifications", "who liked my post",
                   "see my Instagram notifications"],
@@ -5884,7 +6342,10 @@ TAXONOMY: dict[str, Intent] = {
         description="Send a text or chat message to someone",
         signals=["text", "message", "send a message", "shoot a text", "msg",
                  "send a text", "iMessage", "whatsapp", "dm"],
-        blockers=["email", "voice message", "voicemail"],
+        blockers=["email", "voice message", "voicemail",
+                  "slack", "in slack", "on slack", "slack message",
+                  "text larger", "text smaller", "font size", "text size",
+                  "the text larger", "the text smaller", "larger text", "make the text"],
         patterns=[r"\b(?:text|message)\s+[A-Z][a-z]+"],
         extractor="messaging_send",
         examples=["text Mom I'll be late", "send a message to John saying hey",
@@ -6226,7 +6687,9 @@ TAXONOMY: dict[str, Intent] = {
         description="Make a phone call to a contact or number",
         signals=["call", "dial", "phone", "ring", "give a call", "make a call",
                  "call up", "facetime"],
-        blockers=["call the api", "function call", "called the"],
+        blockers=["call the api", "function call", "called the",
+                  "back up", "backup", "my phone now", "back up my phone",
+                  "phone storage", "phone battery"],
         patterns=[r"\b(?:call|dial|phone|ring)\s+[A-Z][a-z]+"],
         extractor="phone_call",
         examples=["call Mom", "dial 555-1234", "ring John",
@@ -6294,6 +6757,7 @@ TAXONOMY: dict[str, Intent] = {
         description="Record a phone call",
         signals=["record this call", "record the call", "call recording",
                  "start recording", "save this call"],
+        blockers=["my screen", "the screen", "screen recording", "screen record"],
         extractor="phone_record",
         examples=["record this call", "start call recording",
                   "save this conversation"],
@@ -6323,7 +6787,8 @@ TAXONOMY: dict[str, Intent] = {
         description="Record a video",
         signals=["record a video", "take a video", "start recording", "video mode",
                  "shoot a video", "record this"],
-        blockers=["watch a video", "play a video", "stream a video"],
+        blockers=["watch a video", "play a video", "stream a video",
+                  "my screen", "the screen", "screen recording", "screen record"],
         extractor="camera_video",
         examples=["record a video", "take a 30-second video",
                   "start recording"],
@@ -6348,8 +6813,9 @@ TAXONOMY: dict[str, Intent] = {
         op="camera_scan_doc",
         domain="camera",
         description="Scan a document using the camera",
-        signals=["scan document", "scan this document", "scan a receipt",
-                 "document scanner", "scan and save", "scan to pdf"],
+        signals=["scan a receipt", "document scanner", "scan and save", "scan to pdf",
+                 "scan the receipt", "scan the contract", "scan the form"],
+        blockers=["scan this document", "scan document", "use scanner", "use the scanner"],
         extractor="camera_scan_doc",
         examples=["scan this document", "scan the receipt",
                   "scan the contract to PDF"],
@@ -7091,6 +7557,8 @@ TAXONOMY: dict[str, Intent] = {
         signals=["step count", "how many steps", "my steps today",
                  "steps today", "step goal", "activity rings",
                  "did i hit my step goal"],
+        blockers=["set my", "update my goal", "change my goal", "daily step goal",
+                  "calorie goal", "health goal", "fitness goal"],
         extractor="health_steps",
         examples=["how many steps did I take today",
                   "check my step count",
@@ -7519,10 +7987,11 @@ TAXONOMY: dict[str, Intent] = {
         op="translate_text",
         domain="translate",
         description="Translate text from one language to another",
-        signals=["translate", "how do you say", "what is", "in spanish",
+        signals=["translate", "how do you say", "in spanish",
                  "in french", "in german", "in japanese", "translate to",
-                 "translation of"],
-        blockers=["what is the weather", "what is my balance", "what is nearby"],
+                 "translation of", "en espanol", "auf deutsch"],
+        patterns=[r"\bhow\s+do\s+you\s+say\b", r"\btranslate\b.+\bto\b"],
+        blockers=[],
         extractor="translate_text",
         examples=["translate 'hello' to Spanish", "how do you say goodbye in French",
                   "what is 'gracias' in English"],
@@ -7732,6 +8201,1197 @@ TAXONOMY: dict[str, Intent] = {
                   "disable notifications from Twitter",
                   "mute notifications for games"],
         slots={"app": "app name", "action": "on|off"},
+    ),
+
+    # ── Notifications ─────────────────────────────────────────────────────
+
+    "notifications.view": Intent(
+        id="notifications.view",
+        op="notifications_view",
+        domain="notifications",
+        description="View all pending notifications",
+        signals=["my notifications", "show notifications", "notification center",
+                 "check notifications", "open notifications", "view notifications",
+                 "what notifications", "any notifications"],
+        blockers=["notification settings", "turn off notifications",
+                  "disable notifications", "mute notifications"],
+        extractor="notif_view",
+        examples=["show my notifications", "what notifications do I have",
+                  "open notification center"],
+        slots={},
+    ),
+
+    "notifications.clear": Intent(
+        id="notifications.clear",
+        op="notifications_clear",
+        domain="notifications",
+        description="Clear all notifications",
+        signals=["clear all notifications", "dismiss all notifications",
+                 "clear notifications", "remove all notifications"],
+        blockers=["clear notifications from", "clear notifications for",
+                  "dismiss notifications from", "remove notifications from"],
+        extractor="notif_clear",
+        examples=["clear all notifications", "dismiss all my notifications"],
+        slots={},
+    ),
+
+    "notifications.clear_app": Intent(
+        id="notifications.clear_app",
+        op="notifications_clear_app",
+        domain="notifications",
+        description="Clear notifications from a specific app",
+        signals=["clear notifications from", "dismiss notifications from",
+                 "remove notifications from", "clear notifications for"],
+        extractor="notif_clear_app",
+        examples=["clear notifications from Slack", "dismiss Instagram notifications"],
+        slots={"app": "app name"},
+    ),
+
+    "notifications.mark_read": Intent(
+        id="notifications.mark_read",
+        op="notifications_mark_read",
+        domain="notifications",
+        description="Mark all notifications as read",
+        signals=["mark notifications as read", "mark all read",
+                 "mark notifications read"],
+        extractor="notif_mark_read",
+        examples=["mark all notifications as read"],
+        slots={},
+    ),
+
+    "notifications.settings": Intent(
+        id="notifications.settings",
+        op="notifications_settings",
+        domain="notifications",
+        description="Open notification settings for an app",
+        signals=["notification settings for", "notifications settings"],
+        extractor="notif_settings",
+        examples=["notification settings for WhatsApp"],
+        slots={"app": "app name"},
+    ),
+
+    # ── Handoff / Continuity ──────────────────────────────────────────────
+
+    "handoff.airdrop": Intent(
+        id="handoff.airdrop",
+        op="handoff_airdrop",
+        domain="handoff",
+        description="AirDrop a file or content to a nearby device",
+        signals=["airdrop", "air drop", "airdrop this", "airdrop to"],
+        extractor="handoff_airdrop",
+        examples=["AirDrop this photo to John",
+                  "AirDrop this file", "send via AirDrop"],
+        slots={"target": "person or device name"},
+    ),
+
+    "handoff.clipboard": Intent(
+        id="handoff.clipboard",
+        op="handoff_clipboard",
+        domain="handoff",
+        description="Copy to or sync Universal Clipboard across devices",
+        signals=["universal clipboard", "copy to mac", "paste from iphone",
+                 "clipboard sync", "handoff clipboard"],
+        extractor="handoff_clipboard",
+        examples=["copy this to my Mac", "sync clipboard",
+                  "paste from my iPhone"],
+        slots={},
+    ),
+
+    "handoff.continue": Intent(
+        id="handoff.continue",
+        op="handoff_continue",
+        domain="handoff",
+        description="Continue an activity on another device (Handoff)",
+        signals=["continue on", "handoff to", "pick up on", "continue on my mac",
+                 "continue on my iphone", "continue on my ipad", "switch to my"],
+        extractor="handoff_continue",
+        examples=["continue this on my Mac",
+                  "pick up on my iPad", "handoff to my iPhone"],
+        slots={"device": "target device name"},
+    ),
+
+    "handoff.screen_share": Intent(
+        id="handoff.screen_share",
+        op="handoff_screen_share",
+        domain="handoff",
+        description="Share or mirror screen to another device",
+        signals=["share my screen", "screen sharing", "shareplay", "share screen with",
+                 "start screen share"],
+        blockers=["screen record", "screenshot"],
+        extractor="handoff_screen_share",
+        examples=["share my screen with the team",
+                  "start SharePlay", "share screen on FaceTime"],
+        slots={},
+    ),
+
+    # ── Enterprise — Jira ─────────────────────────────────────────────────
+
+    "jira.create": Intent(
+        id="jira.create",
+        op="jira_create",
+        domain="jira",
+        description="Create a new Jira ticket or issue",
+        signals=["jira ticket", "jira issue", "create a ticket", "file a ticket",
+                 "open a ticket", "new jira", "create jira", "jira bug", "jira story"],
+        extractor="jira_create",
+        examples=["create a Jira ticket for the login bug",
+                  "file a bug in Jira", "open a new Jira story"],
+        slots={"title": "ticket title", "type": "bug|story|task|epic"},
+    ),
+
+    "jira.view": Intent(
+        id="jira.view",
+        op="jira_view",
+        domain="jira",
+        description="View a specific Jira ticket by key",
+        signals=["jira ticket", "jira issue", "show jira", "view jira", "open jira"],
+        patterns=[r"\b[A-Z]+-\d+\b"],
+        extractor="jira_view",
+        examples=["show me PROJ-123", "view Jira ticket ABC-456",
+                  "open PROJ-789"],
+        slots={"ticket": "ticket key e.g. PROJ-123"},
+    ),
+
+    "jira.update": Intent(
+        id="jira.update",
+        op="jira_update",
+        domain="jira",
+        description="Update, assign, or close a Jira ticket",
+        signals=["update jira", "close jira ticket", "assign jira ticket",
+                 "mark jira done", "set jira status", "resolve jira ticket"],
+        patterns=[r"\b(?:update|close|assign|resolve|mark)\b.+\b[A-Za-z]+-\d+\b"],
+        extractor="jira_update",
+        examples=["close PROJ-123", "assign ABC-456 to John",
+                  "mark PROJ-789 as done"],
+        slots={"ticket": "ticket key", "action": "close|assign|update", "assignee": "person"},
+    ),
+
+    "jira.my_issues": Intent(
+        id="jira.my_issues",
+        op="jira_my_issues",
+        domain="jira",
+        description="Show Jira issues assigned to me",
+        signals=["my jira issues", "my jira tickets", "assigned to me in jira",
+                 "my open tickets", "jira backlog", "jira board"],
+        extractor="jira_my_issues",
+        examples=["show my Jira issues", "what tickets are assigned to me",
+                  "my Jira backlog"],
+        slots={},
+    ),
+
+    "jira.sprint": Intent(
+        id="jira.sprint",
+        op="jira_sprint",
+        domain="jira",
+        description="View current sprint status and tickets",
+        signals=["current sprint", "sprint board", "active sprint", "sprint status",
+                 "this sprint", "sprint tickets"],
+        extractor="jira_sprint",
+        examples=["show current sprint", "what's in this sprint",
+                  "sprint board status"],
+        slots={},
+    ),
+
+    # ── Enterprise — GitHub ───────────────────────────────────────────────
+
+    "github.pr_view": Intent(
+        id="github.pr_view",
+        op="github_pr_view",
+        domain="github",
+        description="View a GitHub pull request",
+        signals=["pull request", "pr review", "github pr", "view pr",
+                 "open pr", "check pr", "pr status"],
+        extractor="github_pr_view",
+        examples=["show PR #123", "view pull request 456",
+                  "check the GitHub PR"],
+        slots={"pr": "PR number"},
+    ),
+
+    "github.issue_create": Intent(
+        id="github.issue_create",
+        op="github_issue_create",
+        domain="github",
+        description="Create a new GitHub issue",
+        signals=["github issue", "create github issue", "open github issue",
+                 "file github issue", "new github issue"],
+        extractor="github_issue_create",
+        examples=["open a GitHub issue for the crash bug",
+                  "create a GitHub issue", "file an issue on GitHub"],
+        slots={"title": "issue title"},
+    ),
+
+    "github.my_prs": Intent(
+        id="github.my_prs",
+        op="github_my_prs",
+        domain="github",
+        description="Show my open pull requests",
+        signals=["my pull requests", "my prs", "my github prs",
+                 "prs i opened", "my open pull requests", "github dashboard",
+                 "open github prs", "my open prs", "github prs"],
+        extractor="github_my_prs",
+        examples=["show my pull requests", "what PRs do I have open",
+                  "my GitHub PRs"],
+        slots={},
+    ),
+
+    "github.repo_search": Intent(
+        id="github.repo_search",
+        op="github_repo_search",
+        domain="github",
+        description="Search for a GitHub repository",
+        signals=["github repo", "find a repo", "github repository",
+                 "search github", "look for a repo"],
+        extractor="github_repo_search",
+        examples=["find a GitHub repo for markdown editors",
+                  "search GitHub for React templates"],
+        slots={"query": "search query"},
+    ),
+
+    "github.commit": Intent(
+        id="github.commit",
+        op="github_commit",
+        domain="github",
+        description="View recent commits or commit history",
+        signals=["github commits", "recent commits", "commit history",
+                 "latest commits", "who committed", "git log"],
+        extractor="github_commit",
+        examples=["show recent commits", "what's the commit history",
+                  "who committed last"],
+        slots={},
+    ),
+
+    # ── Enterprise — Slack ────────────────────────────────────────────────
+
+    "slack.send": Intent(
+        id="slack.send",
+        op="slack_send",
+        domain="slack",
+        description="Send a Slack message to a channel or person",
+        signals=["slack message", "message in slack", "send in slack",
+                 "dm in slack", "post to slack", "message on slack",
+                 "send a slack", "slack the team"],
+        extractor="slack_send",
+        examples=["send a Slack message to #general",
+                  "message John on Slack",
+                  "post to the #dev channel on Slack"],
+        slots={"channel": "channel or person", "message": "message text"},
+    ),
+
+    "slack.read": Intent(
+        id="slack.read",
+        op="slack_read",
+        domain="slack",
+        description="Read messages from a Slack channel",
+        signals=["check slack", "read slack", "slack messages",
+                 "what's in slack", "slack channel", "unread slack"],
+        extractor="slack_read",
+        examples=["check Slack #general", "what's new in #dev on Slack",
+                  "read my Slack messages"],
+        slots={"channel": "channel name"},
+    ),
+
+    "slack.search": Intent(
+        id="slack.search",
+        op="slack_search",
+        domain="slack",
+        description="Search for a message in Slack",
+        signals=["search slack", "find in slack", "look up slack",
+                 "slack search for"],
+        extractor="slack_search",
+        examples=["search Slack for the deployment notes",
+                  "find the standup message in Slack"],
+        slots={"query": "search query"},
+    ),
+
+    "slack.status": Intent(
+        id="slack.status",
+        op="slack_status",
+        domain="slack",
+        description="Set Slack status",
+        signals=["slack status", "set slack status", "set my status on slack",
+                 "update slack status", "change slack status"],
+        extractor="slack_status",
+        examples=["set my Slack status to 'in a meeting'",
+                  "update Slack status to WFH"],
+        slots={"status": "status text"},
+    ),
+
+    "slack.reaction": Intent(
+        id="slack.reaction",
+        op="slack_reaction",
+        domain="slack",
+        description="Add an emoji reaction to a Slack message",
+        signals=["slack react", "slack reaction", "react with emoji on slack",
+                 "add reaction in slack"],
+        extractor="slack_reaction",
+        examples=["react with thumbs up on Slack",
+                  "add a 🎉 reaction in Slack"],
+        slots={"emoji": "emoji name"},
+    ),
+
+    # ── Enterprise — Notion ───────────────────────────────────────────────
+
+    "notion.create": Intent(
+        id="notion.create",
+        op="notion_create",
+        domain="notion",
+        description="Create a new Notion page or note",
+        signals=["notion page", "notion note", "create notion", "new notion",
+                 "add to notion", "notion doc"],
+        extractor="notion_create",
+        examples=["create a Notion page about the project plan",
+                  "new Notion note", "add to Notion"],
+        slots={"title": "page title"},
+    ),
+
+    "notion.find": Intent(
+        id="notion.find",
+        op="notion_find",
+        domain="notion",
+        description="Find a Notion page or document",
+        signals=["find notion", "search notion", "open notion page",
+                 "notion page about", "my notion notes"],
+        extractor="notion_find",
+        examples=["find my Notion page about Q4 goals",
+                  "open the Notion doc for the project"],
+        slots={"query": "search query"},
+    ),
+
+    "notion.update": Intent(
+        id="notion.update",
+        op="notion_update",
+        domain="notion",
+        description="Update an existing Notion page",
+        signals=["update notion", "edit notion page", "add to notion page",
+                 "modify notion"],
+        extractor="notion_update",
+        examples=["update my Notion page for the roadmap",
+                  "edit the Notion doc"],
+        slots={"query": "page query"},
+    ),
+
+    "notion.database": Intent(
+        id="notion.database",
+        op="notion_database",
+        domain="notion",
+        description="Access a Notion database",
+        signals=["notion database", "notion table", "notion board",
+                 "my notion database", "notion kanban"],
+        extractor="notion_database",
+        examples=["show my Notion database", "open the Notion task board",
+                  "view Notion kanban"],
+        slots={"name": "database name"},
+    ),
+
+    # ── Enterprise — Asana ────────────────────────────────────────────────
+
+    "asana.create": Intent(
+        id="asana.create",
+        op="asana_create",
+        domain="asana",
+        description="Create an Asana task",
+        signals=["asana task", "create asana", "new asana task",
+                 "add asana task", "asana to-do"],
+        extractor="asana_create",
+        examples=["create an Asana task for the launch",
+                  "new Asana task: review PR by Friday"],
+        slots={"title": "task title"},
+    ),
+
+    "asana.my_tasks": Intent(
+        id="asana.my_tasks",
+        op="asana_my_tasks",
+        domain="asana",
+        description="Show my Asana tasks",
+        signals=["my asana tasks", "asana my tasks", "asana tasks assigned",
+                 "what's on asana", "asana to-do list"],
+        extractor="asana_my_tasks",
+        examples=["show my Asana tasks", "what do I have on Asana",
+                  "my Asana to-do list"],
+        slots={},
+    ),
+
+    "asana.update": Intent(
+        id="asana.update",
+        op="asana_update",
+        domain="asana",
+        description="Update or complete an Asana task",
+        signals=["complete asana task", "mark asana done", "update asana task",
+                 "close asana task", "asana task complete"],
+        extractor="asana_update",
+        examples=["mark the Asana task as complete",
+                  "update Asana task: review PR"],
+        slots={"task": "task name"},
+    ),
+
+    "asana.project": Intent(
+        id="asana.project",
+        op="asana_project",
+        domain="asana",
+        description="View an Asana project",
+        signals=["asana project", "show asana project", "open asana project",
+                 "view asana project", "asana board"],
+        extractor="asana_project",
+        examples=["show the Asana project for website redesign",
+                  "open the Q4 Asana project"],
+        slots={"project": "project name"},
+    ),
+
+    # ── Wallet / Passes ───────────────────────────────────────────────────
+
+    "wallet.passes": Intent(
+        id="wallet.passes",
+        op="wallet_passes",
+        domain="wallet",
+        description="View passes, tickets, and boarding passes in wallet",
+        signals=["my passes", "wallet passes", "apple wallet", "google wallet",
+                 "boarding pass in wallet", "ticket in wallet",
+                 "show my wallet", "open wallet"],
+        blockers=["payments", "pay with", "send money", "transfer"],
+        extractor="wallet_passes",
+        examples=["show my wallet passes", "open Apple Wallet",
+                  "my boarding pass in Wallet"],
+        slots={},
+    ),
+
+    "wallet.loyalty": Intent(
+        id="wallet.loyalty",
+        op="wallet_loyalty",
+        domain="wallet",
+        description="Find a loyalty or rewards card",
+        signals=["loyalty card", "rewards card", "my points", "reward points",
+                 "membership card", "starbucks rewards", "airline miles"],
+        extractor="wallet_loyalty",
+        examples=["show my Starbucks rewards card",
+                  "find my airline miles card", "loyalty card for Target"],
+        slots={"brand": "brand or program name"},
+    ),
+
+    "wallet.gift_card": Intent(
+        id="wallet.gift_card",
+        op="wallet_gift_card",
+        domain="wallet",
+        description="View or use a gift card",
+        signals=["gift card", "show gift card", "my gift cards",
+                 "gift card balance", "use gift card"],
+        extractor="wallet_gift_card",
+        examples=["show my Amazon gift card",
+                  "what's the balance on my gift card",
+                  "use my Starbucks gift card"],
+        slots={"brand": "brand name"},
+    ),
+
+    "wallet.coupon": Intent(
+        id="wallet.coupon",
+        op="wallet_coupon",
+        domain="wallet",
+        description="Find a coupon, promo code, or discount offer",
+        signals=["coupon", "promo code", "discount code", "my coupons",
+                 "available offers", "promotional offer", "deal available"],
+        blockers=["show me a deal", "find a deal on"],
+        extractor="wallet_coupon",
+        examples=["do I have any coupons for Target",
+                  "show promo code for Nike",
+                  "find discount for my order"],
+        slots={"brand": "brand name"},
+    ),
+
+    # ── VPN ───────────────────────────────────────────────────────────────
+
+    "vpn.connect": Intent(
+        id="vpn.connect",
+        op="vpn_connect",
+        domain="vpn",
+        description="Connect to a VPN server",
+        signals=["connect vpn", "enable vpn", "turn on vpn", "start vpn",
+                 "activate vpn", "vpn on"],
+        extractor="vpn_connect",
+        examples=["connect to VPN", "turn on VPN", "enable VPN US server"],
+        slots={"server": "server location or name"},
+    ),
+
+    "vpn.disconnect": Intent(
+        id="vpn.disconnect",
+        op="vpn_disconnect",
+        domain="vpn",
+        description="Disconnect from VPN",
+        signals=["disconnect vpn", "disable vpn", "turn off vpn",
+                 "stop vpn", "vpn off"],
+        extractor="vpn_disconnect",
+        examples=["disconnect VPN", "turn off VPN", "disable VPN"],
+        slots={},
+    ),
+
+    "vpn.status": Intent(
+        id="vpn.status",
+        op="vpn_status",
+        domain="vpn",
+        description="Check VPN connection status",
+        signals=["vpn status", "am i connected to vpn", "vpn connected",
+                 "is vpn on", "vpn connection"],
+        extractor="vpn_status",
+        examples=["am I connected to VPN", "VPN status",
+                  "is my VPN on"],
+        slots={},
+    ),
+
+    # ── Focus / Productivity ──────────────────────────────────────────────
+
+    "focus.pomodoro": Intent(
+        id="focus.pomodoro",
+        op="focus_pomodoro",
+        domain="focus",
+        description="Start a Pomodoro focus timer",
+        signals=["pomodoro", "focus timer", "25 minute timer", "work timer",
+                 "start pomodoro", "pomodoro timer"],
+        extractor="focus_pomodoro",
+        examples=["start a Pomodoro", "set a 25 minute focus timer",
+                  "start a Pomodoro session"],
+        slots={"duration": "minutes (default 25)"},
+    ),
+
+    "focus.session": Intent(
+        id="focus.session",
+        op="focus_session",
+        domain="focus",
+        description="Start a focus work session",
+        signals=["focus session", "deep work", "focus mode", "work session",
+                 "start focusing", "focus for"],
+        blockers=["do not disturb", "dnd", "silence"],
+        extractor="focus_session",
+        examples=["start a 2 hour focus session",
+                  "enter deep work mode", "focus for 90 minutes"],
+        slots={"duration": "duration"},
+    ),
+
+    "focus.block": Intent(
+        id="focus.block",
+        op="focus_block",
+        domain="focus",
+        description="Block distracting apps or websites during focus",
+        signals=["block distractions", "block apps", "block websites",
+                 "block social media during", "site blocker",
+                 "distraction blocker"],
+        extractor="focus_block",
+        examples=["block social media for 2 hours",
+                  "block Twitter during my focus session",
+                  "block distracting apps"],
+        slots={"app": "app or site to block"},
+    ),
+
+    "focus.stats": Intent(
+        id="focus.stats",
+        op="focus_stats",
+        domain="focus",
+        description="View focus or screen time statistics",
+        signals=["screen time", "focus stats", "how long i focused",
+                 "focus report", "screen time stats", "daily screen time",
+                 "phone usage stats", "app usage time"],
+        extractor="focus_stats",
+        examples=["show my screen time", "how long did I focus today",
+                  "my phone usage stats"],
+        slots={},
+    ),
+
+    # ── Dictionary / Reference ────────────────────────────────────────────
+
+    "dictionary.define": Intent(
+        id="dictionary.define",
+        op="dict_define",
+        domain="dictionary",
+        description="Look up the definition of a word",
+        signals=["define", "definition of", "what does", "meaning of",
+                 "look up the word", "dictionary"],
+        blockers=["define a task", "define a goal", "define a project",
+                  "define my", "screen time", "focus"],
+        extractor="dict_define",
+        examples=["define ephemeral", "what does ubiquitous mean",
+                  "definition of serendipity"],
+        slots={"word": "word to define"},
+    ),
+
+    "dictionary.thesaurus": Intent(
+        id="dictionary.thesaurus",
+        op="dict_thesaurus",
+        domain="dictionary",
+        description="Find synonyms or antonyms of a word",
+        signals=["synonyms for", "synonym of", "antonyms for",
+                 "another word for", "thesaurus", "similar words to"],
+        extractor="dict_thesaurus",
+        examples=["synonyms for happy", "another word for quickly",
+                  "antonyms of brave"],
+        slots={"word": "word"},
+    ),
+
+    "dictionary.wikipedia": Intent(
+        id="dictionary.wikipedia",
+        op="dict_wikipedia",
+        domain="dictionary",
+        description="Look up an article on Wikipedia",
+        signals=["wikipedia", "wiki article", "look up on wikipedia",
+                 "tell me about on wikipedia"],
+        extractor="dict_wikipedia",
+        examples=["Wikipedia article about black holes",
+                  "look up Tokyo on Wikipedia"],
+        slots={"query": "search query"},
+    ),
+
+    "dictionary.etymology": Intent(
+        id="dictionary.etymology",
+        op="dict_etymology",
+        domain="dictionary",
+        description="Look up the etymology or word origin",
+        signals=["etymology", "word origin", "origin of the word",
+                 "history of the word", "where does the word come from"],
+        extractor="dict_etymology",
+        examples=["etymology of serendipity", "origin of the word robot",
+                  "where does the word 'disaster' come from"],
+        slots={"word": "word"},
+    ),
+
+    # ── Password Manager ──────────────────────────────────────────────────
+
+    "password.find": Intent(
+        id="password.find",
+        op="password_find",
+        domain="password",
+        description="Find a saved password for a service",
+        signals=["my password for", "password for", "login for",
+                 "credentials for", "find my password"],
+        extractor="password_find",
+        examples=["what's my password for Netflix",
+                  "find login for GitHub",
+                  "credentials for Amazon"],
+        slots={"service": "service or site name"},
+    ),
+
+    "password.generate": Intent(
+        id="password.generate",
+        op="password_generate",
+        domain="password",
+        description="Generate a secure random password",
+        signals=["generate a password", "create a password", "random password",
+                 "strong password", "new password for", "password generator",
+                 "generate password", "generate secure password"],
+        patterns=[r"\bgenerate\b.{0,30}\bpassword\b"],
+        extractor="password_generate",
+        examples=["generate a secure password for Twitter",
+                  "create a 16-character password",
+                  "generate a strong random password"],
+        slots={"service": "service name", "length": "length in chars"},
+    ),
+
+    "password.2fa": Intent(
+        id="password.2fa",
+        op="password_2fa",
+        domain="password",
+        description="Get a 2FA or authenticator code",
+        signals=["2fa code", "two factor code", "authenticator code",
+                 "totp code", "verification code for", "one time code",
+                 "otp for"],
+        extractor="password_2fa",
+        examples=["get 2FA code for GitHub",
+                  "authenticator code for Google",
+                  "two-factor code for Slack"],
+        slots={"service": "service name"},
+    ),
+
+    "password.update": Intent(
+        id="password.update",
+        op="password_update",
+        domain="password",
+        description="Update or change a saved password",
+        signals=["update my password for", "change my password for",
+                 "reset my password for", "new password for",
+                 "rotate password for"],
+        extractor="password_update",
+        examples=["update my password for Netflix",
+                  "change password for GitHub",
+                  "reset my Amazon password"],
+        slots={"service": "service name"},
+    ),
+
+    # ── App Store ─────────────────────────────────────────────────────────
+
+    "app.find": Intent(
+        id="app.find",
+        op="app_find",
+        domain="app",
+        description="Search the app store for an app",
+        signals=["find an app", "search for an app", "app for", "app that",
+                 "find app", "look for an app", "recommend an app",
+                 "best app for"],
+        blockers=["app notification", "mute app", "block app"],
+        extractor="app_find",
+        examples=["find an app for tracking sleep",
+                  "search for a good budgeting app",
+                  "best app for meditation"],
+        slots={"query": "app query"},
+    ),
+
+    "app.install": Intent(
+        id="app.install",
+        op="app_install",
+        domain="app",
+        description="Install an app",
+        signals=["install", "download the app", "get the app",
+                 "install the app", "download and install"],
+        blockers=["install update", "install backup", "update apps",
+                  "update my apps"],
+        extractor="app_install",
+        examples=["install Spotify", "download the Duolingo app",
+                  "get the Notion app"],
+        slots={"name": "app name"},
+    ),
+
+    "app.update": Intent(
+        id="app.update",
+        op="app_update",
+        domain="app",
+        description="Update apps to the latest version",
+        signals=["update my apps", "app updates", "update all apps",
+                 "pending app updates", "apps need updating",
+                 "check for app updates"],
+        extractor="app_update",
+        examples=["update all my apps", "check for app updates",
+                  "install pending app updates"],
+        slots={},
+    ),
+
+    # ── Reading List ──────────────────────────────────────────────────────
+
+    "reading.save": Intent(
+        id="reading.save",
+        op="reading_save",
+        domain="reading",
+        description="Save an article or page to reading list",
+        signals=["save to reading list", "add to reading list",
+                 "read later", "save this article", "bookmark this article",
+                 "save article for later"],
+        extractor="reading_save",
+        examples=["save this article to my reading list",
+                  "add to read later", "bookmark this page to read later"],
+        slots={},
+    ),
+
+    "reading.list": Intent(
+        id="reading.list",
+        op="reading_list",
+        domain="reading",
+        description="View saved reading list",
+        signals=["my reading list", "show reading list",
+                 "articles saved to read", "read later list",
+                 "saved articles", "things to read"],
+        extractor="reading_list",
+        examples=["show my reading list", "articles I saved to read later",
+                  "open my read later list"],
+        slots={},
+    ),
+
+    "reading.mark_read": Intent(
+        id="reading.mark_read",
+        op="reading_mark_read",
+        domain="reading",
+        description="Mark a reading list article as read",
+        signals=["mark as read", "finished reading", "read this article",
+                 "mark article read"],
+        blockers=["mark notification", "mark email"],
+        extractor="reading_mark_read",
+        examples=["mark this article as read",
+                  "I finished reading this"],
+        slots={},
+    ),
+
+    # ── Date Calculator ───────────────────────────────────────────────────
+
+    "date.days_until": Intent(
+        id="date.days_until",
+        op="date_days_until",
+        domain="date",
+        description="Calculate how many days until an event or date",
+        signals=["how many days until", "days until", "days till",
+                 "how long until", "when is"],
+        blockers=["when is the weather", "when is my flight"],
+        extractor="date_days_until",
+        examples=["how many days until Christmas",
+                  "days until my birthday",
+                  "how long until New Year's Eve"],
+        slots={"event": "event or date"},
+    ),
+
+    "date.countdown": Intent(
+        id="date.countdown",
+        op="date_countdown",
+        domain="date",
+        description="Set a countdown timer to an event",
+        signals=["countdown to", "countdown timer", "count down to",
+                 "time until", "time till"],
+        blockers=["time until my flight", "countdown to launch"],
+        extractor="date_countdown",
+        examples=["countdown to my anniversary",
+                  "countdown timer to graduation",
+                  "count down to the Super Bowl"],
+        slots={"event": "event or date"},
+    ),
+
+    "date.day_of": Intent(
+        id="date.day_of",
+        op="date_day_of",
+        domain="date",
+        description="Find out what day of the week a date falls on",
+        signals=["what day is", "day of the week", "what day was",
+                 "day of week for", "what day will"],
+        extractor="date_day_of",
+        examples=["what day is July 4th", "what day of the week is March 15",
+                  "what day was December 25 2020"],
+        slots={"date": "date to check"},
+    ),
+
+    "date.age": Intent(
+        id="date.age",
+        op="date_age",
+        domain="date",
+        description="Calculate age from a birth date",
+        signals=["how old am i", "how old is", "calculate my age",
+                 "my age if born in", "born in"],
+        blockers=["how old is the account", "age of my phone"],
+        extractor="date_age",
+        examples=["how old am I if I was born in 1990",
+                  "calculate my age born March 5 1985"],
+        slots={"dob": "date of birth"},
+    ),
+
+    # ── Screen Capture ────────────────────────────────────────────────────
+
+    "screen.screenshot": Intent(
+        id="screen.screenshot",
+        op="screen_screenshot",
+        domain="screen",
+        description="Take a screenshot",
+        signals=["screenshot", "take a screenshot", "capture the screen",
+                 "take a screen capture", "snap the screen"],
+        extractor="screen_screenshot",
+        examples=["take a screenshot", "capture the screen",
+                  "take a screen snap"],
+        slots={},
+    ),
+
+    "screen.record": Intent(
+        id="screen.record",
+        op="screen_record",
+        domain="screen",
+        description="Start or stop screen recording",
+        signals=["screen record", "record my screen", "start recording screen",
+                 "stop recording screen", "screen recorder",
+                 "recording my screen", "start recording my screen",
+                 "stop recording my screen"],
+        blockers=["share my screen", "screen sharing"],
+        extractor="screen_record",
+        examples=["start recording my screen",
+                  "stop screen recording",
+                  "record what's on my screen"],
+        slots={"action": "start|stop"},
+    ),
+
+    "screen.mirror": Intent(
+        id="screen.mirror",
+        op="screen_mirror",
+        domain="screen",
+        description="Mirror or cast screen to another display",
+        signals=["mirror my screen", "cast my screen", "airplay screen",
+                 "project screen", "screen mirroring", "cast to tv"],
+        blockers=["share my screen", "screen sharing"],
+        extractor="screen_mirror",
+        examples=["mirror my screen to the TV",
+                  "AirPlay my screen to the Apple TV",
+                  "cast screen to Chromecast"],
+        slots={"target": "target device"},
+    ),
+
+    "screen.split": Intent(
+        id="screen.split",
+        op="screen_split",
+        domain="screen",
+        description="Enable split screen or multi-window mode",
+        signals=["split screen", "side by side", "split view",
+                 "multitasking view", "snap window", "split window",
+                 "stage manager"],
+        extractor="screen_split",
+        examples=["open split screen", "put apps side by side",
+                  "enable Stage Manager"],
+        slots={},
+    ),
+
+    # ── Print / Scan ──────────────────────────────────────────────────────
+
+    "print.document": Intent(
+        id="print.document",
+        op="print_document",
+        domain="print",
+        description="Print a document or file",
+        signals=["print this", "print the document", "print the file",
+                 "print this page", "print the report", "send to printer"],
+        blockers=["print photo", "print picture", "print image", "scan"],
+        extractor="print_document",
+        examples=["print this document", "send to printer",
+                  "print the PDF"],
+        slots={"name": "document name"},
+    ),
+
+    "print.photo": Intent(
+        id="print.photo",
+        op="print_photo",
+        domain="print",
+        description="Print a photo or image",
+        signals=["print this photo", "print this picture", "print this image",
+                 "print the photo", "photo print"],
+        extractor="print_photo",
+        examples=["print this photo", "print the picture",
+                  "print this image"],
+        slots={"name": "photo name"},
+    ),
+
+    "print.scan": Intent(
+        id="print.scan",
+        op="print_scan",
+        domain="print",
+        description="Scan a document with the camera or scanner",
+        signals=["scan document", "scan this", "scanner", "scan a document",
+                 "scan the receipt", "scan barcode", "scan qr code",
+                 "use scanner"],
+        extractor="print_scan",
+        examples=["scan this document", "scan the receipt",
+                  "use the scanner"],
+        slots={},
+    ),
+
+    # ── Backup ────────────────────────────────────────────────────────────
+
+    "backup.now": Intent(
+        id="backup.now",
+        op="backup_now",
+        domain="backup",
+        description="Back up the device now",
+        signals=["back up now", "backup now", "start backup", "backup my phone",
+                 "backup my device", "icloud backup", "google backup",
+                 "run backup", "back up my phone", "back up my device",
+                 "back up my"],
+        extractor="backup_now",
+        examples=["back up my phone now", "start iCloud backup",
+                  "backup my device"],
+        slots={},
+    ),
+
+    "backup.status": Intent(
+        id="backup.status",
+        op="backup_status",
+        domain="backup",
+        description="Check the status of the last backup",
+        signals=["backup status", "last backup", "when was my last backup",
+                 "backup progress", "is backup done"],
+        extractor="backup_status",
+        examples=["when was my last backup", "backup status",
+                  "is my phone backed up"],
+        slots={},
+    ),
+
+    # ── Accessibility ─────────────────────────────────────────────────────
+
+    "accessibility.font": Intent(
+        id="accessibility.font",
+        op="access_font",
+        domain="accessibility",
+        description="Increase or decrease text/font size",
+        signals=["font size", "text size", "make text larger", "make text smaller",
+                 "increase font size", "decrease font size", "bigger text",
+                 "larger text", "smaller text",
+                 "make the text larger", "make the text smaller",
+                 "make the text bigger", "text larger", "text smaller"],
+        extractor="access_font",
+        examples=["make the text larger", "increase font size",
+                  "make text smaller"],
+        slots={"action": "increase|decrease"},
+    ),
+
+    "accessibility.voice": Intent(
+        id="accessibility.voice",
+        op="access_voice",
+        domain="accessibility",
+        description="Toggle screen reader / VoiceOver / TalkBack",
+        signals=["voiceover", "talkback", "screen reader", "voice control",
+                 "turn on voiceover", "turn off voiceover",
+                 "enable screen reader"],
+        extractor="access_voice",
+        examples=["turn on VoiceOver", "enable TalkBack",
+                  "turn off screen reader"],
+        slots={"action": "on|off"},
+    ),
+
+    "accessibility.zoom": Intent(
+        id="accessibility.zoom",
+        op="access_zoom",
+        domain="accessibility",
+        description="Enable accessibility zoom or magnifier",
+        signals=["zoom in", "zoom out", "magnifier", "enable zoom",
+                 "magnify screen", "accessibility zoom", "screen magnifier"],
+        blockers=["camera zoom", "pinch to zoom", "map zoom"],
+        extractor="access_zoom",
+        examples=["enable accessibility zoom", "turn on magnifier",
+                  "zoom in on the screen"],
+        slots={"action": "in|out|toggle"},
+    ),
+
+    "accessibility.display": Intent(
+        id="accessibility.display",
+        op="access_display",
+        domain="accessibility",
+        description="Toggle display accessibility features",
+        signals=["bold text", "invert colors", "reduce motion",
+                 "color filter", "high contrast", "reduce transparency",
+                 "grayscale mode", "display accessibility"],
+        extractor="access_display",
+        examples=["turn on bold text", "enable high contrast mode",
+                  "turn on invert colors"],
+        slots={"feature": "feature name"},
+    ),
+
+    # ── Shortcuts / Automations ───────────────────────────────────────────
+
+    "shortcuts.run": Intent(
+        id="shortcuts.run",
+        op="shortcut_run",
+        domain="shortcuts",
+        description="Run a named shortcut or automation",
+        signals=["run shortcut", "run automation", "execute shortcut",
+                 "activate shortcut", "run my shortcut"],
+        patterns=[r"\b(?:run|execute|activate)\b.{1,40}\bshortcut\b"],
+        extractor="shortcut_run",
+        examples=["run my morning routine shortcut",
+                  "execute the 'send location' shortcut",
+                  "run Good Morning automation"],
+        slots={"name": "shortcut name"},
+    ),
+
+    "shortcuts.create": Intent(
+        id="shortcuts.create",
+        op="shortcut_create",
+        domain="shortcuts",
+        description="Create a new shortcut or automation",
+        signals=["create a shortcut", "make a shortcut", "new shortcut",
+                 "create an automation", "build a shortcut",
+                 "new automation"],
+        extractor="shortcut_create",
+        examples=["create a shortcut to send my location",
+                  "make a new automation for my morning routine"],
+        slots={"description": "what the shortcut should do"},
+    ),
+
+    "shortcuts.list": Intent(
+        id="shortcuts.list",
+        op="shortcut_list",
+        domain="shortcuts",
+        description="List all available shortcuts",
+        signals=["my shortcuts", "show shortcuts", "list shortcuts",
+                 "available shortcuts", "all my shortcuts",
+                 "what shortcuts do i have"],
+        extractor="shortcut_list",
+        examples=["show my shortcuts", "list all automations",
+                  "what shortcuts do I have"],
+        slots={},
+    ),
+
+    # ── Currency ──────────────────────────────────────────────────────────
+
+    "currency.convert": Intent(
+        id="currency.convert",
+        op="currency_convert",
+        domain="currency",
+        description="Convert an amount from one currency to another",
+        signals=["convert currency", "exchange rate", "in euros", "in dollars",
+                 "usd to eur", "eur to usd", "convert dollars to",
+                 "how much is", "currency converter"],
+        blockers=["how much is it", "how much does it cost", "how much are"],
+        patterns=[
+            r"\b\d+(?:\.\d+)?\s+(?:dollars?|euros?|pounds?|yen|yuan|rupees?|pesos?|[A-Z]{3})\s+(?:in|to|into)\b",
+            r"\bconvert\s+\d+(?:\.\d+)?\s+[A-Za-z]+\s+to\s+[A-Za-z]+\b",
+        ],
+        extractor="currency_convert",
+        examples=["convert 100 USD to EUR", "how much is 50 euros in dollars",
+                  "1000 yen in USD"],
+        slots={"amount": "numeric amount", "from": "source currency", "to": "target currency"},
+    ),
+
+    "currency.rates": Intent(
+        id="currency.rates",
+        op="currency_rates",
+        domain="currency",
+        description="Show current exchange rates",
+        signals=["exchange rates", "current exchange rate", "forex rates",
+                 "currency rates", "rate for", "fx rate"],
+        extractor="currency_rates",
+        examples=["show exchange rates for EUR",
+                  "current USD to GBP rate",
+                  "forex rates today"],
+        slots={},
+    ),
+
+    # ── Health extensions ─────────────────────────────────────────────────
+
+    "health.cycle": Intent(
+        id="health.cycle",
+        op="health_cycle",
+        domain="health",
+        description="Track menstrual cycle or log symptoms",
+        signals=["period", "menstrual cycle", "cycle tracking", "log period",
+                 "track my cycle", "period symptoms", "ovulation",
+                 "cycle log"],
+        extractor="health_cycle",
+        examples=["log my period", "track my cycle",
+                  "record ovulation symptoms"],
+        slots={},
+    ),
+
+    "health.streak": Intent(
+        id="health.streak",
+        op="health_streak",
+        domain="health",
+        description="View health or activity streaks",
+        signals=["activity streak", "health streak", "workout streak",
+                 "my streak", "step streak", "consecutive days",
+                 "how many days in a row"],
+        extractor="health_streak",
+        examples=["show my workout streak", "how many days in a row have I worked out",
+                  "my activity streak"],
+        slots={},
+    ),
+
+    "health.goals": Intent(
+        id="health.goals",
+        op="health_goals",
+        domain="health",
+        description="View or update health and fitness goals",
+        signals=["health goal", "fitness goal", "activity goal", "step goal",
+                 "set my goal", "update my goal", "calorie goal",
+                 "daily goal"],
+        extractor="health_goals",
+        examples=["set my daily step goal to 10000",
+                  "update my calorie goal",
+                  "show my health goals"],
+        slots={},
+    ),
+
+    "health.hrv": Intent(
+        id="health.hrv",
+        op="health_hrv",
+        domain="health",
+        description="Check heart rate variability or readiness score",
+        signals=["hrv", "heart rate variability", "readiness score",
+                 "recovery score", "body battery", "strain score",
+                 "how recovered am i"],
+        extractor="health_hrv",
+        examples=["what's my HRV today", "show my readiness score",
+                  "body battery level"],
+        slots={},
     ),
 }
 
