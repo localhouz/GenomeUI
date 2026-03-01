@@ -2188,6 +2188,1242 @@ def _ext_calendar_rsvp(raw: str, lower: str) -> dict[str, Any] | None:
     return {"response": response, "event": m.group(1).strip() if m else ""}
 
 
+# ─── Wave-3 extractors ────────────────────────────────────────────────────────
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
+_TIME_RE = re.compile(
+    r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b", re.IGNORECASE
+)
+
+
+def _extract_time_str(lower: str) -> str | None:
+    m = _TIME_RE.search(lower)
+    if not m:
+        return None
+    h, mn, ampm = m.group(1), m.group(2) or "00", (m.group(3) or "").lower().replace(".", "")
+    return f"{h}:{mn} {ampm}".strip()
+
+
+def _extract_music_platform(lower: str) -> str | None:
+    for p in ("spotify", "apple music", "youtube music", "tidal", "amazon music",
+              "deezer", "pandora", "soundcloud"):
+        if p in lower:
+            return p.replace(" ", "_")
+    return None
+
+
+def _extract_msg_platform(lower: str) -> str | None:
+    for p in ("imessage", "whatsapp", "signal", "telegram", "messenger",
+              "instagram", "snapchat", "discord", "slack"):
+        if p in lower:
+            return p
+    return None
+
+
+def _extract_payment_platform(lower: str) -> str | None:
+    for p in ("venmo", "zelle", "paypal", "cash app", "cashapp", "apple pay", "google pay"):
+        if p in lower:
+            return p.replace(" ", "_")
+    return None
+
+
+def _extract_streaming_platform(lower: str) -> str | None:
+    for p in ("netflix", "hulu", "disney", "hbo", "amazon prime", "youtube",
+              "peacock", "paramount", "apple tv"):
+        if p in lower:
+            return p.replace(" ", "_")
+    return None
+
+
+def _extract_person(lower: str) -> str:
+    m = re.search(
+        r"(?:to|from|with|for)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)", lower
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _extract_amount(lower: str) -> float | None:
+    mm = _MONEY_RE.search(lower)
+    if not mm:
+        return None
+    try:
+        return float((mm.group(1) or mm.group(2) or "0").replace(",", ""))
+    except ValueError:
+        return None
+
+
+# ── Messaging ──────────────────────────────────────────────────────────────────
+
+def _ext_messaging_send(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:text|message|send\s+(?:a\s+)?(?:text|message|msg))\s+"
+        r"(?:to\s+)?([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+        lower,
+    )
+    recipient = m.group(1).strip() if m else _extract_person(lower)
+    body_m = re.search(r"(?:saying|that|:)\s*(.+)$", raw, re.IGNORECASE)
+    return {
+        "recipient": recipient,
+        "body": body_m.group(1).strip() if body_m else "",
+        "platform": _extract_msg_platform(lower),
+    }
+
+
+def _ext_messaging_read(_raw: str, lower: str) -> dict[str, Any] | None:
+    person_m = re.search(
+        r"(?:from|with|messages?\s+from)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)", lower
+    )
+    return {
+        "contact": person_m.group(1).strip() if person_m else "",
+        "platform": _extract_msg_platform(lower),
+    }
+
+
+def _ext_messaging_reply(raw: str, lower: str) -> dict[str, Any] | None:
+    body_m = re.search(r"(?:reply|respond)\s+(?:to\s+.+?\s+)?(?:saying|with|:)\s*(.+)$",
+                       raw, re.IGNORECASE)
+    return {
+        "body": body_m.group(1).strip() if body_m else "",
+        "platform": _extract_msg_platform(lower),
+    }
+
+
+def _ext_messaging_delete(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:delete|remove|clear)\s+(?:the\s+)?(?:conversation|messages?|chat)\s+"
+        r"(?:with|from\s+)?(.+?)(?:\s+messages?)?$",
+        lower,
+    )
+    return {"contact": m.group(1).strip() if m else ""}
+
+
+def _ext_messaging_search(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:search|find)\s+(?:messages?\s+)?(?:for\s+|about\s+)?(.+?)$", lower)
+    return {"query": m.group(1).strip() if m else raw.strip()}
+
+
+def _ext_messaging_group_create(raw: str, lower: str) -> dict[str, Any] | None:
+    name_m = re.search(r"(?:called|named)\s+[\"']?(.+?)[\"']?$", lower)
+    return {
+        "name": name_m.group(1).strip() if name_m else "",
+        "platform": _extract_msg_platform(lower),
+    }
+
+
+def _ext_messaging_group_add(raw: str, lower: str) -> dict[str, Any] | None:
+    person_m = re.search(r"add\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+to", lower)
+    group_m = re.search(r"to\s+(?:the\s+)?(.+?)(?:\s+group|chat)?$", lower)
+    return {
+        "person": person_m.group(1).strip() if person_m else "",
+        "group": group_m.group(1).strip() if group_m else "",
+    }
+
+
+def _ext_messaging_react_msg(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:love|heart)\b", lower):
+        reaction = "love"
+    elif re.search(r"\b(?:laugh|haha|lol)\b", lower):
+        reaction = "haha"
+    elif re.search(r"\b(?:thumbs\s+up|like)\b", lower):
+        reaction = "like"
+    elif re.search(r"\b(?:thumbs\s+down|dislike)\b", lower):
+        reaction = "dislike"
+    else:
+        reaction = "like"
+    return {"reaction": reaction}
+
+
+def _ext_messaging_forward(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"forward\s+(?:this\s+)?(?:message\s+)?to\s+(.+?)$", lower)
+    return {"recipient": m.group(1).strip() if m else ""}
+
+
+def _ext_messaging_block(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:block|mute)\s+(?:messages?\s+from\s+)?(.+?)$", lower)
+    return {"contact": m.group(1).strip() if m else ""}
+
+
+def _ext_messaging_schedule(raw: str, lower: str) -> dict[str, Any] | None:
+    person_m = re.search(
+        r"(?:message|text)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:saying|at|tomorrow)",
+        lower,
+    )
+    body_m = re.search(r"(?:saying|:)\s*(.+?)(?:\s+at\b|$)", raw, re.IGNORECASE)
+    return {
+        "recipient": person_m.group(1).strip() if person_m else "",
+        "body": body_m.group(1).strip() if body_m else "",
+        "time": _extract_time_str(lower),
+    }
+
+
+# ── Music ──────────────────────────────────────────────────────────────────────
+
+def _ext_music_play(raw: str, lower: str) -> dict[str, Any] | None:
+    platform = _extract_music_platform(lower)
+    # artist
+    artist_m = re.search(r"(?:by|from|artist)\s+([A-Za-z][^\s]+(?:\s+[A-Za-z][^\s]+){0,3})",
+                         lower)
+    # album
+    album_m = re.search(r"(?:album|the\s+album)\s+[\"']?(.+?)[\"']?(?:\s+by|\s+on|$)", lower)
+    # playlist
+    playlist_m = re.search(r"(?:playlist|mix)\s+[\"']?(.+?)[\"']?(?:\s+on|$)", lower)
+    # song title — text before "by" keyword or after play/listen keywords
+    title_m = re.search(
+        r"(?:play|listen\s+to|put\s+on|queue\s+up)\s+[\"']?(.+?)[\"']?"
+        r"(?:\s+by|\s+on\s+spotify|\s+playlist|$)",
+        lower,
+    )
+    return {
+        "query": title_m.group(1).strip() if title_m else raw.strip(),
+        "artist": artist_m.group(1).strip() if artist_m else None,
+        "album": album_m.group(1).strip() if album_m else None,
+        "playlist": playlist_m.group(1).strip() if playlist_m else None,
+        "platform": platform,
+    }
+
+
+def _ext_music_pause(_raw: str, lower: str) -> dict[str, Any] | None:
+    action = "resume" if re.search(r"\b(?:resume|unpause|continue)\b", lower) else "pause"
+    return {"action": action}
+
+
+def _ext_music_skip(_raw: str, lower: str) -> dict[str, Any] | None:
+    direction = "previous" if re.search(r"\b(?:previous|back|last\s+song|go\s+back)\b",
+                                        lower) else "next"
+    return {"direction": direction}
+
+
+def _ext_music_volume(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:mute|silence)\b", lower):
+        return {"action": "mute", "level": None}
+    if re.search(r"\b(?:louder|turn\s+up|volume\s+up|increase\s+volume)\b", lower):
+        return {"action": "up", "level": None}
+    if re.search(r"\b(?:quieter|turn\s+down|volume\s+down|lower\s+the\s+volume)\b", lower):
+        return {"action": "down", "level": None}
+    pct_m = re.search(r"\b(\d{1,3})\s*(?:percent|%)\b", lower)
+    return {"action": "set", "level": int(pct_m.group(1)) if pct_m else None}
+
+
+def _ext_music_like(_raw: str, lower: str) -> dict[str, Any] | None:
+    action = "unlike" if re.search(r"\b(?:unlike|dislike|remove\s+from\s+liked)\b",
+                                   lower) else "like"
+    return {"action": action}
+
+
+def _ext_music_playlist_add(raw: str, lower: str) -> dict[str, Any] | None:
+    playlist_m = re.search(r"(?:to|into)\s+(?:my\s+)?(?:playlist\s+)?[\"']?(.+?)[\"']?\s*$",
+                           lower)
+    song_m = re.search(r"add\s+[\"']?(.+?)[\"']?\s+(?:to|into)\b", lower)
+    return {
+        "song": song_m.group(1).strip() if song_m else "",
+        "playlist": playlist_m.group(1).strip() if playlist_m else "",
+    }
+
+
+def _ext_music_playlist_create(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:called|named|titled)\s+[\"']?(.+?)[\"']?$", lower)
+    if not m:
+        m = re.search(r"playlist\s+(?:for|of|about)\s+(.+?)$", lower)
+    return {"name": m.group(1).strip() if m else ""}
+
+
+def _ext_music_queue(raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:show|view|open|what(?:'s|\s+is)\s+(?:in|on))\b", lower):
+        return {"action": "view", "song": None}
+    song_m = re.search(r"(?:add|queue|play\s+next)\s+[\"']?(.+?)[\"']?\s*$", lower)
+    return {"action": "add", "song": song_m.group(1).strip() if song_m else ""}
+
+
+def _ext_music_lyrics(_raw: str, lower: str) -> dict[str, Any] | None:
+    song_m = re.search(r"lyrics\s+(?:for|to|of)\s+[\"']?(.+?)[\"']?$", lower)
+    return {"song": song_m.group(1).strip() if song_m else ""}
+
+
+def _ext_music_radio(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:radio|station)\s+(?:for|based\s+on|like)\s+[\"']?(.+?)[\"']?$", lower)
+    if not m:
+        m = re.search(r"(.+?)\s+radio$", lower)
+    return {"seed": m.group(1).strip() if m else raw.strip(), "platform": _extract_music_platform(lower)}
+
+
+def _ext_music_discover(_raw: str, lower: str) -> dict[str, Any] | None:
+    genre_m = re.search(
+        r"\b(jazz|rock|pop|hip.?hop|r&b|classical|country|electronic|indie|metal|"
+        r"folk|blues|reggae|latin|k.?pop|edm|soul|punk|alternative)\b",
+        lower,
+    )
+    mood_m = re.search(
+        r"\b(chill|happy|sad|energetic|focus|workout|sleep|study|party|relax)\b", lower
+    )
+    return {
+        "genre": genre_m.group(1) if genre_m else None,
+        "mood": mood_m.group(1) if mood_m else None,
+    }
+
+
+def _ext_music_cast(raw: str, lower: str) -> dict[str, Any] | None:
+    device_m = re.search(
+        r"(?:to|on)\s+(?:the\s+)?(?:my\s+)?(.+?)\s*(?:speaker|sonos|echo|homepod|chromecast|tv)?$",
+        lower,
+    )
+    return {"device": device_m.group(1).strip() if device_m else ""}
+
+
+def _ext_music_sleep_timer(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(\d+)\s*(minute|min|hour|hr)s?", lower)
+    if not m:
+        return None
+    unit = "hour" if "h" in m.group(2) else "minute"
+    return {"duration": int(m.group(1)), "unit": unit}
+
+
+# ── Phone / Calls ──────────────────────────────────────────────────────────────
+
+def _ext_phone_call(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:call|dial|phone|ring)\s+(?:up\s+)?([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?|"
+        r"\+?[\d\s\-().]{7,})",
+        lower,
+    )
+    return {"contact": m.group(1).strip() if m else ""} if m else None
+
+
+def _ext_phone_voicemail(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_phone_recent(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_phone_block(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:block|blacklist)\s+(?:calls?\s+from\s+)?(.+?)$", lower)
+    return {"contact": m.group(1).strip() if m else ""} if m else None
+
+
+def _ext_phone_conference(raw: str, lower: str) -> dict[str, Any] | None:
+    members_m = re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?", raw)
+    return {"participants": members_m}
+
+
+def _ext_phone_record(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+# ── Camera / Photos ────────────────────────────────────────────────────────────
+
+def _ext_camera_photo(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_camera_video(_raw: str, lower: str) -> dict[str, Any] | None:
+    duration_m = re.search(r"(\d+)\s*(?:second|minute|min|sec)s?\s*video", lower)
+    return {"duration": int(duration_m.group(1)) if duration_m else None}
+
+
+def _ext_camera_scan_qr(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_camera_scan_doc(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_camera_ocr(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_photos_search(raw: str, lower: str) -> dict[str, Any] | None:
+    person_m = re.search(r"(?:of|with)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    date_m = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|20\d\d|last\s+\w+|this\s+\w+)\b",
+        lower,
+    )
+    loc_m = re.search(r"(?:in|at|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    return {
+        "person": person_m.group(1) if person_m else None,
+        "date": date_m.group(1) if date_m else None,
+        "location": loc_m.group(1) if loc_m else None,
+        "query": raw.strip(),
+    }
+
+
+def _ext_photos_album(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:album|folder)\s+(?:called|named)?\s*[\"']?(.+?)[\"']?$", lower)
+    return {"name": m.group(1).strip() if m else ""}
+
+
+def _ext_photos_share(raw: str, lower: str) -> dict[str, Any] | None:
+    recipient_m = re.search(r"(?:share|send)\s+(?:it|this|these|.+?)\s+(?:to|with)\s+(.+?)$",
+                            lower)
+    return {"recipient": recipient_m.group(1).strip() if recipient_m else ""}
+
+
+def _ext_photos_edit(_raw: str, lower: str) -> dict[str, Any] | None:
+    for edit_type in ("crop", "rotate", "filter", "brightness", "contrast", "saturation",
+                      "portrait", "black and white", "background"):
+        if edit_type in lower:
+            return {"edit": edit_type}
+    return {"edit": "general"}
+
+
+# ── Smart Home ─────────────────────────────────────────────────────────────────
+
+_ROOM_RE = re.compile(
+    r"\b(bedroom|living\s+room|kitchen|bathroom|garage|office|basement|"
+    r"hallway|dining\s+room|porch|backyard|front\s+yard|all\s+lights?|everywhere)\b"
+)
+
+
+def _ext_smarthome_lights(_raw: str, lower: str) -> dict[str, Any] | None:
+    room_m = _ROOM_RE.search(lower)
+    room = room_m.group(1) if room_m else None
+    pct_m = re.search(r"\b(\d{1,3})\s*(?:percent|%)\b", lower)
+    color_m = re.search(
+        r"\b(red|blue|green|yellow|purple|pink|orange|white|warm|cool|daylight)\b", lower
+    )
+    if re.search(r"\b(?:turn\s+off|switch\s+off|lights?\s+off|off)\b", lower):
+        action = "off"
+    elif re.search(r"\b(?:turn\s+on|switch\s+on|lights?\s+on|on)\b", lower):
+        action = "on"
+    elif re.search(r"\b(?:dim|dimmer|lower|softer)\b", lower):
+        action = "dim"
+    elif color_m or re.search(r"\b(?:color|colour|hue)\b", lower):
+        action = "color"
+    else:
+        action = "on"
+    return {
+        "action": action,
+        "room": room,
+        "level": int(pct_m.group(1)) if pct_m else None,
+        "color": color_m.group(1) if color_m else None,
+    }
+
+
+def _ext_smarthome_thermostat(_raw: str, lower: str) -> dict[str, Any] | None:
+    temp_m = re.search(r"\b(\d{2,3})\s*(?:degrees?|°)?\s*(?:fahrenheit|celsius|f|c)?\b", lower)
+    mode_m = re.search(r"\b(heat|cool|auto|off|fan)\b", lower)
+    action = "set" if temp_m or mode_m else "check"
+    return {
+        "action": action,
+        "temperature": int(temp_m.group(1)) if temp_m else None,
+        "mode": mode_m.group(1) if mode_m else None,
+    }
+
+
+def _ext_smarthome_lock(_raw: str, lower: str) -> dict[str, Any] | None:
+    action = "unlock" if re.search(r"\b(?:unlock|open\s+the\s+door)\b", lower) else "lock"
+    door_m = re.search(r"\b(front|back|garage|side|main)\s+(?:door|gate|lock)\b", lower)
+    return {"action": action, "door": door_m.group(1) if door_m else "front"}
+
+
+def _ext_smarthome_camera(raw: str, lower: str) -> dict[str, Any] | None:
+    loc_m = re.search(r"\b(front\s+door|backyard|garage|porch|driveway|living\s+room|baby)\b",
+                      lower)
+    return {"camera": loc_m.group(1) if loc_m else ""}
+
+
+def _ext_smarthome_appliance(raw: str, lower: str) -> dict[str, Any] | None:
+    appliance_m = re.search(
+        r"\b(dishwasher|washing\s+machine|washer|dryer|oven|microwave|"
+        r"coffee\s+maker|robot\s+vacuum|roomba|tv|fan|air\s+purifier)\b",
+        lower,
+    )
+    action = "off" if re.search(r"\b(?:off|stop|pause|cancel)\b", lower) else "on"
+    return {
+        "appliance": appliance_m.group(1) if appliance_m else "",
+        "action": action,
+    }
+
+
+def _ext_smarthome_scene(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:activate|run|start|set|turn\s+on)\s+(?:the\s+)?[\"']?(.+?)[\"']?"
+        r"\s+(?:scene|mode|routine)?$",
+        lower,
+    )
+    if not m:
+        m = re.search(r"[\"']?(.+?)[\"']?\s+(?:scene|mode|routine)", lower)
+    return {"scene": m.group(1).strip() if m else ""} if m else {}
+
+
+def _ext_smarthome_energy(_raw: str, lower: str) -> dict[str, Any] | None:
+    window_m = re.search(r"\b(today|this\s+week|this\s+month|this\s+year)\b", lower)
+    return {"window": window_m.group(1) if window_m else "today"}
+
+
+# ── Payments ───────────────────────────────────────────────────────────────────
+
+def _ext_payments_send(raw: str, lower: str) -> dict[str, Any] | None:
+    amount = _extract_amount(lower)
+    person_m = re.search(
+        r"(?:send|pay|venmo|zelle)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+"
+        r"(?:\$|£|€|\d)",
+        lower,
+    )
+    if not person_m:
+        person_m = re.search(r"\$[\d.]+\s+(?:to|for)\s+(.+?)$", lower)
+    note_m = re.search(r"(?:for|note:?)\s+(.+?)(?:\s+on\s+|\s+via\s+|$)", lower)
+    return {
+        "recipient": person_m.group(1).strip() if person_m else _extract_person(lower),
+        "amount": amount,
+        "note": note_m.group(1).strip() if note_m else "",
+        "platform": _extract_payment_platform(lower),
+    }
+
+
+def _ext_payments_request(raw: str, lower: str) -> dict[str, Any] | None:
+    amount = _extract_amount(lower)
+    person_m = re.search(
+        r"(?:request|charge|ask)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+"
+        r"(?:for\s+)?\$?[\d]",
+        lower,
+    )
+    note_m = re.search(r"(?:for|because)\s+(.+?)$", lower)
+    return {
+        "recipient": person_m.group(1).strip() if person_m else _extract_person(lower),
+        "amount": amount,
+        "note": note_m.group(1).strip() if note_m else "",
+    }
+
+
+def _ext_payments_split(raw: str, lower: str) -> dict[str, Any] | None:
+    amount = _extract_amount(lower)
+    people_m = re.findall(r"[A-Z][a-z]+", raw)
+    ways_m = re.search(r"(\d+)\s+ways?", lower)
+    return {
+        "amount": amount,
+        "people": people_m,
+        "ways": int(ways_m.group(1)) if ways_m else len(people_m) or 2,
+    }
+
+
+def _ext_payments_history(_raw: str, lower: str) -> dict[str, Any] | None:
+    person_m = re.search(r"(?:with|from|to)\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)?)", lower)
+    window_m = re.search(r"\b(today|this\s+week|this\s+month|last\s+month)\b", lower)
+    return {
+        "contact": person_m.group(1).strip() if person_m else None,
+        "window": window_m.group(1) if window_m else "recent",
+        "platform": _extract_payment_platform(lower),
+    }
+
+
+def _ext_payments_balance(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_payment_platform(lower)}
+
+
+# ── Food Delivery ──────────────────────────────────────────────────────────────
+
+def _extract_delivery_platform(lower: str) -> str | None:
+    for p in ("doordash", "uber eats", "ubereats", "grubhub", "seamless", "instacart",
+              "postmates", "caviar", "gopuff"):
+        if p in lower:
+            return p.replace(" ", "_")
+    return None
+
+
+def _ext_food_delivery_order(raw: str, lower: str) -> dict[str, Any] | None:
+    rest_m = re.search(
+        r"(?:from|at)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?(?:\s+[A-Z][a-z]+)?)", raw
+    )
+    return {
+        "restaurant": rest_m.group(1).strip() if rest_m else "",
+        "platform": _extract_delivery_platform(lower),
+    }
+
+
+def _ext_food_delivery_track(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_delivery_platform(lower)}
+
+
+def _ext_food_delivery_reorder(_raw: str, lower: str) -> dict[str, Any] | None:
+    rest_m = re.search(r"(?:from|at)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", lower)
+    return {
+        "restaurant": rest_m.group(1).strip() if rest_m else "",
+        "platform": _extract_delivery_platform(lower),
+    }
+
+
+def _ext_food_delivery_browse(raw: str, lower: str) -> dict[str, Any] | None:
+    cuisine_m = re.search(
+        r"\b(pizza|sushi|chinese|mexican|indian|thai|italian|burger|"
+        r"mediterranean|japanese|korean|vietnamese|greek|american)\b",
+        lower,
+    )
+    return {
+        "cuisine": cuisine_m.group(1) if cuisine_m else None,
+        "platform": _extract_delivery_platform(lower),
+    }
+
+
+# ── Rideshare ──────────────────────────────────────────────────────────────────
+
+def _extract_rideshare_platform(lower: str) -> str | None:
+    if "lyft" in lower:
+        return "lyft"
+    if "uber" in lower:
+        return "uber"
+    return None
+
+
+def _ext_rideshare_book(raw: str, lower: str) -> dict[str, Any] | None:
+    dest_m = re.search(r"(?:to|for)\s+(.+?)(?:\s+on\s+uber|\s+on\s+lyft|$)", lower)
+    ride_type_m = re.search(r"\b(xl|pool|share|comfort|black|lux|plus|x)\b", lower)
+    return {
+        "destination": dest_m.group(1).strip() if dest_m else "",
+        "type": ride_type_m.group(1) if ride_type_m else "standard",
+        "platform": _extract_rideshare_platform(lower),
+    }
+
+
+def _ext_rideshare_track(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_rideshare_platform(lower)}
+
+
+def _ext_rideshare_schedule(raw: str, lower: str) -> dict[str, Any] | None:
+    dest_m = re.search(r"(?:to|for)\s+(.+?)(?:\s+at\b|$)", lower)
+    return {
+        "destination": dest_m.group(1).strip() if dest_m else "",
+        "time": _extract_time_str(lower),
+        "platform": _extract_rideshare_platform(lower),
+    }
+
+
+def _ext_rideshare_cancel(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_rideshare_platform(lower)}
+
+
+# ── Maps / Navigation extras ───────────────────────────────────────────────────
+
+def _ext_maps_search(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:find|search|show|look\s+up)\s+(?:a\s+|the\s+)?(.+?)$", lower)
+    return {"query": m.group(1).strip() if m else raw.strip()}
+
+
+def _ext_maps_save_place(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:save|bookmark|add)\s+(.+?)\s+(?:to\s+(?:my\s+)?(?:places?|maps?|saved))?$",
+                  lower)
+    return {"place": m.group(1).strip() if m else ""}
+
+
+def _ext_maps_explore(_raw: str, lower: str) -> dict[str, Any] | None:
+    category_m = re.search(
+        r"\b(restaurant|bar|cafe|museum|park|hotel|gym|pharmacy|hospital|"
+        r"atm|gas\s+station|grocery|coffee\s+shop|shopping)\b",
+        lower,
+    )
+    return {
+        "category": category_m.group(1) if category_m else "",
+        "location": _extract_location(_raw, lower) or "__current__",
+    }
+
+
+def _ext_maps_review(raw: str, lower: str) -> dict[str, Any] | None:
+    place_m = re.search(
+        r"(?:review|rate)\s+(?:a\s+|the\s+)?(.+?)(?:\s+\d\s+star|\s+five\s+|\s+one\s+|$)",
+        lower,
+    )
+    rating_m = re.search(r"\b(\d)\s*(?:star|out\s+of\s+5)?\b", lower)
+    return {
+        "place": place_m.group(1).strip() if place_m else "",
+        "rating": int(rating_m.group(1)) if rating_m else None,
+    }
+
+
+def _ext_maps_share_eta(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+# ── Travel ─────────────────────────────────────────────────────────────────────
+
+_AIRPORT_RE = re.compile(r"\b([A-Z]{3})\b")
+_MONTH_NAMES = (
+    "january|february|march|april|may|june|july|august|september|"
+    "october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+)
+
+
+def _ext_travel_flight_search(raw: str, lower: str) -> dict[str, Any] | None:
+    airports = _AIRPORT_RE.findall(raw)
+    origin = airports[0] if airports else None
+    dest = airports[1] if len(airports) > 1 else None
+    if not dest:
+        dest_m = re.search(r"(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+        dest = dest_m.group(1).strip() if dest_m else None
+    date_m = re.search(
+        rf"\b({_MONTH_NAMES})\s+(\d{{1,2}})\b", lower
+    )
+    cabin_m = re.search(r"\b(economy|business|first\s+class|premium)\b", lower)
+    return {
+        "origin": origin,
+        "destination": dest,
+        "date": f"{date_m.group(1)} {date_m.group(2)}" if date_m else None,
+        "cabin": cabin_m.group(1) if cabin_m else "economy",
+    }
+
+
+def _ext_travel_flight_status(raw: str, lower: str) -> dict[str, Any] | None:
+    flight_m = re.search(r"\b([A-Z]{2,3})\s*(\d{1,4})\b", raw)
+    return {
+        "flight": f"{flight_m.group(1)}{flight_m.group(2)}" if flight_m else None,
+        "airline": flight_m.group(1) if flight_m else None,
+    }
+
+
+def _ext_travel_boarding_pass(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_travel_hotel_search(raw: str, lower: str) -> dict[str, Any] | None:
+    city_m = re.search(r"(?:in|at|near)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    date_m = re.search(rf"\b({_MONTH_NAMES})\s+(\d{{1,2}})\b", lower)
+    guests_m = re.search(r"(\d+)\s+(?:guest|person|people|adult)", lower)
+    stars_m = re.search(r"(\d)\s*star", lower)
+    return {
+        "city": city_m.group(1).strip() if city_m else None,
+        "checkin": f"{date_m.group(1)} {date_m.group(2)}" if date_m else None,
+        "guests": int(guests_m.group(1)) if guests_m else 1,
+        "stars": int(stars_m.group(1)) if stars_m else None,
+    }
+
+
+def _ext_travel_hotel_book(raw: str, lower: str) -> dict[str, Any] | None:
+    hotel_m = re.search(r"(?:book|reserve)\s+(?:a\s+(?:room\s+at|night\s+at)\s+)?(.+?)(?:\s+for|\s+in|$)",
+                        lower)
+    return {"hotel": hotel_m.group(1).strip() if hotel_m else ""}
+
+
+def _ext_travel_checkin(raw: str, lower: str) -> dict[str, Any] | None:
+    airline_m = re.search(
+        r"\b(united|delta|american|southwest|jetblue|alaska|spirit|frontier|"
+        r"lufthansa|ba|british airways|air france|emirates)\b",
+        lower,
+    )
+    flight_m = re.search(r"\b([A-Z]{2,3})\s*(\d{1,4})\b", raw)
+    return {
+        "airline": airline_m.group(1) if airline_m else None,
+        "flight": f"{flight_m.group(1)}{flight_m.group(2)}" if flight_m else None,
+    }
+
+
+def _ext_travel_itinerary(raw: str, lower: str) -> dict[str, Any] | None:
+    trip_m = re.search(r"(?:for|to|trip\s+to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    return {"trip": trip_m.group(1).strip() if trip_m else ""}
+
+
+def _ext_travel_car_rental(raw: str, lower: str) -> dict[str, Any] | None:
+    city_m = re.search(r"(?:in|at|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    type_m = re.search(r"\b(economy|compact|midsize|suv|luxury|truck|van|convertible)\b", lower)
+    return {
+        "location": city_m.group(1).strip() if city_m else None,
+        "type": type_m.group(1) if type_m else None,
+    }
+
+
+def _ext_travel_alert(raw: str, lower: str) -> dict[str, Any] | None:
+    dest_m = re.search(r"(?:for|to|in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    return {"destination": dest_m.group(1).strip() if dest_m else ""}
+
+
+# ── Video Streaming ────────────────────────────────────────────────────────────
+
+def _ext_video_play(raw: str, lower: str) -> dict[str, Any] | None:
+    platform = _extract_streaming_platform(lower)
+    type_m = re.search(r"\b(movie|film|episode|show|series|documentary|season)\b", lower)
+    title_m = re.search(
+        r"(?:watch|play|put\s+on|stream)\s+[\"']?(.+?)[\"']?"
+        r"(?:\s+on\s+\w+|\s+episode|\s+season|$)",
+        lower,
+    )
+    return {
+        "title": title_m.group(1).strip() if title_m else raw.strip(),
+        "type": type_m.group(1) if type_m else None,
+        "platform": platform,
+    }
+
+
+def _ext_video_search(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:find|search|look\s+for|browse)\s+[\"']?(.+?)[\"']?(?:\s+on\s+\w+)?$",
+                  lower)
+    return {
+        "query": m.group(1).strip() if m else raw.strip(),
+        "platform": _extract_streaming_platform(lower),
+    }
+
+
+def _ext_video_watchlist(raw: str, lower: str) -> dict[str, Any] | None:
+    action = "view" if re.search(r"\b(?:show|view|open|my)\b", lower) else "add"
+    title_m = re.search(r"(?:add|save)\s+[\"']?(.+?)[\"']?\s+to\b", lower)
+    return {
+        "action": action,
+        "title": title_m.group(1).strip() if title_m else "",
+        "platform": _extract_streaming_platform(lower),
+    }
+
+
+def _ext_video_browse(_raw: str, lower: str) -> dict[str, Any] | None:
+    genre_m = re.search(
+        r"\b(action|comedy|drama|horror|thriller|sci.?fi|romance|animation|"
+        r"documentary|crime|fantasy|mystery|adventure)\b",
+        lower,
+    )
+    return {
+        "genre": genre_m.group(1) if genre_m else None,
+        "platform": _extract_streaming_platform(lower),
+    }
+
+
+def _ext_video_recommend(_raw: str, lower: str) -> dict[str, Any] | None:
+    mood_m = re.search(
+        r"\b(funny|scary|sad|inspiring|relaxing|thrilling|romantic|educational)\b", lower
+    )
+    return {
+        "mood": mood_m.group(1) if mood_m else None,
+        "platform": _extract_streaming_platform(lower),
+    }
+
+
+def _ext_video_cast(_raw: str, lower: str) -> dict[str, Any] | None:
+    device_m = re.search(
+        r"(?:to|on)\s+(?:the\s+)?(?:my\s+)?(.+?)\s*(?:tv|chromecast|fire\s+stick|apple\s+tv|roku)?$",
+        lower,
+    )
+    return {"device": device_m.group(1).strip() if device_m else "tv"}
+
+
+def _ext_video_continue(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_streaming_platform(lower)}
+
+
+def _ext_video_rate(raw: str, lower: str) -> dict[str, Any] | None:
+    rating_m = re.search(r"\b(\d)\s*(?:star|out\s+of\s+5)?\b", lower)
+    thumbs = "up" if re.search(r"\bthumb\s*s?\s*up|good|great|loved?\b", lower) else None
+    if re.search(r"\bthumb\s*s?\s*down|bad|hated?\b", lower):
+        thumbs = "down"
+    return {"rating": int(rating_m.group(1)) if rating_m else None, "thumbs": thumbs}
+
+
+# ── Health / Fitness ───────────────────────────────────────────────────────────
+
+_WORKOUT_TYPES = (
+    r"running|run|jog|walk|hike|cycling|bike|swim|yoga|pilates|crossfit|"
+    r"weightlifting|weights|gym|basketball|tennis|soccer|football|golf|"
+    r"rowing|jump\s+rope|hiit|cardio|strength|stretching|meditation"
+)
+
+
+def _ext_health_workout_log(raw: str, lower: str) -> dict[str, Any] | None:
+    type_m = re.search(_WORKOUT_TYPES, lower)
+    duration_m = re.search(r"(\d+)\s*(?:minute|min|hour|hr)s?", lower)
+    distance_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mile|km|meter)s?", lower)
+    cal_m = re.search(r"(\d+)\s*(?:calorie|cal)s?", lower)
+    return {
+        "type": type_m.group(0) if type_m else "",
+        "duration_min": int(duration_m.group(1)) if duration_m else None,
+        "distance": float(distance_m.group(1)) if distance_m else None,
+        "calories": int(cal_m.group(1)) if cal_m else None,
+    }
+
+
+def _ext_health_workout_start(_raw: str, lower: str) -> dict[str, Any] | None:
+    type_m = re.search(_WORKOUT_TYPES, lower)
+    return {"type": type_m.group(0) if type_m else "general"}
+
+
+def _ext_health_steps(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_health_heart_rate(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_health_sleep(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_health_food_log(raw: str, lower: str) -> dict[str, Any] | None:
+    cal_m = re.search(r"(\d+)\s*(?:calorie|cal)s?", lower)
+    meal_m = re.search(r"\b(breakfast|lunch|dinner|snack)\b", lower)
+    food_m = re.search(
+        r"(?:ate|had|log(?:ged)?|record(?:ed)?)\s+(?:a\s+|some\s+|my\s+)?(.+?)(?:\s+for\s+|\s*$)",
+        lower,
+    )
+    return {
+        "food": food_m.group(1).strip() if food_m else raw.strip(),
+        "calories": int(cal_m.group(1)) if cal_m else None,
+        "meal": meal_m.group(1) if meal_m else None,
+    }
+
+
+def _ext_health_water(_raw: str, lower: str) -> dict[str, Any] | None:
+    oz_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:oz|ounce)s?", lower)
+    ml_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:ml|milliliter)s?", lower)
+    cup_m = re.search(r"(\d+(?:\.\d+)?)\s*cup?s?", lower)
+    if oz_m:
+        return {"amount": float(oz_m.group(1)), "unit": "oz"}
+    if ml_m:
+        return {"amount": float(ml_m.group(1)), "unit": "ml"}
+    if cup_m:
+        return {"amount": float(cup_m.group(1)), "unit": "cup"}
+    return {"amount": None, "unit": None}
+
+
+def _ext_health_weight(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:pounds?|lbs?|kg|kilograms?)", lower)
+    unit = "lbs" if m and re.search(r"pound|lb", m.group(0)) else "kg"
+    return {"weight": float(m.group(1)) if m else None, "unit": unit}
+
+
+def _ext_health_medication(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:take|took|log|remind\s+me\s+to\s+take|medication|medicine|pill|supplement)\s+"
+        r"(?:my\s+)?(.+?)(?:\s+at\b|$)",
+        lower,
+    )
+    return {
+        "medication": m.group(1).strip() if m else "",
+        "time": _extract_time_str(lower),
+    }
+
+
+def _ext_health_mood(_raw: str, lower: str) -> dict[str, Any] | None:
+    for mood in ("great", "good", "okay", "ok", "bad", "terrible", "anxious",
+                 "happy", "sad", "stressed", "calm", "tired", "energetic"):
+        if mood in lower:
+            return {"mood": mood}
+    score_m = re.search(r"\b([1-9]|10)\s*(?:out\s+of\s+10|/10)?\b", lower)
+    return {"mood": None, "score": int(score_m.group(1)) if score_m else None}
+
+
+# ── Files / Storage ────────────────────────────────────────────────────────────
+
+def _ext_files_upload(raw: str, lower: str) -> dict[str, Any] | None:
+    file_m = re.search(r"upload\s+(.+?)(?:\s+to\b|$)", lower)
+    dest_m = re.search(r"(?:to|into)\s+(.+?)(?:\s+folder)?$", lower)
+    return {
+        "file": file_m.group(1).strip() if file_m else "",
+        "destination": dest_m.group(1).strip() if dest_m else "",
+    }
+
+
+def _ext_files_download(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"download\s+(.+?)(?:\s+from\b|$)", lower)
+    return {"file": m.group(1).strip() if m else ""}
+
+
+def _ext_files_share_file(raw: str, lower: str) -> dict[str, Any] | None:
+    file_m = re.search(r"(?:share|send)\s+(.+?)\s+(?:with|to)\b", lower)
+    person_m = re.search(r"(?:with|to)\s+(.+?)$", lower)
+    return {
+        "file": file_m.group(1).strip() if file_m else "",
+        "recipient": person_m.group(1).strip() if person_m else "",
+    }
+
+
+def _ext_files_search(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:find|search|look\s+for)\s+(?:a\s+)?(?:file\s+)?(.+?)(?:\s+file)?$",
+                  lower)
+    return {"query": m.group(1).strip() if m else raw.strip()}
+
+
+def _ext_files_recent(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+# ── Alarm / Clock ──────────────────────────────────────────────────────────────
+
+def _ext_alarm_set(raw: str, lower: str) -> dict[str, Any] | None:
+    time_str = _extract_time_str(lower)
+    if not time_str:
+        return None
+    label_m = re.search(r"(?:called|labeled?|named?|for)\s+(.+?)(?:\s+at\b|$)", lower)
+    days_m = re.findall(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"weekday|weekend|daily|every\s+day)\b",
+        lower,
+    )
+    return {
+        "time": time_str,
+        "label": label_m.group(1).strip() if label_m else "",
+        "days": days_m,
+    }
+
+
+def _ext_alarm_delete(raw: str, lower: str) -> dict[str, Any] | None:
+    time_str = _extract_time_str(lower)
+    label_m = re.search(r"(?:the\s+|my\s+)?(.+?)\s+alarm$", lower)
+    return {
+        "time": time_str,
+        "label": label_m.group(1).strip() if label_m else "",
+    }
+
+
+def _ext_alarm_list(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_clock_world(_raw: str, lower: str) -> dict[str, Any] | None:
+    city_m = re.search(
+        r"(?:in|at|for)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)", lower
+    )
+    tz_m = re.search(r"\b(est|cst|mst|pst|gmt|utc|et|ct|mt|pt)\b", lower)
+    return {
+        "city": city_m.group(1).strip() if city_m else None,
+        "timezone": tz_m.group(1) if tz_m else None,
+    }
+
+
+def _ext_clock_stopwatch(_raw: str, lower: str) -> dict[str, Any] | None:
+    action = "stop" if re.search(r"\b(?:stop|pause|end)\b", lower) else "start"
+    lap = bool(re.search(r"\blap\b", lower))
+    return {"action": action, "lap": lap}
+
+
+def _ext_clock_bedtime(_raw: str, lower: str) -> dict[str, Any] | None:
+    time_str = _extract_time_str(lower)
+    return {"bedtime": time_str}
+
+
+# ── Podcasts ───────────────────────────────────────────────────────────────────
+
+def _ext_podcast_find(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:find|search|discover)\s+(?:a\s+|the\s+)?(?:podcast\s+)?(.+?)$", lower)
+    topic_m = re.search(r"(?:about|on)\s+(.+?)$", lower)
+    return {
+        "query": m.group(1).strip() if m else raw.strip(),
+        "topic": topic_m.group(1).strip() if topic_m else None,
+    }
+
+
+def _ext_podcast_play(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"(?:play|listen\s+to|put\s+on)\s+(?:the\s+)?(?:latest\s+)?(?:episode\s+of\s+)?(.+?)$",
+        lower,
+    )
+    latest = bool(re.search(r"\b(?:latest|newest|recent)\b", lower))
+    return {
+        "podcast": m.group(1).strip() if m else "",
+        "latest": latest,
+    }
+
+
+def _ext_podcast_subscribe(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:subscribe|follow)\s+(?:to\s+)?(.+?)(?:\s+podcast)?$", lower)
+    return {"podcast": m.group(1).strip() if m else ""}
+
+
+def _ext_podcast_queue(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:add|queue)\s+(.+?)\s+to\b", lower)
+    return {"episode": m.group(1).strip() if m else ""}
+
+
+# ── Recipes / Food ─────────────────────────────────────────────────────────────
+
+def _ext_recipe_find(raw: str, lower: str) -> dict[str, Any] | None:
+    dish_m = re.search(
+        r"(?:recipe\s+for|how\s+(?:to\s+)?(?:make|cook)|cook(?:ing)?)\s+(.+?)$", lower
+    )
+    cuisine_m = re.search(
+        r"\b(italian|mexican|thai|indian|chinese|japanese|french|greek|"
+        r"mediterranean|american|vegan|vegetarian|keto|paleo)\b",
+        lower,
+    )
+    ingredient_m = re.search(r"(?:with|using|made\s+with)\s+(.+?)(?:\s+recipe)?$", lower)
+    return {
+        "dish": dish_m.group(1).strip() if dish_m else raw.strip(),
+        "cuisine": cuisine_m.group(1) if cuisine_m else None,
+        "ingredients": ingredient_m.group(1).strip() if ingredient_m else None,
+    }
+
+
+def _ext_recipe_save(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"save\s+(?:this\s+)?(?:recipe\s+for\s+|the\s+)?(.+?)(?:\s+recipe)?$", lower)
+    return {"recipe": m.group(1).strip() if m else ""}
+
+
+def _ext_recipe_nutrition(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:nutrition|calories|macros?)\s+(?:in|for|of)\s+(.+?)$", lower)
+    if not m:
+        m = re.search(r"(?:how\s+(?:many|much)\s+calories?\s+(?:in|does)\s+)(.+?)(?:\s+have)?$",
+                      lower)
+    return {"food": m.group(1).strip() if m else raw.strip()}
+
+
+def _ext_recipe_scale(raw: str, lower: str) -> dict[str, Any] | None:
+    servings_m = re.search(r"(\d+)\s+(?:serving|portion|people|person)s?", lower)
+    return {"servings": int(servings_m.group(1)) if servings_m else None}
+
+
+def _ext_grocery_add(raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"add\s+(.+?)\s+(?:to\s+(?:(?:my|the)\s+)?(?:grocery|shopping)\s+list)?$",
+                  lower)
+    items_raw = m.group(1).strip() if m else raw.strip()
+    # try to split comma/and separated items
+    items = [i.strip() for i in re.split(r",\s*|\s+and\s+", items_raw) if i.strip()]
+    return {"items": items}
+
+
+def _ext_grocery_list(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_grocery_order(_raw: str, lower: str) -> dict[str, Any] | None:
+    return {"platform": _extract_delivery_platform(lower)}
+
+
+# ── Translation ────────────────────────────────────────────────────────────────
+
+_LANG_RE = re.compile(
+    r"\b(spanish|french|german|italian|portuguese|russian|chinese|mandarin|"
+    r"japanese|korean|arabic|hindi|dutch|polish|turkish|swedish|greek|hebrew|"
+    r"vietnamese|thai|indonesian|english)\b",
+    re.IGNORECASE,
+)
+
+
+def _ext_translate_text(raw: str, lower: str) -> dict[str, Any] | None:
+    langs = _LANG_RE.findall(lower)
+    source = langs[0].lower() if langs else None
+    target = langs[1].lower() if len(langs) > 1 else (langs[0].lower() if langs else None)
+    text_m = re.search(r"(?:translate|say)\s+[\"'](.+?)[\"']", raw)
+    if not text_m:
+        text_m = re.search(
+            r"(?:translate|convert|say)\s+(.+?)\s+(?:to\s+\w+|in\s+\w+)?$", lower
+        )
+    return {
+        "text": text_m.group(1).strip() if text_m else "",
+        "source": source,
+        "target": target,
+    }
+
+
+def _ext_translate_detect(raw: str, _lower: str) -> dict[str, Any] | None:
+    text_m = re.search(r"(?:what\s+language\s+is|detect\s+the\s+language\s+of)\s+[\"']?(.+?)[\"']?$",
+                       raw, re.IGNORECASE)
+    return {"text": text_m.group(1).strip() if text_m else ""}
+
+
+def _ext_translate_conversation(_raw: str, lower: str) -> dict[str, Any] | None:
+    langs = _LANG_RE.findall(lower)
+    return {
+        "lang1": langs[0].lower() if langs else "english",
+        "lang2": langs[1].lower() if len(langs) > 1 else None,
+    }
+
+
+# ── Books / Reading ────────────────────────────────────────────────────────────
+
+def _ext_book_find(raw: str, lower: str) -> dict[str, Any] | None:
+    author_m = re.search(r"(?:by|from\s+author)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", raw)
+    genre_m = re.search(
+        r"\b(mystery|thriller|romance|fantasy|sci.?fi|biography|history|"
+        r"self.?help|non.?fiction|fiction|horror|business|memoir)\b",
+        lower,
+    )
+    title_m = re.search(r"(?:find|read|get|buy)\s+[\"']?(.+?)[\"']?(?:\s+by|\s+book|$)", lower)
+    return {
+        "title": title_m.group(1).strip() if title_m else "",
+        "author": author_m.group(1) if author_m else None,
+        "genre": genre_m.group(1) if genre_m else None,
+    }
+
+
+def _ext_book_read(raw: str, lower: str) -> dict[str, Any] | None:
+    title_m = re.search(
+        r"(?:read|open|continue|start)\s+[\"']?(.+?)[\"']?(?:\s+book)?$", lower
+    )
+    audio = bool(re.search(r"\b(?:audiobook|audio|listen)\b", lower))
+    return {
+        "title": title_m.group(1).strip() if title_m else "",
+        "audio": audio,
+    }
+
+
+def _ext_book_library(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_book_highlight(raw: str, _lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:highlight|mark)\s+[\"']?(.+?)[\"']?$", raw, re.IGNORECASE)
+    return {"text": m.group(1).strip() if m else ""}
+
+
+# ── Device / Settings ──────────────────────────────────────────────────────────
+
+def _ext_settings_wifi(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:connect|join)\b", lower):
+        net_m = re.search(r"(?:connect\s+to|join)\s+[\"']?(.+?)[\"']?(?:\s+wifi|network)?$",
+                          lower)
+        return {"action": "connect", "network": net_m.group(1).strip() if net_m else ""}
+    if re.search(r"\b(?:turn\s+off|disable|off)\b", lower):
+        return {"action": "off"}
+    if re.search(r"\b(?:turn\s+on|enable|on)\b", lower):
+        return {"action": "on"}
+    return {"action": "settings"}
+
+
+def _ext_settings_bluetooth(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:pair|connect)\b", lower):
+        device_m = re.search(r"(?:pair|connect)\s+(?:to\s+|with\s+)?(.+?)$", lower)
+        return {"action": "pair", "device": device_m.group(1).strip() if device_m else ""}
+    if re.search(r"\b(?:turn\s+off|disable|off)\b", lower):
+        return {"action": "off"}
+    if re.search(r"\b(?:turn\s+on|enable|on)\b", lower):
+        return {"action": "on"}
+    return {"action": "settings"}
+
+
+def _ext_settings_brightness(_raw: str, lower: str) -> dict[str, Any] | None:
+    pct_m = re.search(r"\b(\d{1,3})\s*(?:percent|%)?\b", lower)
+    if re.search(r"\b(?:up|increase|brighter|max|full)\b", lower):
+        return {"action": "up", "level": None}
+    if re.search(r"\b(?:down|decrease|dimmer|lower|min)\b", lower):
+        return {"action": "down", "level": None}
+    return {"action": "set", "level": int(pct_m.group(1)) if pct_m else None}
+
+
+def _ext_settings_dnd(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:off|disable|turn\s+off)\b", lower):
+        action = "off"
+    elif re.search(r"\b(?:on|enable|turn\s+on)\b", lower):
+        action = "on"
+    else:
+        action = "toggle"
+    duration_m = re.search(r"(?:for\s+)?(\d+)\s*(?:hour|minute|min|hr)s?", lower)
+    return {
+        "action": action,
+        "duration": int(duration_m.group(1)) if duration_m else None,
+    }
+
+
+def _ext_settings_airplane(_raw: str, lower: str) -> dict[str, Any] | None:
+    if re.search(r"\b(?:off|disable|turn\s+off)\b", lower):
+        return {"action": "off"}
+    return {"action": "on"}
+
+
+def _ext_settings_battery(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_settings_storage(_raw: str, _lower: str) -> dict[str, Any] | None:
+    return {}
+
+
+def _ext_settings_notification(raw: str, lower: str) -> dict[str, Any] | None:
+    app_m = re.search(
+        r"(?:notifications?\s+for|from)\s+(.+?)(?:\s+notifications?|$)", lower
+    )
+    action = "off" if re.search(r"\b(?:off|disable|mute|silence|stop)\b", lower) else "on"
+    return {
+        "app": app_m.group(1).strip() if app_m else "",
+        "action": action,
+    }
+
+
 # ─── Extractor registry ───────────────────────────────────────────────────────
 
 _EXTRACTORS: dict[str, ExtractorFn] = {
@@ -2292,6 +3528,135 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "calendar_invite":          _ext_calendar_invite,
     "calendar_availability":    _ext_calendar_availability,
     "calendar_recurring":       _ext_calendar_recurring,
+    # Wave-3 extractors
+    "messaging_send":           _ext_messaging_send,
+    "messaging_read":           _ext_messaging_read,
+    "messaging_reply":          _ext_messaging_reply,
+    "messaging_delete":         _ext_messaging_delete,
+    "messaging_search":         _ext_messaging_search,
+    "messaging_group_create":   _ext_messaging_group_create,
+    "messaging_group_add":      _ext_messaging_group_add,
+    "messaging_react":          _ext_messaging_react_msg,
+    "messaging_forward":        _ext_messaging_forward,
+    "messaging_block":          _ext_messaging_block,
+    "messaging_schedule":       _ext_messaging_schedule,
+    "music_play":               _ext_music_play,
+    "music_pause":              _ext_music_pause,
+    "music_skip":               _ext_music_skip,
+    "music_volume":             _ext_music_volume,
+    "music_like":               _ext_music_like,
+    "music_playlist_add":       _ext_music_playlist_add,
+    "music_playlist_create":    _ext_music_playlist_create,
+    "music_queue":              _ext_music_queue,
+    "music_lyrics":             _ext_music_lyrics,
+    "music_radio":              _ext_music_radio,
+    "music_discover":           _ext_music_discover,
+    "music_cast":               _ext_music_cast,
+    "music_sleep_timer":        _ext_music_sleep_timer,
+    "phone_call":               _ext_phone_call,
+    "phone_voicemail":          _ext_phone_voicemail,
+    "phone_recent":             _ext_phone_recent,
+    "phone_block":              _ext_phone_block,
+    "phone_conference":         _ext_phone_conference,
+    "phone_record":             _ext_phone_record,
+    "camera_photo":             _ext_camera_photo,
+    "camera_video":             _ext_camera_video,
+    "camera_scan_qr":           _ext_camera_scan_qr,
+    "camera_scan_doc":          _ext_camera_scan_doc,
+    "camera_ocr":               _ext_camera_ocr,
+    "photos_search":            _ext_photos_search,
+    "photos_album":             _ext_photos_album,
+    "photos_share":             _ext_photos_share,
+    "photos_edit":              _ext_photos_edit,
+    "smarthome_lights":         _ext_smarthome_lights,
+    "smarthome_thermostat":     _ext_smarthome_thermostat,
+    "smarthome_lock":           _ext_smarthome_lock,
+    "smarthome_camera":         _ext_smarthome_camera,
+    "smarthome_appliance":      _ext_smarthome_appliance,
+    "smarthome_scene":          _ext_smarthome_scene,
+    "smarthome_energy":         _ext_smarthome_energy,
+    "payments_send":            _ext_payments_send,
+    "payments_request":         _ext_payments_request,
+    "payments_split":           _ext_payments_split,
+    "payments_history":         _ext_payments_history,
+    "payments_balance":         _ext_payments_balance,
+    "food_delivery_order":      _ext_food_delivery_order,
+    "food_delivery_track":      _ext_food_delivery_track,
+    "food_delivery_reorder":    _ext_food_delivery_reorder,
+    "food_delivery_browse":     _ext_food_delivery_browse,
+    "rideshare_book":           _ext_rideshare_book,
+    "rideshare_track":          _ext_rideshare_track,
+    "rideshare_schedule":       _ext_rideshare_schedule,
+    "rideshare_cancel":         _ext_rideshare_cancel,
+    "maps_search":              _ext_maps_search,
+    "maps_save_place":          _ext_maps_save_place,
+    "maps_explore":             _ext_maps_explore,
+    "maps_review":              _ext_maps_review,
+    "maps_share_eta":           _ext_maps_share_eta,
+    "travel_flight_search":     _ext_travel_flight_search,
+    "travel_flight_status":     _ext_travel_flight_status,
+    "travel_boarding_pass":     _ext_travel_boarding_pass,
+    "travel_hotel_search":      _ext_travel_hotel_search,
+    "travel_hotel_book":        _ext_travel_hotel_book,
+    "travel_checkin":           _ext_travel_checkin,
+    "travel_itinerary":         _ext_travel_itinerary,
+    "travel_car_rental":        _ext_travel_car_rental,
+    "travel_alert":             _ext_travel_alert,
+    "video_play":               _ext_video_play,
+    "video_search":             _ext_video_search,
+    "video_watchlist":          _ext_video_watchlist,
+    "video_browse":             _ext_video_browse,
+    "video_recommend":          _ext_video_recommend,
+    "video_cast":               _ext_video_cast,
+    "video_continue":           _ext_video_continue,
+    "video_rate":               _ext_video_rate,
+    "health_workout_log":       _ext_health_workout_log,
+    "health_workout_start":     _ext_health_workout_start,
+    "health_steps":             _ext_health_steps,
+    "health_heart_rate":        _ext_health_heart_rate,
+    "health_sleep":             _ext_health_sleep,
+    "health_food_log":          _ext_health_food_log,
+    "health_water":             _ext_health_water,
+    "health_weight":            _ext_health_weight,
+    "health_medication":        _ext_health_medication,
+    "health_mood":              _ext_health_mood,
+    "files_upload":             _ext_files_upload,
+    "files_download":           _ext_files_download,
+    "files_share":              _ext_files_share_file,
+    "files_search":             _ext_files_search,
+    "files_recent":             _ext_files_recent,
+    "alarm_set":                _ext_alarm_set,
+    "alarm_delete":             _ext_alarm_delete,
+    "alarm_list":               _ext_alarm_list,
+    "clock_world":              _ext_clock_world,
+    "clock_stopwatch":          _ext_clock_stopwatch,
+    "clock_bedtime":            _ext_clock_bedtime,
+    "podcast_find":             _ext_podcast_find,
+    "podcast_play":             _ext_podcast_play,
+    "podcast_subscribe":        _ext_podcast_subscribe,
+    "podcast_queue":            _ext_podcast_queue,
+    "recipe_find":              _ext_recipe_find,
+    "recipe_save":              _ext_recipe_save,
+    "recipe_nutrition":         _ext_recipe_nutrition,
+    "recipe_scale":             _ext_recipe_scale,
+    "grocery_add":              _ext_grocery_add,
+    "grocery_list":             _ext_grocery_list,
+    "grocery_order":            _ext_grocery_order,
+    "translate_text":           _ext_translate_text,
+    "translate_detect":         _ext_translate_detect,
+    "translate_conversation":   _ext_translate_conversation,
+    "book_find":                _ext_book_find,
+    "book_read":                _ext_book_read,
+    "book_library":             _ext_book_library,
+    "book_highlight":           _ext_book_highlight,
+    "settings_wifi":            _ext_settings_wifi,
+    "settings_bluetooth":       _ext_settings_bluetooth,
+    "settings_brightness":      _ext_settings_brightness,
+    "settings_dnd":             _ext_settings_dnd,
+    "settings_airplane":        _ext_settings_airplane,
+    "settings_battery":         _ext_settings_battery,
+    "settings_storage":         _ext_settings_storage,
+    "settings_notification":    _ext_settings_notification,
 }
 
 
@@ -2356,7 +3721,9 @@ TAXONOMY: dict[str, Intent] = {
                   "phone number", "number for", "email for", "contact",
                   "remind me to", "remember to", "don't forget to", "dont forget to",
                   "need to", "have to", "gotta", "i should", "i must",
-                  "log expense", "expense", "spent", "paid"],
+                  "log expense", "expense", "spent", "paid",
+                  "order food", "food delivery", "deliver food", "doordash",
+                  "uber eats", "grubhub", "from restaurant", "pizza delivery"],
         extractor="shopping",
         examples=["show me Nike running shoes size 10", "I want to buy a laptop",
                   "find me a black hoodie", "order some AirPods"],
@@ -2782,7 +4149,8 @@ TAXONOMY: dict[str, Intent] = {
                  "when are the", "play next", "next match"],
         blockers=["my tasks", "my notes", "my expenses",
                   "meeting", "appointment", "dentist", "calendar event",
-                  "add to calendar", "block time", "block off"],
+                  "add to calendar", "block time", "block off",
+                  "uber", "lyft", "ride", "rideshare", "delivery", "doordash"],
         extractor="sports",
         examples=["when do the Bears play next", "show me the Cubs schedule",
                   "when is the next Bulls game", "upcoming Bears games"],
@@ -2813,7 +4181,9 @@ TAXONOMY: dict[str, Intent] = {
         signals=["follow", "track", "add to my teams", "save team", "subscribe to",
                  "add the", "follow the", "i like the", "my team"],
         patterns=[r"follow\s+(?:the\s+)?\w+", r"add\s+(?:the\s+)?\w+\s+to\s+my\s+teams?"],
-        blockers=["unfollow", "stop following", "remove"],
+        blockers=["unfollow", "stop following", "remove",
+                  "podcast", "my order", "delivery order", "doordash order",
+                  "uber eats", "grubhub", "track my package", "track package"],
         extractor="sports",
         examples=["follow the Bears", "add the Cubs to my teams", "track the Bulls",
                   "I like the Bears"],
@@ -2933,7 +4303,9 @@ TAXONOMY: dict[str, Intent] = {
                  "look for my", "locate my"],
         patterns=[r"\b(?:open|find|pull\s+up|bring\s+up|locate)\s+(?:my\s+)?[\"']?[\w\s]{2,}[\"']?"],
         blockers=["search the web", "google", "search online", "find a store",
-                  "terminal", "command line", "shell", "a terminal"],
+                  "terminal", "command line", "shell", "a terminal",
+                  "hotel", "hotels", "flight", "flights", "podcast", "recipe",
+                  "restaurant", "book by", "novel", "book about"],
         extractor="content",
         examples=["open Q4 Report", "find my budget spreadsheet",
                   "pull up the project proposal"],
@@ -3516,7 +4888,8 @@ TAXONOMY: dict[str, Intent] = {
         description="Transfer money between accounts or to a person",
         signals=["transfer", "send money", "move money", "wire", "zelle",
                  "venmo", "pay someone", "send to"],
-        blockers=["pay bill", "pay my bill", "pay the bill", "subscription"],
+        blockers=["pay bill", "pay my bill", "pay the bill", "subscription",
+                  "venmo", "paypal", "cash app", "cashapp", "peer-to-peer"],
         extractor="banking_transfer",
         examples=["transfer $200 to savings", "send $50 to Sarah via Zelle",
                   "move $500 from checking to savings"],
@@ -3931,7 +5304,9 @@ TAXONOMY: dict[str, Intent] = {
         description="Get personalized product recommendations",
         signals=["recommend", "suggestions", "what should i buy", "gift ideas",
                  "best products", "top picks", "what's popular"],
-        blockers=["movie recommendation", "book recommendation", "music recommendation"],
+        blockers=["movie recommendation", "book recommendation", "music recommendation",
+                  "novel", "book to read", "what should i read", "podcast recommendation",
+                  "recommend a book", "recommend a movie", "recommend a show"],
         extractor="shopping_recommendations",
         examples=["recommend a good laptop bag", "gift ideas for my dad",
                   "what are the best wireless earbuds"],
@@ -4498,6 +5873,1865 @@ TAXONOMY: dict[str, Intent] = {
                   "remind me about this email on Monday",
                   "snooze for next week"],
         slots={"action": "snooze", "date": "date to resurface"},
+    ),
+
+    # ── Messaging ─────────────────────────────────────────────────────────
+
+    "messaging.send": Intent(
+        id="messaging.send",
+        op="messaging_send",
+        domain="messaging",
+        description="Send a text or chat message to someone",
+        signals=["text", "message", "send a message", "shoot a text", "msg",
+                 "send a text", "iMessage", "whatsapp", "dm"],
+        blockers=["email", "voice message", "voicemail"],
+        patterns=[r"\b(?:text|message)\s+[A-Z][a-z]+"],
+        extractor="messaging_send",
+        examples=["text Mom I'll be late", "send a message to John saying hey",
+                  "WhatsApp Sarah that I'm on my way"],
+        slots={"recipient": "person name", "body": "message text",
+               "platform": "messaging platform"},
+    ),
+
+    "messaging.read": Intent(
+        id="messaging.read",
+        op="messaging_read",
+        domain="messaging",
+        description="Read messages from a contact or inbox",
+        signals=["read my texts", "my messages", "check messages", "show messages",
+                 "read messages from", "unread messages", "my inbox",
+                 "texts from", "messages from"],
+        blockers=["email inbox", "read my email"],
+        extractor="messaging_read",
+        examples=["show messages from Sarah", "read my unread texts",
+                  "check my WhatsApp messages"],
+        slots={"contact": "sender name", "platform": "messaging platform"},
+    ),
+
+    "messaging.reply": Intent(
+        id="messaging.reply",
+        op="messaging_reply",
+        domain="messaging",
+        description="Reply to a message",
+        signals=["reply to", "respond to the message", "write back", "reply saying",
+                 "text back", "message back"],
+        extractor="messaging_reply",
+        examples=["reply to Sarah's text saying I'll be there at 7",
+                  "respond to John's message with OK",
+                  "text back saying on my way"],
+        slots={"body": "reply text", "platform": "messaging platform"},
+    ),
+
+    "messaging.delete": Intent(
+        id="messaging.delete",
+        op="messaging_delete",
+        domain="messaging",
+        description="Delete a conversation or message",
+        signals=["delete conversation", "delete messages", "clear chat",
+                 "remove the conversation", "delete the thread"],
+        extractor="messaging_delete",
+        examples=["delete my conversation with John",
+                  "clear the chat with Sarah",
+                  "remove messages from that number"],
+        slots={"contact": "contact name"},
+    ),
+
+    "messaging.search": Intent(
+        id="messaging.search",
+        op="messaging_search",
+        domain="messaging",
+        description="Search through messages",
+        signals=["search messages", "find a message", "look for a text",
+                 "search my texts", "find texts about", "search conversations"],
+        extractor="messaging_search",
+        examples=["search messages for the address Sarah sent",
+                  "find texts about the meeting",
+                  "look for the message with the tracking number"],
+        slots={"query": "search query"},
+    ),
+
+    "messaging.group_create": Intent(
+        id="messaging.group_create",
+        op="messaging_group_create",
+        domain="messaging",
+        description="Create a group chat",
+        signals=["group chat", "create a group", "group message", "new group",
+                 "start a group", "group text"],
+        extractor="messaging_group_create",
+        examples=["create a group chat called Weekend Plans",
+                  "start a group text with Mom and Dad",
+                  "make a group with the team"],
+        slots={"name": "group name", "platform": "messaging platform"},
+    ),
+
+    "messaging.group_add": Intent(
+        id="messaging.group_add",
+        op="messaging_group_add",
+        domain="messaging",
+        description="Add someone to a group chat",
+        signals=["add to the group", "add to the chat", "add someone to",
+                 "include in the group"],
+        extractor="messaging_group_add",
+        examples=["add Sarah to the Weekend Plans group",
+                  "add Mike to our chat",
+                  "include John in the group chat"],
+        slots={"person": "person to add", "group": "group name"},
+    ),
+
+    "messaging.react": Intent(
+        id="messaging.react",
+        op="messaging_react",
+        domain="messaging",
+        description="React to a message with an emoji",
+        signals=["react to the message", "like that message", "heart that text",
+                 "thumbs up the message", "react with"],
+        extractor="messaging_react",
+        examples=["react to that message with a heart",
+                  "thumbs up the last text",
+                  "like Sarah's message"],
+        slots={"reaction": "reaction type"},
+    ),
+
+    "messaging.forward": Intent(
+        id="messaging.forward",
+        op="messaging_forward",
+        domain="messaging",
+        description="Forward a message to another contact",
+        signals=["forward this message", "forward that text", "send this message to",
+                 "pass this along to"],
+        extractor="messaging_forward",
+        examples=["forward this message to Dad",
+                  "send that text to my boss",
+                  "forward Sarah's message to the group"],
+        slots={"recipient": "person to forward to"},
+    ),
+
+    "messaging.block": Intent(
+        id="messaging.block",
+        op="messaging_block",
+        domain="messaging",
+        description="Block a contact from messaging",
+        signals=["block messages from", "block that number", "block this contact",
+                 "stop messages from", "block sender"],
+        extractor="messaging_block",
+        examples=["block messages from that number",
+                  "block this contact",
+                  "stop texts from John"],
+        slots={"contact": "contact or number to block"},
+    ),
+
+    "messaging.schedule": Intent(
+        id="messaging.schedule",
+        op="messaging_schedule",
+        domain="messaging",
+        description="Schedule a message to be sent later",
+        signals=["schedule a message", "send a message later", "schedule a text",
+                 "send this text tomorrow", "message later"],
+        extractor="messaging_schedule",
+        examples=["schedule a text to Mom for 8am",
+                  "send this message to John tomorrow morning",
+                  "schedule a happy birthday text for midnight"],
+        slots={"recipient": "recipient", "body": "message text", "time": "send time"},
+    ),
+
+    # ── Music ──────────────────────────────────────────────────────────────
+
+    "music.play": Intent(
+        id="music.play",
+        op="music_play",
+        domain="music",
+        description="Play a song, artist, album, or playlist",
+        signals=["play", "listen to", "put on", "queue up", "stream",
+                 "play some", "play me"],
+        blockers=["play a video", "play a podcast", "play an audiobook",
+                  "play next episode", "play movie", "play show"],
+        extractor="music_play",
+        examples=["play Bohemian Rhapsody", "play Taylor Swift on Spotify",
+                  "listen to the chill playlist", "put on some jazz"],
+        slots={"query": "song/artist/album/playlist", "artist": "artist name",
+               "platform": "music platform"},
+    ),
+
+    "music.pause": Intent(
+        id="music.pause",
+        op="music_pause",
+        domain="music",
+        description="Pause or resume music playback",
+        signals=["pause music", "pause the music", "stop the music",
+                 "resume music", "resume playback", "unpause"],
+        blockers=["pause the video", "pause the show"],
+        extractor="music_pause",
+        examples=["pause the music", "stop playing", "resume the song"],
+        slots={"action": "pause|resume"},
+    ),
+
+    "music.skip": Intent(
+        id="music.skip",
+        op="music_skip",
+        domain="music",
+        description="Skip to the next or previous track",
+        signals=["next song", "skip", "previous song", "go back", "next track",
+                 "skip this song", "play the next song"],
+        blockers=["skip to next episode", "next episode"],
+        extractor="music_skip",
+        examples=["skip this song", "next track", "go back to the previous song"],
+        slots={"direction": "next|previous"},
+    ),
+
+    "music.volume": Intent(
+        id="music.volume",
+        op="music_volume",
+        domain="music",
+        description="Adjust music volume",
+        signals=["volume up", "volume down", "turn it up", "turn it down",
+                 "louder", "quieter", "mute the music", "set volume"],
+        blockers=["turn up the thermostat", "turn down the lights"],
+        extractor="music_volume",
+        examples=["turn the music up", "lower the volume to 50%",
+                  "mute", "make it louder"],
+        slots={"action": "up|down|mute|set", "level": "volume 0-100"},
+    ),
+
+    "music.like": Intent(
+        id="music.like",
+        op="music_like",
+        domain="music",
+        description="Like or unlike the current song",
+        signals=["like this song", "heart this song", "save this song",
+                 "unlike this song", "dislike", "thumbs up the song",
+                 "add to liked songs"],
+        extractor="music_like",
+        examples=["like this song", "heart the current track",
+                  "add this to my liked songs"],
+        slots={"action": "like|unlike"},
+    ),
+
+    "music.playlist_add": Intent(
+        id="music.playlist_add",
+        op="music_playlist_add",
+        domain="music",
+        description="Add a song to a playlist",
+        signals=["add to playlist", "add this song to", "save to playlist",
+                 "add to my playlist", "put this in"],
+        extractor="music_playlist_add",
+        examples=["add this song to my workout playlist",
+                  "save this track to Chill Vibes",
+                  "add Blinding Lights to the road trip playlist"],
+        slots={"song": "song name", "playlist": "playlist name"},
+    ),
+
+    "music.playlist_create": Intent(
+        id="music.playlist_create",
+        op="music_playlist_create",
+        domain="music",
+        description="Create a new music playlist",
+        signals=["create a playlist", "make a playlist", "new playlist",
+                 "start a playlist", "build a playlist"],
+        extractor="music_playlist_create",
+        examples=["create a playlist called Road Trip",
+                  "make a workout playlist",
+                  "new playlist for the party"],
+        slots={"name": "playlist name"},
+    ),
+
+    "music.queue": Intent(
+        id="music.queue",
+        op="music_queue",
+        domain="music",
+        description="View or manage the music queue",
+        signals=["what's in the queue", "show the queue", "add to queue",
+                 "play next", "music queue", "up next"],
+        extractor="music_queue",
+        examples=["what's in the queue", "add this to the queue",
+                  "play next: Hotel California"],
+        slots={"action": "view|add", "song": "song to add"},
+    ),
+
+    "music.lyrics": Intent(
+        id="music.lyrics",
+        op="music_lyrics",
+        domain="music",
+        description="Show lyrics for the current or a specific song",
+        signals=["lyrics", "show lyrics", "what are the lyrics",
+                 "song lyrics", "lyrics for"],
+        extractor="music_lyrics",
+        examples=["show lyrics for this song", "what are the lyrics to Bohemian Rhapsody",
+                  "lyrics"],
+        slots={"song": "song name or blank for current"},
+    ),
+
+    "music.radio": Intent(
+        id="music.radio",
+        op="music_radio",
+        domain="music",
+        description="Start a radio station based on an artist or song",
+        signals=["radio", "start a radio", "artist radio", "song radio",
+                 "similar music", "based on"],
+        blockers=["news radio", "talk radio", "fm radio", "am radio"],
+        extractor="music_radio",
+        examples=["start a Beatles radio", "play music like Coldplay",
+                  "Fleetwood Mac radio on Spotify"],
+        slots={"seed": "artist or song name", "platform": "platform"},
+    ),
+
+    "music.discover": Intent(
+        id="music.discover",
+        op="music_discover",
+        domain="music",
+        description="Discover new music by mood, genre, or taste",
+        signals=["discover music", "recommend music", "music recommendations",
+                 "suggest music", "new music", "something new to listen to",
+                 "music for working out", "music to relax"],
+        extractor="music_discover",
+        examples=["recommend some chill music", "discover new hip-hop",
+                  "suggest something to listen to while I work"],
+        slots={"genre": "music genre", "mood": "mood or activity"},
+    ),
+
+    "music.cast": Intent(
+        id="music.cast",
+        op="music_cast",
+        domain="music",
+        description="Cast or play music on another device or speaker",
+        signals=["play on", "cast to", "send to the speaker", "play on the",
+                 "airplay to", "connect to speaker", "play through"],
+        blockers=["play on spotify", "play on apple music"],
+        extractor="music_cast",
+        examples=["play this on the kitchen speaker",
+                  "cast to the living room Sonos",
+                  "airplay to the HomePod"],
+        slots={"device": "target device name"},
+    ),
+
+    "music.sleep_timer": Intent(
+        id="music.sleep_timer",
+        op="music_sleep_timer",
+        domain="music",
+        description="Set a timer to stop music after a duration",
+        signals=["sleep timer", "stop music after", "turn off music in",
+                 "stop playing in", "music off after"],
+        extractor="music_sleep_timer",
+        examples=["set a sleep timer for 30 minutes",
+                  "stop the music in an hour",
+                  "turn off music after 45 minutes"],
+        slots={"duration": "duration number", "unit": "minute|hour"},
+    ),
+
+    # ── Phone / Calls ──────────────────────────────────────────────────────
+
+    "phone.call": Intent(
+        id="phone.call",
+        op="phone_call",
+        domain="phone",
+        description="Make a phone call to a contact or number",
+        signals=["call", "dial", "phone", "ring", "give a call", "make a call",
+                 "call up", "facetime"],
+        blockers=["call the api", "function call", "called the"],
+        patterns=[r"\b(?:call|dial|phone|ring)\s+[A-Z][a-z]+"],
+        extractor="phone_call",
+        examples=["call Mom", "dial 555-1234", "ring John",
+                  "FaceTime Sarah"],
+        slots={"contact": "name or number to call"},
+    ),
+
+    "phone.voicemail": Intent(
+        id="phone.voicemail",
+        op="phone_voicemail",
+        domain="phone",
+        description="Listen to voicemail messages",
+        signals=["voicemail", "check voicemail", "listen to voicemail",
+                 "my voicemails", "new voicemail"],
+        extractor="phone_voicemail",
+        examples=["check my voicemail", "listen to my voicemails",
+                  "do I have any voicemail"],
+        slots={},
+    ),
+
+    "phone.recent": Intent(
+        id="phone.recent",
+        op="phone_recent",
+        domain="phone",
+        description="View recent or missed calls",
+        signals=["recent calls", "missed calls", "call history", "who called",
+                 "who did I call", "last call"],
+        extractor="phone_recent",
+        examples=["show my recent calls", "did I miss any calls",
+                  "call history"],
+        slots={},
+    ),
+
+    "phone.block": Intent(
+        id="phone.block",
+        op="phone_block",
+        domain="phone",
+        description="Block a phone number or contact",
+        signals=["block this number", "block calls from", "blacklist number",
+                 "stop calls from", "block that caller"],
+        extractor="phone_block",
+        examples=["block this number", "block calls from 555-1234",
+                  "blacklist that caller"],
+        slots={"contact": "number or contact to block"},
+    ),
+
+    "phone.conference": Intent(
+        id="phone.conference",
+        op="phone_conference",
+        domain="phone",
+        description="Set up a conference or group call",
+        signals=["conference call", "group call", "three-way call", "add to the call",
+                 "merge calls", "add someone to the call"],
+        extractor="phone_conference",
+        examples=["set up a conference call with Sarah and John",
+                  "three-way call with Mom and Dad",
+                  "add Mike to the current call"],
+        slots={"participants": "list of participants"},
+    ),
+
+    "phone.record": Intent(
+        id="phone.record",
+        op="phone_record",
+        domain="phone",
+        description="Record a phone call",
+        signals=["record this call", "record the call", "call recording",
+                 "start recording", "save this call"],
+        extractor="phone_record",
+        examples=["record this call", "start call recording",
+                  "save this conversation"],
+        slots={},
+    ),
+
+    # ── Camera / Photos ────────────────────────────────────────────────────
+
+    "camera.photo": Intent(
+        id="camera.photo",
+        op="camera_photo",
+        domain="camera",
+        description="Take a photo",
+        signals=["take a photo", "take a picture", "snap a photo", "selfie",
+                 "open camera", "camera", "take a pic"],
+        blockers=["attach a photo", "share a photo", "find a photo"],
+        extractor="camera_photo",
+        examples=["take a photo", "selfie", "snap a picture",
+                  "open the camera"],
+        slots={},
+    ),
+
+    "camera.video": Intent(
+        id="camera.video",
+        op="camera_video",
+        domain="camera",
+        description="Record a video",
+        signals=["record a video", "take a video", "start recording", "video mode",
+                 "shoot a video", "record this"],
+        blockers=["watch a video", "play a video", "stream a video"],
+        extractor="camera_video",
+        examples=["record a video", "take a 30-second video",
+                  "start recording"],
+        slots={"duration": "seconds if specified"},
+    ),
+
+    "camera.scan_qr": Intent(
+        id="camera.scan_qr",
+        op="camera_scan_qr",
+        domain="camera",
+        description="Scan a QR code",
+        signals=["scan qr", "scan qr code", "read qr", "qr code scanner",
+                 "scan this code", "scan barcode"],
+        extractor="camera_scan_qr",
+        examples=["scan the QR code", "read this barcode",
+                  "scan the code on the menu"],
+        slots={},
+    ),
+
+    "camera.scan_doc": Intent(
+        id="camera.scan_doc",
+        op="camera_scan_doc",
+        domain="camera",
+        description="Scan a document using the camera",
+        signals=["scan document", "scan this document", "scan a receipt",
+                 "document scanner", "scan and save", "scan to pdf"],
+        extractor="camera_scan_doc",
+        examples=["scan this document", "scan the receipt",
+                  "scan the contract to PDF"],
+        slots={},
+    ),
+
+    "camera.ocr": Intent(
+        id="camera.ocr",
+        op="camera_ocr",
+        domain="camera",
+        description="Extract text from an image",
+        signals=["read the text", "extract text from image", "text in photo",
+                 "copy text from", "live text", "what does the sign say",
+                 "read what's in the image"],
+        extractor="camera_ocr",
+        examples=["read the text in this photo", "extract the text from this image",
+                  "what does that sign say"],
+        slots={},
+    ),
+
+    "photos.search": Intent(
+        id="photos.search",
+        op="photos_search",
+        domain="photos",
+        description="Search the photo library by person, place, or date",
+        signals=["find photos", "search photos", "photos of", "pictures of",
+                 "photos from", "photos at", "show me photos"],
+        blockers=["find a photo online", "search for a photo online"],
+        extractor="photos_search",
+        examples=["find photos of Sarah", "photos from last Christmas",
+                  "pictures from my trip to Paris"],
+        slots={"person": "person name", "date": "date or period",
+               "location": "place name"},
+    ),
+
+    "photos.album": Intent(
+        id="photos.album",
+        op="photos_album",
+        domain="photos",
+        description="Create a photo album",
+        signals=["create an album", "make an album", "new album",
+                 "photo album", "organize photos into"],
+        extractor="photos_album",
+        examples=["create a photo album called Summer 2025",
+                  "make an album for the wedding photos",
+                  "new album: Family Vacation"],
+        slots={"name": "album name"},
+    ),
+
+    "photos.share": Intent(
+        id="photos.share",
+        op="photos_share",
+        domain="photos",
+        description="Share a photo or album with someone",
+        signals=["share this photo", "send this picture", "share the photo with",
+                 "share these photos", "send these photos"],
+        blockers=["share a file", "share a document"],
+        extractor="photos_share",
+        examples=["share this photo with Sarah",
+                  "send these vacation pictures to Mom",
+                  "share the album with the family"],
+        slots={"recipient": "person to share with"},
+    ),
+
+    "photos.edit": Intent(
+        id="photos.edit",
+        op="photos_edit",
+        domain="photos",
+        description="Edit a photo — crop, filter, adjust brightness, etc.",
+        signals=["edit this photo", "crop the photo", "filter", "adjust brightness",
+                 "black and white", "photo edit", "enhance photo", "remove background"],
+        extractor="photos_edit",
+        examples=["crop this photo", "apply a black and white filter",
+                  "brighten this picture", "remove the background"],
+        slots={"edit": "edit type"},
+    ),
+
+    # ── Smart Home ─────────────────────────────────────────────────────────
+
+    "smarthome.lights": Intent(
+        id="smarthome.lights",
+        op="smarthome_lights",
+        domain="smarthome",
+        description="Control smart lights — on, off, dim, or change color",
+        signals=["turn on the lights", "turn off the lights", "dim the lights",
+                 "lights on", "lights off", "light", "bedroom lights",
+                 "kitchen lights", "living room lights", "change light color"],
+        blockers=["traffic light", "flash light", "spotlight on"],
+        extractor="smarthome_lights",
+        examples=["turn off the bedroom lights", "dim the living room to 50%",
+                  "set the kitchen lights to warm white",
+                  "turn on all the lights"],
+        slots={"action": "on|off|dim|color", "room": "room name",
+               "level": "0-100", "color": "color name"},
+    ),
+
+    "smarthome.thermostat": Intent(
+        id="smarthome.thermostat",
+        op="smarthome_thermostat",
+        domain="smarthome",
+        description="Set or check the thermostat temperature",
+        signals=["thermostat", "set the temperature", "temperature to",
+                 "heat to", "cool to", "what is the temperature", "set heat",
+                 "make it warmer", "make it cooler", "hvac"],
+        blockers=["weather temperature", "body temperature", "fever"],
+        extractor="smarthome_thermostat",
+        examples=["set the thermostat to 72", "heat the house to 68 degrees",
+                  "what's the thermostat set to", "cool it down"],
+        slots={"action": "set|check", "temperature": "degrees",
+               "mode": "heat|cool|auto"},
+    ),
+
+    "smarthome.lock": Intent(
+        id="smarthome.lock",
+        op="smarthome_lock",
+        domain="smarthome",
+        description="Lock or unlock smart door locks",
+        signals=["lock the door", "unlock the door", "front door lock",
+                 "lock the house", "unlock the front door", "is the door locked",
+                 "lock the front door", "lock the back door", "door locked",
+                 "smart lock"],
+        patterns=[r"\b(?:lock|unlock)\s+(?:the\s+)?(?:front|back|garage|side)?\s*door\b"],
+        blockers=["lock the screen", "screen lock"],
+        extractor="smarthome_lock",
+        examples=["lock the front door", "unlock the back door",
+                  "is the front door locked"],
+        slots={"action": "lock|unlock", "door": "door identifier"},
+    ),
+
+    "smarthome.camera": Intent(
+        id="smarthome.camera",
+        op="smarthome_camera",
+        domain="smarthome",
+        description="View a security or home camera feed",
+        signals=["security camera", "front door camera", "baby monitor",
+                 "show the camera", "check the camera", "driveway camera",
+                 "backyard camera", "view the feed"],
+        blockers=["take a photo with camera", "camera app"],
+        extractor="smarthome_camera",
+        examples=["show the front door camera", "check the baby monitor",
+                  "view the backyard security camera"],
+        slots={"camera": "camera location or name"},
+    ),
+
+    "smarthome.appliance": Intent(
+        id="smarthome.appliance",
+        op="smarthome_appliance",
+        domain="smarthome",
+        description="Control a smart home appliance",
+        signals=["start the dishwasher", "run the washer", "start the dryer",
+                 "turn on the oven", "robot vacuum", "roomba", "coffee maker",
+                 "start the washer", "run the dishwasher"],
+        extractor="smarthome_appliance",
+        examples=["start the dishwasher", "run the robot vacuum",
+                  "turn on the coffee maker", "start the dryer"],
+        slots={"appliance": "appliance name", "action": "on|off|start"},
+    ),
+
+    "smarthome.scene": Intent(
+        id="smarthome.scene",
+        op="smarthome_scene",
+        domain="smarthome",
+        description="Activate a smart home scene or routine",
+        signals=["movie mode", "good morning", "good night", "bedtime mode",
+                 "away mode", "home mode", "activate scene", "run routine",
+                 "dinner mode", "party mode"],
+        extractor="smarthome_scene",
+        examples=["activate movie mode", "run the good morning routine",
+                  "set the house to away mode",
+                  "turn on bedtime mode"],
+        slots={"scene": "scene or routine name"},
+    ),
+
+    "smarthome.energy": Intent(
+        id="smarthome.energy",
+        op="smarthome_energy",
+        domain="smarthome",
+        description="Check home energy usage",
+        signals=["energy usage", "power consumption", "electricity bill",
+                 "how much power", "energy report", "kwh", "solar output"],
+        extractor="smarthome_energy",
+        examples=["show my energy usage today", "how much power is the house using",
+                  "what's my electricity consumption this month"],
+        slots={"window": "time period"},
+    ),
+
+    # ── Payments ───────────────────────────────────────────────────────────
+
+    "payments.send": Intent(
+        id="payments.send",
+        op="payments_send",
+        domain="payments",
+        description="Send money to someone via Venmo, Zelle, PayPal, etc.",
+        signals=["send money", "pay", "venmo", "zelle", "paypal", "cash app",
+                 "transfer money", "send payment", "split the bill"],
+        blockers=["pay the bill", "pay with credit", "payment failed"],
+        patterns=[r"\bsend\s+\$\d+|\bvenmo\s+[A-Z]|\bpay\s+[A-Z][a-z]+\s+\$"],
+        extractor="payments_send",
+        examples=["send $20 to Sarah on Venmo", "Zelle John $50 for dinner",
+                  "PayPal Mom $100"],
+        slots={"recipient": "person", "amount": "dollar amount",
+               "note": "payment note", "platform": "payment platform"},
+    ),
+
+    "payments.request": Intent(
+        id="payments.request",
+        op="payments_request",
+        domain="payments",
+        description="Request money from someone",
+        signals=["request money", "charge", "ask for money", "request payment",
+                 "request $", "collect money", "invoice"],
+        extractor="payments_request",
+        examples=["request $30 from Mike for lunch", "charge Sarah $15 for the movie",
+                  "ask John to pay me back $50"],
+        slots={"recipient": "person", "amount": "dollar amount", "note": "reason"},
+    ),
+
+    "payments.split": Intent(
+        id="payments.split",
+        op="payments_split",
+        domain="payments",
+        description="Split a bill between people",
+        signals=["split", "divide the bill", "split the check", "split evenly",
+                 "split between", "each person owes"],
+        extractor="payments_split",
+        examples=["split $120 four ways", "divide the dinner bill with Sarah and Mike",
+                  "split the check equally"],
+        slots={"amount": "total amount", "people": "list of people",
+               "ways": "number of ways"},
+    ),
+
+    "payments.history": Intent(
+        id="payments.history",
+        op="payments_history",
+        domain="payments",
+        description="View payment history or past transactions",
+        signals=["payment history", "past payments", "who did I pay",
+                 "payment transactions", "recent payments", "venmo history",
+                 "zelle history"],
+        extractor="payments_history",
+        examples=["show my Venmo history", "who did I pay this week",
+                  "recent payment transactions"],
+        slots={"contact": "person filter", "window": "time period",
+               "platform": "payment platform"},
+    ),
+
+    "payments.balance": Intent(
+        id="payments.balance",
+        op="payments_balance",
+        domain="payments",
+        description="Check the balance in a payment app",
+        signals=["venmo balance", "paypal balance", "cash app balance",
+                 "my balance", "how much is in"],
+        extractor="payments_balance",
+        examples=["what's my Venmo balance", "check my PayPal balance",
+                  "how much do I have in Cash App"],
+        slots={"platform": "payment platform"},
+    ),
+
+    # ── Food Delivery ──────────────────────────────────────────────────────
+
+    "food_delivery.order": Intent(
+        id="food_delivery.order",
+        op="food_delivery_order",
+        domain="food_delivery",
+        description="Order food for delivery",
+        signals=["order food", "order delivery", "get food delivered",
+                 "doordash", "uber eats", "grubhub", "order from",
+                 "food delivery", "order dinner", "order lunch"],
+        blockers=["track my order", "track delivery", "where is my food",
+                  "my delivery", "track my doordash"],
+        extractor="food_delivery_order",
+        examples=["order pizza from Domino's", "get sushi delivered",
+                  "order food from Chipotle on DoorDash"],
+        slots={"restaurant": "restaurant name", "platform": "delivery platform"},
+    ),
+
+    "food_delivery.track": Intent(
+        id="food_delivery.track",
+        op="food_delivery_track",
+        domain="food_delivery",
+        description="Track a food delivery order",
+        signals=["track my order", "track delivery", "where is my food",
+                 "delivery status", "how far is my food", "when will food arrive",
+                 "track my doordash", "track my uber eats", "my doordash order",
+                 "my delivery", "where is my order"],
+        extractor="food_delivery_track",
+        examples=["track my DoorDash order", "where is my food",
+                  "how long until my delivery arrives"],
+        slots={"platform": "delivery platform"},
+    ),
+
+    "food_delivery.reorder": Intent(
+        id="food_delivery.reorder",
+        op="food_delivery_reorder",
+        domain="food_delivery",
+        description="Reorder a previous food delivery",
+        signals=["reorder", "order again", "get the same order", "order it again",
+                 "repeat my last order"],
+        extractor="food_delivery_reorder",
+        examples=["reorder from last time", "get the same order from Chipotle",
+                  "order my usual from DoorDash"],
+        slots={"restaurant": "restaurant name", "platform": "delivery platform"},
+    ),
+
+    "food_delivery.browse": Intent(
+        id="food_delivery.browse",
+        op="food_delivery_browse",
+        domain="food_delivery",
+        description="Browse restaurants or cuisines for delivery",
+        signals=["what restaurants deliver", "find food near me", "delivery options",
+                 "what's available for delivery", "find pizza delivery",
+                 "restaurants nearby", "browse restaurants"],
+        blockers=["find a restaurant to eat at", "restaurant reservation"],
+        extractor="food_delivery_browse",
+        examples=["find sushi delivery near me", "what restaurants deliver to my address",
+                  "browse pizza places on DoorDash"],
+        slots={"cuisine": "cuisine type", "platform": "delivery platform"},
+    ),
+
+    # ── Ride Sharing ───────────────────────────────────────────────────────
+
+    "rideshare.book": Intent(
+        id="rideshare.book",
+        op="rideshare_book",
+        domain="rideshare",
+        description="Book a ride with Uber or Lyft",
+        signals=["get an uber", "book a ride", "call a lyft", "order a ride",
+                 "uber to", "lyft to", "get a ride", "book uber", "hail a cab"],
+        extractor="rideshare_book",
+        examples=["get an Uber to the airport", "book a Lyft to downtown",
+                  "order a ride to 123 Main St"],
+        slots={"destination": "drop-off location", "type": "ride type",
+               "platform": "uber|lyft"},
+    ),
+
+    "rideshare.track": Intent(
+        id="rideshare.track",
+        op="rideshare_track",
+        domain="rideshare",
+        description="Track the current ride or driver location",
+        signals=["track my uber", "where is my driver", "track my ride",
+                 "driver location", "how far is my uber", "eta for my ride"],
+        extractor="rideshare_track",
+        examples=["where is my Uber driver", "track my current ride",
+                  "how far away is my Lyft"],
+        slots={"platform": "uber|lyft"},
+    ),
+
+    "rideshare.schedule": Intent(
+        id="rideshare.schedule",
+        op="rideshare_schedule",
+        domain="rideshare",
+        description="Schedule a ride in advance",
+        signals=["schedule a ride", "book a ride for", "schedule an uber",
+                 "reserve a ride", "uber for tomorrow morning", "set up a ride"],
+        extractor="rideshare_schedule",
+        examples=["schedule an Uber for 6am tomorrow to the airport",
+                  "book a ride for Friday at 3pm",
+                  "reserve a Lyft for my appointment"],
+        slots={"destination": "drop-off", "time": "pickup time",
+               "platform": "platform"},
+    ),
+
+    "rideshare.cancel": Intent(
+        id="rideshare.cancel",
+        op="rideshare_cancel",
+        domain="rideshare",
+        description="Cancel a rideshare booking",
+        signals=["cancel my uber", "cancel the ride", "cancel my lyft",
+                 "cancel rideshare", "don't need the ride"],
+        extractor="rideshare_cancel",
+        examples=["cancel my Uber", "cancel the current ride",
+                  "cancel my Lyft booking"],
+        slots={"platform": "uber|lyft"},
+    ),
+
+    # ── Maps extras ────────────────────────────────────────────────────────
+
+    "maps.search": Intent(
+        id="maps.search",
+        op="maps_search",
+        domain="maps",
+        description="Search for a specific place on the map",
+        signals=["find on map", "show on map", "where is", "search maps for",
+                 "pull up on maps", "map it", "locate"],
+        blockers=["where is my package", "where are my files", "where is my order"],
+        extractor="maps_search",
+        examples=["find Whole Foods on the map", "where is the nearest hospital",
+                  "show me the Empire State Building on maps"],
+        slots={"query": "place to search"},
+    ),
+
+    "maps.save_place": Intent(
+        id="maps.save_place",
+        op="maps_save_place",
+        domain="maps",
+        description="Save a place to favorites or saved locations",
+        signals=["save this place", "bookmark this location", "add to saved places",
+                 "save to maps", "remember this place", "add to favorites in maps"],
+        extractor="maps_save_place",
+        examples=["save this restaurant to my places",
+                  "bookmark this location",
+                  "add the office to saved places"],
+        slots={"place": "place name or current location"},
+    ),
+
+    "maps.explore": Intent(
+        id="maps.explore",
+        op="maps_explore",
+        domain="maps",
+        description="Explore nearby places by category",
+        signals=["restaurants near me", "coffee shops near", "atm near me",
+                 "nearby pharmacy", "gas stations near", "things to do near",
+                 "bars near me", "hotels near", "what's around me"],
+        blockers=["directions", "navigate to", "how far"],
+        extractor="maps_explore",
+        examples=["find coffee shops near me", "restaurants near the office",
+                  "what's around me right now", "nearby gas stations"],
+        slots={"category": "place category", "location": "search anchor"},
+    ),
+
+    "maps.review": Intent(
+        id="maps.review",
+        op="maps_review",
+        domain="maps",
+        description="Write a review or rate a place",
+        signals=["write a review", "rate this place", "leave a review",
+                 "review the restaurant", "star rating", "google review"],
+        extractor="maps_review",
+        examples=["write a review for that restaurant",
+                  "rate the coffee shop 5 stars",
+                  "leave a Google review for the hotel"],
+        slots={"place": "place name", "rating": "star rating 1-5"},
+    ),
+
+    "maps.share_eta": Intent(
+        id="maps.share_eta",
+        op="maps_share_eta",
+        domain="maps",
+        description="Share your estimated time of arrival",
+        signals=["share eta", "share my location", "send my eta",
+                 "let them know my eta", "share arrival time",
+                 "share where I am"],
+        extractor="maps_share_eta",
+        examples=["share my ETA with Sarah",
+                  "send my location to Dad",
+                  "let Mom know when I'll arrive"],
+        slots={},
+    ),
+
+    # ── Travel ─────────────────────────────────────────────────────────────
+
+    "travel.flight_search": Intent(
+        id="travel.flight_search",
+        op="travel_flight_search",
+        domain="travel",
+        description="Search for flights between destinations",
+        signals=["search flights", "find flights", "book a flight", "cheap flights",
+                 "flight to", "flights from", "plane tickets", "airfare",
+                 "round trip", "one way to"],
+        extractor="travel_flight_search",
+        examples=["find flights from NYC to LA next weekend",
+                  "search for cheap flights to Miami in March",
+                  "book a round trip to London"],
+        slots={"origin": "departure city/airport", "destination": "arrival city",
+               "date": "travel date", "cabin": "economy|business|first"},
+    ),
+
+    "travel.flight_status": Intent(
+        id="travel.flight_status",
+        op="travel_flight_status",
+        domain="travel",
+        description="Check the status of a specific flight",
+        signals=["flight status", "is my flight on time", "flight delay",
+                 "check flight", "track flight", "flight AA123"],
+        extractor="travel_flight_status",
+        examples=["check status of AA456", "is United 1234 on time",
+                  "track flight DL789", "is my flight delayed"],
+        slots={"flight": "flight number", "airline": "airline code"},
+    ),
+
+    "travel.boarding_pass": Intent(
+        id="travel.boarding_pass",
+        op="travel_boarding_pass",
+        domain="travel",
+        description="Show a boarding pass for a flight",
+        signals=["boarding pass", "show my boarding pass", "mobile boarding pass",
+                 "check in for flight", "gate info", "seat assignment"],
+        extractor="travel_boarding_pass",
+        examples=["show my boarding pass", "pull up my boarding pass for tomorrow",
+                  "mobile boarding pass for United"],
+        slots={},
+    ),
+
+    "travel.hotel_search": Intent(
+        id="travel.hotel_search",
+        op="travel_hotel_search",
+        domain="travel",
+        description="Search for hotels in a destination",
+        signals=["find hotels", "search hotels", "book a hotel", "hotel in",
+                 "hotels near", "best hotels", "hotel deals", "place to stay"],
+        extractor="travel_hotel_search",
+        examples=["find hotels in Miami for next weekend",
+                  "search 4-star hotels in Paris",
+                  "best hotels near Times Square"],
+        slots={"city": "destination city", "checkin": "check-in date",
+               "guests": "number of guests", "stars": "star rating"},
+    ),
+
+    "travel.hotel_book": Intent(
+        id="travel.hotel_book",
+        op="travel_hotel_book",
+        domain="travel",
+        description="Book a specific hotel",
+        signals=["book the hotel", "reserve the hotel", "book a room at",
+                 "reserve a room at", "book hilton", "book marriott"],
+        extractor="travel_hotel_book",
+        examples=["book a room at the Marriott downtown",
+                  "reserve the Hilton for two nights",
+                  "book the hotel we found"],
+        slots={"hotel": "hotel name"},
+    ),
+
+    "travel.checkin": Intent(
+        id="travel.checkin",
+        op="travel_checkin",
+        domain="travel",
+        description="Check in for a flight online",
+        signals=["check in for flight", "online check-in", "check into flight",
+                 "check in for my united flight", "flight check-in"],
+        extractor="travel_checkin",
+        examples=["check in for my American Airlines flight",
+                  "do online check-in for UA123",
+                  "check in for tomorrow's flight"],
+        slots={"airline": "airline name", "flight": "flight number"},
+    ),
+
+    "travel.itinerary": Intent(
+        id="travel.itinerary",
+        op="travel_itinerary",
+        domain="travel",
+        description="View a travel itinerary or trip plan",
+        signals=["my itinerary", "trip itinerary", "travel plans",
+                 "show my trip", "trip details", "travel schedule"],
+        extractor="travel_itinerary",
+        examples=["show my travel itinerary", "what's my trip schedule for London",
+                  "view my Paris itinerary"],
+        slots={"trip": "destination or trip name"},
+    ),
+
+    "travel.car_rental": Intent(
+        id="travel.car_rental",
+        op="travel_car_rental",
+        domain="travel",
+        description="Search for or book a rental car",
+        signals=["rent a car", "car rental", "rental car", "hire a car",
+                 "enterprise", "hertz", "avis", "budget car"],
+        extractor="travel_car_rental",
+        examples=["rent a car in Miami for the weekend",
+                  "find a compact rental car at LAX",
+                  "car rental in London for 5 days"],
+        slots={"location": "pickup location", "type": "vehicle type"},
+    ),
+
+    "travel.alert": Intent(
+        id="travel.alert",
+        op="travel_alert",
+        domain="travel",
+        description="Check travel advisories or safety alerts for a destination",
+        signals=["travel advisory", "travel alert", "is it safe to travel to",
+                 "travel warning", "travel restrictions", "travel ban"],
+        extractor="travel_alert",
+        examples=["are there travel advisories for Mexico",
+                  "travel alerts for Europe",
+                  "is it safe to travel to Thailand"],
+        slots={"destination": "destination country or region"},
+    ),
+
+    # ── Video Streaming ────────────────────────────────────────────────────
+
+    "video.play": Intent(
+        id="video.play",
+        op="video_play",
+        domain="video",
+        description="Play a movie, show, or video on a streaming platform",
+        signals=["watch", "stream", "put on netflix", "watch on hulu",
+                 "play the movie", "watch the show", "start the episode",
+                 "play on disney plus"],
+        blockers=["watch my steps", "watch out", "music video"],
+        extractor="video_play",
+        examples=["watch Inception on Netflix", "play the latest episode of The Bear",
+                  "stream Oppenheimer on Prime", "put on a movie"],
+        slots={"title": "movie or show title", "type": "movie|show|episode",
+               "platform": "streaming platform"},
+    ),
+
+    "video.search": Intent(
+        id="video.search",
+        op="video_search",
+        domain="video",
+        description="Search for movies, shows, or videos to watch",
+        signals=["find a movie", "search netflix", "look for a show", "browse movies",
+                 "find something to watch", "movie recommendations",
+                 "what can i watch"],
+        blockers=["search the web", "search google"],
+        extractor="video_search",
+        examples=["find a good thriller on Netflix",
+                  "search Hulu for comedy shows",
+                  "what horror movies are on HBO"],
+        slots={"query": "search term", "platform": "streaming platform"},
+    ),
+
+    "video.watchlist": Intent(
+        id="video.watchlist",
+        op="video_watchlist",
+        domain="video",
+        description="Add to or view the watchlist",
+        signals=["watchlist", "add to watchlist", "save to watch later",
+                 "my list", "watch later", "add this to my list"],
+        extractor="video_watchlist",
+        examples=["add Dune to my Netflix watchlist",
+                  "save this show to watch later",
+                  "show my watchlist"],
+        slots={"action": "add|view", "title": "title to add"},
+    ),
+
+    "video.browse": Intent(
+        id="video.browse",
+        op="video_browse",
+        domain="video",
+        description="Browse movies or shows by genre",
+        signals=["action movies", "comedy shows", "horror movies",
+                 "browse by genre", "sci-fi shows", "drama series",
+                 "documentary", "thriller movies"],
+        blockers=["news", "sports"],
+        extractor="video_browse",
+        examples=["show me action movies on Netflix",
+                  "browse comedy shows on Hulu",
+                  "find documentaries to watch"],
+        slots={"genre": "genre", "platform": "streaming platform"},
+    ),
+
+    "video.recommend": Intent(
+        id="video.recommend",
+        op="video_recommend",
+        domain="video",
+        description="Get personalized movie or show recommendations",
+        signals=["recommend a movie", "recommend a show", "what should i watch",
+                 "suggest a film", "something good to watch",
+                 "what's good on netflix"],
+        extractor="video_recommend",
+        examples=["recommend a funny movie", "suggest something thrilling to watch",
+                  "what's good on Netflix tonight"],
+        slots={"mood": "mood or genre preference", "platform": "platform"},
+    ),
+
+    "video.cast": Intent(
+        id="video.cast",
+        op="video_cast",
+        domain="video",
+        description="Cast video to a TV or external display",
+        signals=["cast to the tv", "play on the tv", "chromecast", "airplay to tv",
+                 "send to the tv", "play on the big screen", "cast this"],
+        extractor="video_cast",
+        examples=["cast this to the living room TV",
+                  "play this on the Chromecast",
+                  "AirPlay to the Apple TV"],
+        slots={"device": "target device"},
+    ),
+
+    "video.continue": Intent(
+        id="video.continue",
+        op="video_continue",
+        domain="video",
+        description="Continue watching something from where you left off",
+        signals=["continue watching", "resume the show", "where i left off",
+                 "pick up where", "continue the movie", "what was i watching"],
+        extractor="video_continue",
+        examples=["continue watching The Bear",
+                  "resume the movie I was watching",
+                  "what was I watching on Netflix"],
+        slots={"platform": "streaming platform"},
+    ),
+
+    "video.rate": Intent(
+        id="video.rate",
+        op="video_rate",
+        domain="video",
+        description="Rate or review a movie or show",
+        signals=["rate this movie", "give it stars", "thumbs up this show",
+                 "thumbs down", "rate the film", "review this"],
+        extractor="video_rate",
+        examples=["give Inception 5 stars", "thumbs up this episode",
+                  "rate The Bear on Netflix"],
+        slots={"rating": "star rating", "thumbs": "up|down"},
+    ),
+
+    # ── Health / Fitness ───────────────────────────────────────────────────
+
+    "health.workout_log": Intent(
+        id="health.workout_log",
+        op="health_workout_log",
+        domain="health",
+        description="Log a completed workout",
+        signals=["log workout", "record workout", "i ran", "i cycled",
+                 "log my run", "log a run", "log a walk", "log a bike",
+                 "workout log", "record my workout", "i swam", "i did yoga",
+                 "i lifted", "log a workout", "log my workout",
+                 "i worked out", "finished a run", "just ran"],
+        patterns=[r"\blog\s+(?:a\s+)?(?:\d+[\s\-](?:minute|min|hour|hr|mile|km)[\s\-])?"
+                  r"(?:run|walk|hike|bike|swim|yoga|lift|workout|jog)\b"],
+        extractor="health_workout_log",
+        examples=["log a 30-minute run", "I cycled 10 miles today",
+                  "record my yoga session", "log my weights workout"],
+        slots={"type": "workout type", "duration_min": "minutes",
+               "distance": "distance", "calories": "calories burned"},
+    ),
+
+    "health.workout_start": Intent(
+        id="health.workout_start",
+        op="health_workout_start",
+        domain="health",
+        description="Start a workout session or activity tracking",
+        signals=["start a workout", "begin a run", "start running",
+                 "start a walk", "start yoga", "track my workout",
+                 "start tracking", "begin workout"],
+        extractor="health_workout_start",
+        examples=["start a running workout", "begin tracking my walk",
+                  "start a yoga session"],
+        slots={"type": "workout type"},
+    ),
+
+    "health.steps": Intent(
+        id="health.steps",
+        op="health_steps",
+        domain="health",
+        description="Check daily step count or activity",
+        signals=["step count", "how many steps", "my steps today",
+                 "steps today", "step goal", "activity rings",
+                 "did i hit my step goal"],
+        extractor="health_steps",
+        examples=["how many steps did I take today",
+                  "check my step count",
+                  "did I hit my step goal"],
+        slots={},
+    ),
+
+    "health.heart_rate": Intent(
+        id="health.heart_rate",
+        op="health_heart_rate",
+        domain="health",
+        description="Check heart rate data",
+        signals=["heart rate", "bpm", "pulse", "resting heart rate",
+                 "my heart rate", "check my pulse"],
+        extractor="health_heart_rate",
+        examples=["what's my heart rate", "check my resting heart rate",
+                  "show my BPM"],
+        slots={},
+    ),
+
+    "health.sleep": Intent(
+        id="health.sleep",
+        op="health_sleep",
+        domain="health",
+        description="View sleep data and sleep quality",
+        signals=["sleep data", "how did i sleep", "sleep quality",
+                 "hours of sleep", "my sleep last night", "deep sleep",
+                 "rem sleep", "sleep score"],
+        extractor="health_sleep",
+        examples=["how did I sleep last night", "show my sleep data",
+                  "what was my sleep score"],
+        slots={},
+    ),
+
+    "health.food_log": Intent(
+        id="health.food_log",
+        op="health_food_log",
+        domain="health",
+        description="Log food intake or calories",
+        signals=["log food", "track calories", "log what i ate", "calorie log",
+                 "i ate", "food diary", "log my meal", "count calories"],
+        extractor="health_food_log",
+        examples=["log 500 calories for lunch", "I ate a salad for lunch",
+                  "track calories for a Big Mac"],
+        slots={"food": "food item", "calories": "calorie count",
+               "meal": "breakfast|lunch|dinner|snack"},
+    ),
+
+    "health.water": Intent(
+        id="health.water",
+        op="health_water",
+        domain="health",
+        description="Log water intake",
+        signals=["log water", "water intake", "i drank water", "track hydration",
+                 "drank a glass", "log a bottle of water", "hydration"],
+        extractor="health_water",
+        examples=["log 16 oz of water", "I drank a glass of water",
+                  "log water intake: 500ml"],
+        slots={"amount": "quantity", "unit": "oz|ml|cup"},
+    ),
+
+    "health.weight": Intent(
+        id="health.weight",
+        op="health_weight",
+        domain="health",
+        description="Log body weight",
+        signals=["log my weight", "weighed myself", "my weight today",
+                 "record weight", "i weigh", "body weight log"],
+        extractor="health_weight",
+        examples=["log my weight: 175 lbs", "I weighed 80kg this morning",
+                  "record my weight"],
+        slots={"weight": "weight value", "unit": "lbs|kg"},
+    ),
+
+    "health.medication": Intent(
+        id="health.medication",
+        op="health_medication",
+        domain="health",
+        description="Log medication or set a medication reminder",
+        signals=["took my medication", "take my pills", "medication reminder",
+                 "log medication", "remind me to take", "pill reminder",
+                 "refill prescription"],
+        extractor="health_medication",
+        examples=["log that I took my blood pressure medication",
+                  "remind me to take Advil at 8pm",
+                  "medication log: vitamin D"],
+        slots={"medication": "medication name", "time": "reminder time"},
+    ),
+
+    "health.mood": Intent(
+        id="health.mood",
+        op="health_mood",
+        domain="health",
+        description="Log mood or emotional state",
+        signals=["log my mood", "how i'm feeling", "mood log", "feeling",
+                 "mood tracker", "mental health log", "i feel"],
+        blockers=["weather feeling", "feeling hungry", "feeling cold"],
+        extractor="health_mood",
+        examples=["log my mood as happy", "I'm feeling stressed today",
+                  "mood: 7 out of 10"],
+        slots={"mood": "mood label", "score": "1-10 score"},
+    ),
+
+    # ── Files / Storage ────────────────────────────────────────────────────
+
+    "files.upload": Intent(
+        id="files.upload",
+        op="files_upload",
+        domain="files",
+        description="Upload a file to cloud storage",
+        signals=["upload", "upload to drive", "upload to icloud",
+                 "sync to cloud", "back up this file", "upload file"],
+        extractor="files_upload",
+        examples=["upload the report to Google Drive",
+                  "back up my photos to iCloud",
+                  "upload this file to Dropbox"],
+        slots={"file": "file name", "destination": "cloud service or folder"},
+    ),
+
+    "files.download": Intent(
+        id="files.download",
+        op="files_download",
+        domain="files",
+        description="Download a file from cloud storage",
+        signals=["download", "download from drive", "save to device",
+                 "download the file", "get the file", "pull down"],
+        blockers=["download an app", "download music"],
+        extractor="files_download",
+        examples=["download the Q4 report from Drive",
+                  "save that file to my device",
+                  "download the presentation"],
+        slots={"file": "file name"},
+    ),
+
+    "files.share": Intent(
+        id="files.share",
+        op="files_share",
+        domain="files",
+        description="Share a file with someone",
+        signals=["share the file", "send the file", "share this document",
+                 "give access to the file", "share the link"],
+        blockers=["share a photo", "share a message", "share on social"],
+        extractor="files_share",
+        examples=["share the budget file with Sarah",
+                  "send the PDF to John",
+                  "share the Drive link with the team"],
+        slots={"file": "file name", "recipient": "person to share with"},
+    ),
+
+    "files.search": Intent(
+        id="files.search",
+        op="files_search",
+        domain="files",
+        description="Search for a file in cloud storage or on device",
+        signals=["find the file", "search for a file", "where is the document",
+                 "find the pdf", "look for my files"],
+        blockers=["find a song", "find a photo", "find a contact"],
+        extractor="files_search",
+        examples=["find the Q4 report", "where is the invoice PDF",
+                  "search for files about the project"],
+        slots={"query": "file search query"},
+    ),
+
+    "files.recent": Intent(
+        id="files.recent",
+        op="files_recent",
+        domain="files",
+        description="Show recently accessed or modified files",
+        signals=["recent files", "recently opened", "show recent documents",
+                 "last files", "what files did i work on"],
+        extractor="files_recent",
+        examples=["show my recent files", "what documents did I open today",
+                  "recently modified files"],
+        slots={},
+    ),
+
+    # ── Alarm / Clock ──────────────────────────────────────────────────────
+
+    "alarm.set": Intent(
+        id="alarm.set",
+        op="alarm_set",
+        domain="alarm",
+        description="Set an alarm for a specific time",
+        signals=["set an alarm", "wake me up", "alarm for", "set alarm",
+                 "alarm at", "reminder alarm"],
+        blockers=["fire alarm", "car alarm", "security alarm"],
+        patterns=[r"\bwake\s+me\s+(?:up\s+)?at\b", r"\balarm\s+(?:at|for)\s+\d"],
+        extractor="alarm_set",
+        examples=["set an alarm for 7am", "wake me up at 6:30",
+                  "alarm for Monday at 8am"],
+        slots={"time": "alarm time", "label": "alarm label", "days": "repeat days"},
+    ),
+
+    "alarm.delete": Intent(
+        id="alarm.delete",
+        op="alarm_delete",
+        domain="alarm",
+        description="Delete or turn off an existing alarm",
+        signals=["delete alarm", "remove alarm", "cancel alarm",
+                 "turn off alarm", "disable the alarm"],
+        extractor="alarm_delete",
+        examples=["delete the 7am alarm", "remove the morning alarm",
+                  "cancel the alarm for tomorrow"],
+        slots={"time": "alarm time", "label": "alarm label"},
+    ),
+
+    "alarm.list": Intent(
+        id="alarm.list",
+        op="alarm_list",
+        domain="alarm",
+        description="View all set alarms",
+        signals=["my alarms", "show alarms", "list alarms", "what alarms do i have",
+                 "all alarms"],
+        extractor="alarm_list",
+        examples=["show all my alarms", "what alarms do I have set",
+                  "list my alarms"],
+        slots={},
+    ),
+
+    "clock.world": Intent(
+        id="clock.world",
+        op="clock_world",
+        domain="clock",
+        description="Check the time in another city or timezone",
+        signals=["time in", "what time is it in", "current time in",
+                 "timezone", "time zone", "local time in"],
+        extractor="clock_world",
+        examples=["what time is it in Tokyo", "current time in London",
+                  "what's the time in New York"],
+        slots={"city": "city name", "timezone": "timezone code"},
+    ),
+
+    "clock.stopwatch": Intent(
+        id="clock.stopwatch",
+        op="clock_stopwatch",
+        domain="clock",
+        description="Start, stop, or lap a stopwatch",
+        signals=["stopwatch", "start stopwatch", "stop stopwatch",
+                 "lap", "start timer", "begin timing"],
+        blockers=["set a timer", "countdown timer"],
+        extractor="clock_stopwatch",
+        examples=["start the stopwatch", "stop the stopwatch",
+                  "lap the stopwatch"],
+        slots={"action": "start|stop|lap", "lap": "true if lap"},
+    ),
+
+    "clock.bedtime": Intent(
+        id="clock.bedtime",
+        op="clock_bedtime",
+        domain="clock",
+        description="Set a bedtime or sleep schedule",
+        signals=["bedtime", "sleep schedule", "set bedtime", "go to bed reminder",
+                 "bedtime reminder", "wind down"],
+        extractor="clock_bedtime",
+        examples=["set my bedtime to 10:30pm", "bedtime reminder at 11",
+                  "set a sleep schedule"],
+        slots={"bedtime": "bedtime hour"},
+    ),
+
+    # ── Podcasts ───────────────────────────────────────────────────────────
+
+    "podcast.find": Intent(
+        id="podcast.find",
+        op="podcast_find",
+        domain="podcast",
+        description="Find or discover a podcast",
+        signals=["find a podcast", "podcast about", "discover podcasts",
+                 "podcast recommendations", "recommend a podcast",
+                 "search for podcasts"],
+        extractor="podcast_find",
+        examples=["find a podcast about true crime",
+                  "recommend a good business podcast",
+                  "discover podcasts about history"],
+        slots={"query": "podcast name or topic", "topic": "topic if browsing"},
+    ),
+
+    "podcast.play": Intent(
+        id="podcast.play",
+        op="podcast_play",
+        domain="podcast",
+        description="Play a podcast episode",
+        signals=["listen to podcast", "play the podcast", "latest episode",
+                 "play the latest", "listen to my podcast", "play episode"],
+        extractor="podcast_play",
+        examples=["play the latest episode of How I Built This",
+                  "listen to the new Joe Rogan podcast",
+                  "play the podcast I was listening to"],
+        slots={"podcast": "podcast name", "latest": "true if latest episode"},
+    ),
+
+    "podcast.subscribe": Intent(
+        id="podcast.subscribe",
+        op="podcast_subscribe",
+        domain="podcast",
+        description="Subscribe or follow a podcast",
+        signals=["subscribe to podcast", "follow the podcast", "subscribe to",
+                 "follow this show", "add podcast to library"],
+        extractor="podcast_subscribe",
+        examples=["subscribe to Lex Fridman Podcast",
+                  "follow Serial",
+                  "add Conan O'Brien Needs a Friend to my podcasts"],
+        slots={"podcast": "podcast name"},
+    ),
+
+    "podcast.queue": Intent(
+        id="podcast.queue",
+        op="podcast_queue",
+        domain="podcast",
+        description="Add a podcast episode to the listening queue",
+        signals=["add episode to queue", "queue the podcast episode",
+                 "add to my queue", "play this episode next"],
+        extractor="podcast_queue",
+        examples=["add this episode to my podcast queue",
+                  "queue up the new Radiolab episode",
+                  "play next: the latest Stuff You Should Know"],
+        slots={"episode": "episode name or description"},
+    ),
+
+    # ── Recipes / Food ─────────────────────────────────────────────────────
+
+    "recipe.find": Intent(
+        id="recipe.find",
+        op="recipe_find",
+        domain="recipe",
+        description="Find a recipe for a dish or with specific ingredients",
+        signals=["recipe for", "how to make", "how to cook", "recipe",
+                 "cooking instructions", "make dinner", "quick recipe"],
+        blockers=["restaurant recommendation", "order food"],
+        extractor="recipe_find",
+        examples=["recipe for chicken tikka masala",
+                  "how to make pasta carbonara",
+                  "quick vegetarian dinner recipe"],
+        slots={"dish": "dish name", "cuisine": "cuisine type",
+               "ingredients": "key ingredients"},
+    ),
+
+    "recipe.save": Intent(
+        id="recipe.save",
+        op="recipe_save",
+        domain="recipe",
+        description="Save a recipe for later",
+        signals=["save this recipe", "bookmark recipe", "add recipe to",
+                 "save to my recipes", "keep this recipe"],
+        extractor="recipe_save",
+        examples=["save this pasta recipe", "bookmark the chicken recipe",
+                  "add this to my saved recipes"],
+        slots={"recipe": "recipe name"},
+    ),
+
+    "recipe.nutrition": Intent(
+        id="recipe.nutrition",
+        op="recipe_nutrition",
+        domain="recipe",
+        description="Look up nutritional information for a food item",
+        signals=["nutrition info", "calories in", "how many calories",
+                 "macros", "nutritional value", "how healthy is",
+                 "protein in", "carbs in"],
+        extractor="recipe_nutrition",
+        examples=["how many calories in a Big Mac", "nutrition info for avocado",
+                  "what are the macros in oatmeal"],
+        slots={"food": "food or dish name"},
+    ),
+
+    "recipe.scale": Intent(
+        id="recipe.scale",
+        op="recipe_scale",
+        domain="recipe",
+        description="Scale a recipe to a different number of servings",
+        signals=["scale the recipe", "adjust servings", "double the recipe",
+                 "half the recipe", "make for 8 people", "change servings"],
+        extractor="recipe_scale",
+        examples=["scale this recipe to 8 servings",
+                  "double the recipe",
+                  "adjust the recipe for 4 people"],
+        slots={"servings": "target number of servings"},
+    ),
+
+    "grocery.add": Intent(
+        id="grocery.add",
+        op="grocery_add",
+        domain="grocery",
+        description="Add items to a grocery or shopping list",
+        signals=["add to grocery list", "add to shopping list",
+                 "grocery list", "shopping list", "need to buy",
+                 "pick up", "get from store", "add milk"],
+        blockers=["add to task list", "add to playlist", "add to watchlist"],
+        extractor="grocery_add",
+        examples=["add milk and eggs to the grocery list",
+                  "I need to buy bananas and bread",
+                  "add chicken to my shopping list"],
+        slots={"items": "list of grocery items"},
+    ),
+
+    "grocery.list": Intent(
+        id="grocery.list",
+        op="grocery_list",
+        domain="grocery",
+        description="View the current grocery or shopping list",
+        signals=["my grocery list", "show grocery list", "shopping list",
+                 "what's on the list", "my shopping list"],
+        blockers=["my task list", "my to-do list", "my playlist"],
+        extractor="grocery_list",
+        examples=["show my grocery list", "what's on my shopping list",
+                  "what do I need to buy"],
+        slots={},
+    ),
+
+    "grocery.order": Intent(
+        id="grocery.order",
+        op="grocery_order",
+        domain="grocery",
+        description="Order groceries for delivery",
+        signals=["order groceries", "grocery delivery", "instacart", "order from whole foods",
+                 "grocery order", "get groceries delivered"],
+        extractor="grocery_order",
+        examples=["order my groceries from Instacart",
+                  "get grocery delivery from Whole Foods",
+                  "order groceries online"],
+        slots={"platform": "delivery platform"},
+    ),
+
+    # ── Translation ────────────────────────────────────────────────────────
+
+    "translate.text": Intent(
+        id="translate.text",
+        op="translate_text",
+        domain="translate",
+        description="Translate text from one language to another",
+        signals=["translate", "how do you say", "what is", "in spanish",
+                 "in french", "in german", "in japanese", "translate to",
+                 "translation of"],
+        blockers=["what is the weather", "what is my balance", "what is nearby"],
+        extractor="translate_text",
+        examples=["translate 'hello' to Spanish", "how do you say goodbye in French",
+                  "what is 'gracias' in English"],
+        slots={"text": "text to translate", "source": "source language",
+               "target": "target language"},
+    ),
+
+    "translate.detect": Intent(
+        id="translate.detect",
+        op="translate_detect",
+        domain="translate",
+        description="Detect what language a piece of text is written in",
+        signals=["what language is", "detect language", "what language is this",
+                 "identify the language", "which language"],
+        extractor="translate_detect",
+        examples=["what language is 'bonjour'",
+                  "detect the language of this text",
+                  "what language is '你好'"],
+        slots={"text": "text to identify"},
+    ),
+
+    "translate.conversation": Intent(
+        id="translate.conversation",
+        op="translate_conversation",
+        domain="translate",
+        description="Start a real-time conversation translation session",
+        signals=["conversation mode", "real-time translation", "live translate",
+                 "two-way translation", "translate our conversation"],
+        extractor="translate_conversation",
+        examples=["start conversation translation between English and Spanish",
+                  "live translate between me and this person",
+                  "two-way translation mode"],
+        slots={"lang1": "first language", "lang2": "second language"},
+    ),
+
+    # ── Books / Reading ────────────────────────────────────────────────────
+
+    "book.find": Intent(
+        id="book.find",
+        op="book_find",
+        domain="book",
+        description="Find or search for a book",
+        signals=["find a book", "recommend a book", "book recommendation",
+                 "search for book", "book by", "book about", "what should i read",
+                 "recommend a novel", "recommend a mystery", "recommend a thriller",
+                 "recommend a biography", "good book", "suggest a book",
+                 "novel to read", "book to read"],
+        blockers=["recipe book", "textbook"],
+        extractor="book_find",
+        examples=["recommend a mystery novel", "find books by Stephen King",
+                  "what should I read next"],
+        slots={"title": "book title", "author": "author name", "genre": "genre"},
+    ),
+
+    "book.read": Intent(
+        id="book.read",
+        op="book_read",
+        domain="book",
+        description="Open and read or listen to a book",
+        signals=["read", "open book", "continue reading", "audiobook",
+                 "listen to", "start the book", "open the ebook",
+                 "continue the audiobook"],
+        blockers=["read my email", "read my messages", "read my texts",
+                  "read the news"],
+        patterns=[r"\b(?:read|listen\s+to)\s+[\"']?.+?[\"']?\s+(?:book|novel|audiobook)\b"],
+        extractor="book_read",
+        examples=["read Atomic Habits", "listen to The Alchemist audiobook",
+                  "continue reading my book"],
+        slots={"title": "book title", "audio": "true for audiobook"},
+    ),
+
+    "book.library": Intent(
+        id="book.library",
+        op="book_library",
+        domain="book",
+        description="View the digital book library",
+        signals=["my books", "my library", "book library", "books i own",
+                 "my ebooks", "my kindle library", "my audiobooks"],
+        extractor="book_library",
+        examples=["show my book library", "what books do I have",
+                  "open my Kindle library"],
+        slots={},
+    ),
+
+    "book.highlight": Intent(
+        id="book.highlight",
+        op="book_highlight",
+        domain="book",
+        description="Highlight a passage in a book",
+        signals=["highlight this", "highlight passage", "bookmark this page",
+                 "mark this section", "save this quote"],
+        extractor="book_highlight",
+        examples=["highlight this paragraph", "save this quote from the book",
+                  "mark this passage"],
+        slots={"text": "text to highlight"},
+    ),
+
+    # ── Device / Settings ──────────────────────────────────────────────────
+
+    "settings.wifi": Intent(
+        id="settings.wifi",
+        op="settings_wifi",
+        domain="settings",
+        description="Manage WiFi — connect, disconnect, or toggle",
+        signals=["wifi", "wi-fi", "connect to wifi", "turn on wifi",
+                 "turn off wifi", "join network", "wireless"],
+        blockers=["smart home wifi", "speaker wifi"],
+        extractor="settings_wifi",
+        examples=["connect to the CoffeeShop WiFi",
+                  "turn off WiFi", "join the HomeNetwork"],
+        slots={"action": "connect|on|off|settings", "network": "network name"},
+    ),
+
+    "settings.bluetooth": Intent(
+        id="settings.bluetooth",
+        op="settings_bluetooth",
+        domain="settings",
+        description="Manage Bluetooth — pair devices, toggle on/off",
+        signals=["bluetooth", "pair", "connect bluetooth", "turn on bluetooth",
+                 "turn off bluetooth", "connect to headphones", "pair airpods"],
+        extractor="settings_bluetooth",
+        examples=["turn on Bluetooth", "pair my AirPods",
+                  "connect Bluetooth headphones", "turn off Bluetooth"],
+        slots={"action": "pair|on|off|settings", "device": "device name"},
+    ),
+
+    "settings.brightness": Intent(
+        id="settings.brightness",
+        op="settings_brightness",
+        domain="settings",
+        description="Adjust screen brightness",
+        signals=["brightness", "screen brightness", "dim screen",
+                 "make screen brighter", "brighter", "dimmer screen",
+                 "turn up brightness", "turn down brightness"],
+        blockers=["dim the lights", "smart lights brightness"],
+        extractor="settings_brightness",
+        examples=["set brightness to 75%", "make the screen brighter",
+                  "dim the screen", "full brightness"],
+        slots={"action": "up|down|set", "level": "0-100"},
+    ),
+
+    "settings.dnd": Intent(
+        id="settings.dnd",
+        op="settings_dnd",
+        domain="settings",
+        description="Toggle Do Not Disturb or Focus mode",
+        signals=["do not disturb", "dnd", "focus mode", "silence notifications",
+                 "quiet mode", "turn off notifications", "focus on"],
+        extractor="settings_dnd",
+        examples=["turn on Do Not Disturb for 2 hours",
+                  "enable focus mode", "silence my phone",
+                  "turn off DND"],
+        slots={"action": "on|off|toggle", "duration": "duration in hours/minutes"},
+    ),
+
+    "settings.airplane": Intent(
+        id="settings.airplane",
+        op="settings_airplane",
+        domain="settings",
+        description="Toggle airplane mode",
+        signals=["airplane mode", "flight mode", "turn on airplane mode",
+                 "turn off airplane mode", "disable airplane mode"],
+        extractor="settings_airplane",
+        examples=["turn on airplane mode", "disable airplane mode",
+                  "toggle flight mode"],
+        slots={"action": "on|off"},
+    ),
+
+    "settings.battery": Intent(
+        id="settings.battery",
+        op="settings_battery",
+        domain="settings",
+        description="Check battery status or enable battery saver",
+        signals=["battery level", "how much battery", "battery percentage",
+                 "battery saver", "low power mode", "charge level",
+                 "battery status"],
+        extractor="settings_battery",
+        examples=["what's my battery level", "how much charge do I have",
+                  "enable battery saver mode"],
+        slots={},
+    ),
+
+    "settings.storage": Intent(
+        id="settings.storage",
+        op="settings_storage",
+        domain="settings",
+        description="Check available storage space",
+        signals=["storage space", "available storage", "how much storage",
+                 "storage full", "free up storage", "clear storage",
+                 "device storage"],
+        extractor="settings_storage",
+        examples=["how much storage do I have left", "check my storage space",
+                  "free up storage on my phone"],
+        slots={},
+    ),
+
+    "settings.notification": Intent(
+        id="settings.notification",
+        op="settings_notification",
+        domain="settings",
+        description="Manage notifications for an app",
+        signals=["turn off notifications", "notification settings",
+                 "disable notifications for", "stop notifications from",
+                 "mute notifications", "app notifications"],
+        extractor="settings_notification",
+        examples=["turn off Instagram notifications",
+                  "disable notifications from Twitter",
+                  "mute notifications for games"],
+        slots={"app": "app name", "action": "on|off"},
     ),
 }
 
