@@ -130,22 +130,65 @@ const RemoteTurnService = {
 // ─── Semantic Cache ──────────────────────────────────────────────────────────
 const SemanticCache = {
     _store: new Map(),  // key → { response, domain, expires }
-    _TTL: { weather: 600, sports: 120, banking: 300, shopping: 1800, travel: 900 },
+    _MAX: 120,          // max entries before LRU eviction
+
+    // TTL in seconds per domain. 0 = never cache (always fetch fresh).
+    _TTL: {
+        // Time-sensitive: short TTL
+        sports:       120,   // scores/standings change fast
+        music:         60,   // now-playing can change any moment
+        rideshare:     60,   // surge pricing fluctuates
+        news:         180,   // headlines update frequently
+        location:       0,   // always fresh — user moves
+        weather:      600,   // forecast stable for ~10 min
+        finance:      180,   // stock quotes change, but not every call
+        banking:      300,   // balances/transactions: 5 min stale ok
+        health:         0,   // biometrics always fresh
+        // Semi-stable: medium TTL
+        food:         600,   // menus/ratings rarely change mid-session
+        travel:       900,   // flight/hotel prices: 15 min ok
+        shopping:    1800,   // product listings: 30 min ok
+        social:       120,   // feed changes quickly
+        // Effectively static: long TTL
+        dictionary:  7200,   // word definitions never change
+        translation: 7200,   // translations never change
+        recipes:     3600,   // recipe data is static
+        books:       3600,   // book metadata is static
+        // Always fresh — mutations or device state
+        calendar:       0,
+        email:          0,
+        reminders:      0,
+        contacts:       0,
+        smarthome:      0,
+        payments:       0,
+    },
 
     _key(intent) { return intent.trim().toLowerCase(); },
 
     _ttl(domain) { return ((this._TTL[domain] ?? 0) * 1000); },
 
+    _evict() {
+        if (this._store.size < this._MAX) return;
+        // Remove the oldest entry (Map preserves insertion order)
+        const oldest = this._store.keys().next().value;
+        if (oldest !== undefined) this._store.delete(oldest);
+    },
+
     get(intent) {
-        const entry = this._store.get(this._key(intent));
+        const key = this._key(intent);
+        const entry = this._store.get(key);
         if (!entry) return null;
-        if (Date.now() > entry.expires) { this._store.delete(this._key(intent)); return null; }
+        if (Date.now() > entry.expires) { this._store.delete(key); return null; }
+        // Move to end (LRU touch)
+        this._store.delete(key);
+        this._store.set(key, entry);
         return entry.response;
     },
 
     set(intent, domain, response) {
         const ttl = this._ttl(domain);
         if (ttl === 0) return;
+        this._evict();
         this._store.set(this._key(intent), { response, domain, expires: Date.now() + ttl });
     },
 
@@ -203,6 +246,12 @@ const SoundEngine = {
 
     // 4 kHz click transient — button press
     click() { this._tone(4000, 'square', 0.035, 0.04); },
+
+    // Low descending pair — high-risk confirm prompt
+    confirm() {
+        this._tone(370, 'sine', 0.22, 0.09);
+        this._tone(311, 'sine', 0.28, 0.07, 0.18);
+    },
 
     toggle() {
         this.enabled = !this.enabled;
@@ -1805,7 +1854,7 @@ const UIEngine = {
         const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow', 'music', 'messaging', 'connections', 'network', 'document', 'spreadsheet', 'code', 'terminal', 'presentation'].includes(core.kind);
         const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
         const railBlocks = this.buildImmersiveRailBlocks(blocks);
-        const darkScenes = new Set(['weather','weather_7day','weather_tomorrow','tasks','expenses','notes','music','banking','sports','sports_manage','messaging','files','connections','network','travel','health','reminders','reminders_list','social','contacts','telephony','domain','graph','location','calendar','email','code','terminal','document','spreadsheet','presentation','content','reference','clock','enterprise','github','jira','notion','asana','finance']);
+        const darkScenes = new Set(['weather','weather_7day','weather_tomorrow','tasks','expenses','notes','music','banking','sports','sports_manage','messaging','files','connections','network','travel','health','reminders','reminders_list','social','contacts','telephony','domain','graph','location','calendar','email','code','terminal','document','spreadsheet','presentation','content','reference','clock','enterprise','github','jira','notion','asana','finance','gaming','arvr','dating']);
         const sceneTone = darkScenes.has(core.kind) ? 'dark' : 'light';
         this.container.innerHTML = `
             <div class="workspace immersive" data-scene-tone="${escapeAttr(sceneTone)}">
@@ -3569,8 +3618,11 @@ const UIEngine = {
         if (domain === 'backup')        return { headline: 'Backup',        summary: 'Device backup',          variant: 'result', kind: 'backup',        theme: 'theme-backup'        };
         if (domain === 'accessibility') return { headline: 'Accessibility', summary: 'Accessibility settings', variant: 'result', kind: 'accessibility', theme: 'theme-accessibility' };
         if (domain === 'shortcuts')     return { headline: 'Shortcuts',     summary: 'Automations',            variant: 'result', kind: 'shortcuts',     theme: 'theme-shortcuts'     };
-        if (domain === 'currency')      return { headline: 'Currency',      summary: 'Exchange rates',         variant: 'result', kind: 'currency',      theme: 'theme-currency'      };
-        if (domain === 'connectors')    return { headline: 'Connections',   summary: 'Manage connected services', variant: 'result', kind: 'connections',   theme: 'theme-connections'   };
+        if (domain === 'currency')      return { headline: 'Currency',      summary: 'Exchange rates',              variant: 'result', kind: 'currency',      theme: 'theme-currency'      };
+        if (domain === 'connectors')    return { headline: 'Connections',   summary: 'Manage connected services',   variant: 'result', kind: 'connections',   theme: 'theme-connections'   };
+        if (domain === 'gaming')        return { headline: 'Gaming',        summary: 'Games & achievements',        variant: 'result', kind: 'gaming',        theme: 'theme-gaming'        };
+        if (domain === 'arvr')          return { headline: 'AR / VR',       summary: 'Spatial computing',          variant: 'result', kind: 'arvr',          theme: 'theme-arvr'          };
+        if (domain === 'dating')        return { headline: 'Dating',        summary: 'Matches & messages',         variant: 'result', kind: 'dating',        theme: 'theme-dating'        };
         return { headline: summary, summary: fallbackSummary, variant: 'result', kind: 'generic', theme: 'theme-neutral' };
     },
 
@@ -6730,6 +6782,12 @@ const UIEngine = {
             this._sceneRenderer = this.makeRemindersRenderer(canvas);
         } else if (scene === 'finance') {
             this._sceneRenderer = this.makeFinanceRenderer(canvas);
+        } else if (scene === 'gaming') {
+            this._sceneRenderer = this.makeGamingRenderer(canvas);
+        } else if (scene === 'arvr') {
+            this._sceneRenderer = this.makeArVrRenderer(canvas);
+        } else if (scene === 'dating') {
+            this._sceneRenderer = this.makeDatingRenderer(canvas);
         } else if (scene === 'focus') {
             this._sceneRenderer = this.makeFocusRenderer(canvas);
         } else if (['notifications','handoff','wallet','vpn','dictionary','password',
@@ -9906,6 +9964,206 @@ const UIEngine = {
         };
     },
 
+    makeGamingRenderer(canvas) {
+        // Dark purple/black with animated scanlines, controller glyph pulse,
+        // and XP bar fill — classic gaming atmosphere.
+        let t = 0;
+        const stars = Array.from({ length: 40 }, () => ({
+            x: Math.random(), y: Math.random(),
+            s: 0.5 + Math.random() * 1.5,
+            o: 0.2 + Math.random() * 0.5,
+            speed: 0.00015 + Math.random() * 0.0003,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.012;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // Deep purple background
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#0a0314');
+            bg.addColorStop(1, '#110820');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Scanlines
+            for (let y = 0; y < h; y += 3) {
+                ctx.fillStyle = 'rgba(0,0,0,0.12)';
+                ctx.fillRect(0, y, w, 1);
+            }
+            // Drifting star particles
+            for (const star of stars) {
+                star.x -= star.speed;
+                if (star.x < 0) { star.x = 1; star.y = Math.random(); }
+                ctx.beginPath();
+                ctx.arc(star.x * w, star.y * h, star.s, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(180,130,255,${star.o})`;
+                ctx.fill();
+            }
+            // XP bar at bottom
+            const barW = w * 0.6, barH = 5, barX = w * 0.2, barY = h * 0.82;
+            ctx.fillStyle = 'rgba(100,50,200,0.25)';
+            ctx.beginPath();
+            ctx.roundRect(barX, barY, barW, barH, 3);
+            ctx.fill();
+            const fill = (0.55 + 0.35 * Math.sin(t * 0.18)) * barW;
+            const fillGrd = ctx.createLinearGradient(barX, 0, barX + fill, 0);
+            fillGrd.addColorStop(0, 'rgba(140,80,255,0.8)');
+            fillGrd.addColorStop(1, 'rgba(200,100,255,0.9)');
+            ctx.fillStyle = fillGrd;
+            ctx.beginPath();
+            ctx.roundRect(barX, barY, fill, barH, 3);
+            ctx.fill();
+            // Controller icon (simplified D-pad cross)
+            const cx = w * 0.5, cy = h * 0.52;
+            const sz = Math.min(w, h) * 0.06;
+            const pulse = 0.6 + 0.4 * Math.sin(t * 0.7);
+            ctx.strokeStyle = `rgba(160,100,255,${pulse * 0.5})`;
+            ctx.lineWidth = 2;
+            // Horizontal bar
+            ctx.beginPath();
+            ctx.moveTo(cx - sz, cy); ctx.lineTo(cx + sz, cy);
+            ctx.stroke();
+            // Vertical bar
+            ctx.beginPath();
+            ctx.moveTo(cx, cy - sz); ctx.lineTo(cx, cy + sz);
+            ctx.stroke();
+            // Accent glow center
+            const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, sz * 2.5);
+            grd.addColorStop(0, `rgba(140,80,255,${0.15 * pulse})`);
+            grd.addColorStop(1, 'rgba(80,40,160,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
+    makeArVrRenderer(canvas) {
+        // Holographic teal grid on deep black — spatial computing atmosphere.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.fillStyle = '#010508';
+            ctx.fillRect(0, 0, w, h);
+            // Perspective grid floor
+            const vx = w * 0.5, vy = h * 0.55;
+            const cols = 10, rows = 8;
+            ctx.strokeStyle = 'rgba(0,200,180,0.18)';
+            ctx.lineWidth = 0.8;
+            for (let c = 0; c <= cols; c++) {
+                const px = (c / cols) * w;
+                ctx.beginPath();
+                ctx.moveTo(px, vy);
+                ctx.lineTo(vx, h * 0.05);
+                ctx.stroke();
+            }
+            for (let r = 1; r <= rows; r++) {
+                const frac = r / rows;
+                const y = vy + (h - vy) * (frac * frac);
+                const xSpread = w * frac * 0.5;
+                ctx.beginPath();
+                ctx.moveTo(w * 0.5 - xSpread, y);
+                ctx.lineTo(w * 0.5 + xSpread, y);
+                ctx.stroke();
+            }
+            // Floating HUD ring
+            const rx = w * 0.5, ry = h * 0.32;
+            const radius = Math.min(w, h) * 0.1;
+            const pulse = 0.5 + 0.5 * Math.sin(t * 0.9);
+            const arcGrd = ctx.createRadialGradient(rx, ry, radius * 0.5, rx, ry, radius * 1.4);
+            arcGrd.addColorStop(0, `rgba(0,220,200,${0.3 * pulse})`);
+            arcGrd.addColorStop(1, 'rgba(0,180,160,0)');
+            ctx.fillStyle = arcGrd;
+            ctx.fillRect(0, 0, w, h);
+            ctx.beginPath();
+            ctx.arc(rx, ry, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(0,220,200,${0.5 * pulse})`;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            // Rotating inner tick marks
+            for (let i = 0; i < 12; i++) {
+                const angle = (i / 12) * Math.PI * 2 + t;
+                const x1 = rx + Math.cos(angle) * radius * 0.85;
+                const y1 = ry + Math.sin(angle) * radius * 0.85;
+                const x2 = rx + Math.cos(angle) * radius * 1.0;
+                const y2 = ry + Math.sin(angle) * radius * 1.0;
+                ctx.beginPath();
+                ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+                ctx.strokeStyle = `rgba(0,255,220,${0.6 * pulse})`;
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+        };
+    },
+
+    makeDatingRenderer(canvas) {
+        // Warm deep rose with floating heart particles and soft bokeh glow.
+        let t = 0;
+        const hearts = Array.from({ length: 14 }, () => ({
+            x: Math.random() * 100,
+            y: 20 + Math.random() * 70,
+            size: 4 + Math.random() * 10,
+            speed: 0.015 + Math.random() * 0.025,
+            drift: (Math.random() - 0.5) * 0.008,
+            opacity: 0.2 + Math.random() * 0.4,
+            phase: Math.random() * Math.PI * 2,
+        }));
+        const drawHeart = (ctx, cx, cy, size, opacity) => {
+            ctx.save();
+            ctx.globalAlpha = opacity;
+            ctx.beginPath();
+            ctx.moveTo(cx, cy + size * 0.25);
+            ctx.bezierCurveTo(cx, cy - size * 0.5, cx - size, cy - size * 0.5, cx - size, cy);
+            ctx.bezierCurveTo(cx - size, cy + size * 0.5, cx, cy + size * 0.9, cx, cy + size * 0.9);
+            ctx.bezierCurveTo(cx, cy + size * 0.9, cx + size, cy + size * 0.5, cx + size, cy);
+            ctx.bezierCurveTo(cx + size, cy - size * 0.5, cx, cy - size * 0.5, cx, cy + size * 0.25);
+            ctx.fillStyle = 'rgba(240,80,100,0.7)';
+            ctx.fill();
+            ctx.restore();
+        };
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.01;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#18060c');
+            bg.addColorStop(1, '#240a12');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Soft bokeh glows
+            for (let i = 0; i < 5; i++) {
+                const bx = w * (0.1 + i * 0.2);
+                const by = h * (0.3 + 0.2 * Math.sin(t * 0.3 + i));
+                const br = w * 0.12;
+                const bgrd = ctx.createRadialGradient(bx, by, 0, bx, by, br);
+                bgrd.addColorStop(0, 'rgba(200,60,80,0.1)');
+                bgrd.addColorStop(1, 'rgba(160,30,50,0)');
+                ctx.fillStyle = bgrd;
+                ctx.fillRect(0, 0, w, h);
+            }
+            // Floating hearts
+            for (const heart of hearts) {
+                heart.x -= heart.speed;
+                heart.y += Math.sin(t + heart.phase) * heart.drift;
+                if (heart.x < -5) heart.x = 105;
+                const pulse = 0.85 + 0.15 * Math.sin(t * 1.2 + heart.phase);
+                drawHeart(ctx, heart.x / 100 * w, heart.y / 100 * h,
+                          heart.size * pulse, heart.opacity);
+            }
+            // Center glow
+            const cgrd = ctx.createRadialGradient(w * 0.5, h * 0.45, 0, w * 0.5, h * 0.45, w * 0.35);
+            cgrd.addColorStop(0, `rgba(220,60,90,${0.1 + 0.05 * Math.sin(t * 0.5)})`);
+            cgrd.addColorStop(1, 'rgba(180,30,60,0)');
+            ctx.fillStyle = cgrd;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
     // ── Mesh: auto-join local network + notification badge ───────────────────
 
     async _initNetworkMesh() {
@@ -9975,6 +10233,7 @@ const UIEngine = {
 
     _showConfirm(remote, originalIntent) {
         this._dismissConfirm(); // clear any existing
+        SoundEngine.confirm();
         const summary = remote.summary || remote.confirmSummary || remote.message || 'This action requires confirmation.';
         const op = remote.op || remote.confirmOp || '';
         const overlay = document.createElement('div');

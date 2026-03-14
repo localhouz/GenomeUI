@@ -20802,6 +20802,22 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "network_view":         {"domain": "network",    "risk": "low"},
     # MCP tool execution
     "mcp_tool_call":        {"domain": "system",     "risk": "medium"},
+    # Gaming
+    "gaming_library":       {"domain": "gaming",     "risk": "low"},
+    "gaming_achievements":  {"domain": "gaming",     "risk": "low"},
+    "gaming_friends":       {"domain": "gaming",     "risk": "low"},
+    "gaming_leaderboard":   {"domain": "gaming",     "risk": "low"},
+    "gaming_clips":         {"domain": "gaming",     "risk": "low"},
+    # AR / VR
+    "arvr_launch":          {"domain": "arvr",       "risk": "low"},
+    "arvr_space":           {"domain": "arvr",       "risk": "low"},
+    "arvr_passthrough":     {"domain": "arvr",       "risk": "low"},
+    "arvr_status":          {"domain": "arvr",       "risk": "low"},
+    # Dating
+    "dating_matches":       {"domain": "dating",     "risk": "low"},
+    "dating_messages":      {"domain": "dating",     "risk": "low"},
+    "dating_profile":       {"domain": "dating",     "risk": "low"},
+    "dating_discover":      {"domain": "dating",     "risk": "low"},
 }
 COMMUTATIVE_MERGE_OPS = {"add_task", "add_note", "add_expense"}
 
