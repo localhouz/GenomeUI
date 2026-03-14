@@ -313,8 +313,9 @@ def _ext_shopping(raw: str, lower: str) -> dict[str, Any] | None:
     return {"query": raw.strip(), "category": _infer_shopping_category(lower)}
 
 
-def _ext_location_status(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_location_status(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:in|at|near|around)\s+(.+?)(?:\s+right now|\s+currently)?$", lower)
+    return {"city": m.group(1).strip() if m else ""}
 
 
 def _ext_news(_raw: str, lower: str) -> dict[str, Any] | None:
@@ -364,16 +365,21 @@ def _ext_finance_crypto(raw: str, lower: str) -> dict[str, Any] | None:
     return {"query": query}
 
 
-def _ext_banking_balance(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_banking_balance(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(checking|savings|credit|investment|retirement)\b", lower)
+    return {"account": m.group(1) if m else ""}
 
 
-def _ext_banking_transactions(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_banking_transactions(_raw: str, lower: str) -> dict[str, Any] | None:
+    m_days = re.search(r"\b(?:last|past)\s+(\d+)\s+days?\b", lower)
+    m_acct = re.search(r"\b(checking|savings|credit)\b", lower)
+    return {"days": int(m_days.group(1)) if m_days else 30,
+            "account": m_acct.group(1) if m_acct else ""}
 
 
-def _ext_social_feed(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_social_feed(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(twitter|x|instagram|facebook|linkedin|tiktok|reddit)\b", lower)
+    return {"platform": m.group(1) if m else ""}
 
 
 def _ext_social_post(raw: str, _lower: str) -> dict[str, Any] | None:
@@ -1615,8 +1621,9 @@ def _ext_news_by_source(raw: str, lower: str) -> dict[str, Any] | None:
 
 # ── Contacts ──────────────────────────────────────────────────────────────────
 
-def _ext_contacts_list(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_contacts_list(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:search|find|show)\s+(?:contacts?\s+)?(?:named|called|with)?\s+(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
 
 
 def _ext_contacts_edit(raw: str, lower: str) -> dict[str, Any] | None:
@@ -1676,8 +1683,9 @@ def _ext_social_follow_person(raw: str, lower: str) -> dict[str, Any] | None:
     return {"action": action, "handle": name} if name else None
 
 
-def _ext_social_notifications(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_social_notifications(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(twitter|x|instagram|facebook|linkedin|tiktok|reddit)\b", lower)
+    return {"platform": m.group(1) if m else ""}
 
 
 def _ext_social_trending(_raw: str, lower: str) -> dict[str, Any] | None:
@@ -1706,8 +1714,9 @@ def _ext_terminal_env(raw: str, lower: str) -> dict[str, Any] | None:
     return {"action": action, "var": var, "value": value}
 
 
-def _ext_terminal_output(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_terminal_output(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"(?:output|result|log)\s+(?:of|from|for)\s+(.+)", lower)
+    return {"command": m.group(1).strip() if m else ""}
 
 
 # ── Banking ───────────────────────────────────────────────────────────────────
@@ -1910,6 +1919,49 @@ def _ext_weather_alert(raw: str, lower: str) -> dict[str, Any] | None:
     return {"location": _extract_location(raw, lower) or "__current__", "type": "alert"}
 
 
+# ── Google Calendar ────────────────────────────────────────────────────────────
+
+def _ext_gcal_list(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:next|upcoming|this week)?\s*(\d+)?\s*(?:days?)?", lower)
+    days = int(m.group(1)) if m and m.group(1) else 7
+    return {"days": days}
+
+def _ext_gcal_create(raw: str, lower: str) -> dict | None:
+    base = _ext_calendar(raw, lower) or {}
+    return {"summary": base.get("title", ""), "start": base.get("date", ""), "end": base.get("endDate", ""), "location": base.get("location", "")}
+
+def _ext_gcal_update(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:update|reschedule|change)\s+(?:event\s+)?(.+?)(?:\s+to\s+(.+))?$", lower)
+    return {"summary": m.group(1).strip() if m else "", "eventId": ""}
+
+def _ext_gcal_delete(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:delete|cancel|remove)\s+(?:event\s+)?(.+)", lower)
+    return {"summary": m.group(1).strip() if m else "", "eventId": ""}
+
+
+# ── Google Drive ───────────────────────────────────────────────────────────────
+
+def _ext_gdrive_search(raw: str, lower: str) -> dict | None:
+    m = re.search(r"(?:find|search|open|show)\s+(?:my\s+)?(?:google\s+drive\s+)?(?:file|doc|sheet|folder)?\s+(?:called|named|about)?\s*(.+)", lower)
+    return {"query": m.group(1).strip() if m else ""}
+
+def _ext_gdrive_create(raw: str, lower: str) -> dict | None:
+    type_map = {"doc": "application/vnd.google-apps.document",
+                "document": "application/vnd.google-apps.document",
+                "sheet": "application/vnd.google-apps.spreadsheet",
+                "spreadsheet": "application/vnd.google-apps.spreadsheet",
+                "slide": "application/vnd.google-apps.presentation",
+                "presentation": "application/vnd.google-apps.presentation",
+                "folder": "application/vnd.google-apps.folder"}
+    detected = next((v for k, v in type_map.items() if k in lower), "")
+    m = re.search(r"(?:create|new|make)\s+(?:a\s+)?(?:google\s+)?(?:drive\s+)?(?:\w+\s+)?(?:called|named)?\s*(.+)?", lower)
+    return {"name": m.group(1).strip() if m and m.group(1) else "Untitled", "mimeType": detected}
+
+def _ext_gdrive_share(raw: str, lower: str) -> dict | None:
+    m = re.search(r"share\s+(.+?)\s+with\s+(.+)", lower)
+    return {"query": m.group(1).strip() if m else "", "email": m.group(2).strip() if m else ""}
+
+
 def _ext_location_directions(raw: str, lower: str) -> dict[str, Any] | None:
     # "directions to X", "navigate to X", "how do I get to X", "take me to X"
     m = re.search(
@@ -2017,8 +2069,11 @@ def _ext_news_saved(_raw: str, _lower: str) -> dict[str, Any] | None:
     return {"kind": "saved"}
 
 
-def _ext_finance_portfolio(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_finance_portfolio(_raw: str, lower: str) -> dict[str, Any] | None:
+    m_ticker = re.search(r"\b([A-Z]{1,5})\b", _raw)
+    m_days = re.search(r"\b(?:last|past)\s+(\d+)\s+days?\b", lower)
+    return {"ticker": m_ticker.group(1) if m_ticker else "",
+            "days": int(m_days.group(1)) if m_days else 30}
 
 
 def _ext_finance_watchlist(raw: str, lower: str) -> dict[str, Any] | None:
@@ -2125,12 +2180,16 @@ def _ext_social_dm(raw: str, _lower: str) -> dict[str, Any] | None:
     return {"to": recipient, "text": (m.group(2) or "").strip()} if recipient else None
 
 
-def _ext_social_profile(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_social_profile(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"@(\w+)", lower) or re.search(r"(?:profile|account|page)\s+(?:of|for|about)\s+@?(\S+)", lower)
+    return {"handle": m.group(1).strip("@") if m else ""}
 
 
-def _ext_terminal_history(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_terminal_history(_raw: str, lower: str) -> dict[str, Any] | None:
+    m_limit = re.search(r"\b(?:last|recent|past)\s+(\d+)\b", lower)
+    m_filter = re.search(r"(?:with|containing|matching|for)\s+(.+)$", lower)
+    return {"limit": int(m_limit.group(1)) if m_limit else 20,
+            "filter": m_filter.group(1).strip() if m_filter else ""}
 
 
 def _ext_terminal_kill(_raw: str, lower: str) -> dict[str, Any] | None:
@@ -2833,7 +2892,7 @@ def _ext_maps_review(raw: str, lower: str) -> dict[str, Any] | None:
 
 
 def _ext_maps_share_eta(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — shares current location ETA
 
 
 # ── Travel ─────────────────────────────────────────────────────────────────────
@@ -3032,16 +3091,21 @@ def _ext_health_workout_start(_raw: str, lower: str) -> dict[str, Any] | None:
     return {"type": type_m.group(0) if type_m else "general"}
 
 
-def _ext_health_steps(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_health_steps(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(?:today|yesterday|last\s+(\d+)\s+days?)\b", lower)
+    days = int(m.group(1)) if m and m.group(1) else 1
+    return {"days": days}
 
 
-def _ext_health_heart_rate(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_health_heart_rate(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(?:last\s+(\d+)\s+(?:hours?|days?))\b", lower)
+    return {"period": m.group(0) if m else "today"}
 
 
-def _ext_health_sleep(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_health_sleep(_raw: str, lower: str) -> dict[str, Any] | None:
+    m = re.search(r"\b(?:last\s+(\d+)\s+nights?|tonight|last\s+night)\b", lower)
+    nights = int(m.group(1)) if m and m.group(1) else 1
+    return {"nights": nights}
 
 
 def _ext_health_food_log(raw: str, lower: str) -> dict[str, Any] | None:
@@ -3129,8 +3193,11 @@ def _ext_files_search(raw: str, lower: str) -> dict[str, Any] | None:
     return {"query": m.group(1).strip() if m else raw.strip()}
 
 
-def _ext_files_recent(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+def _ext_files_recent(_raw: str, lower: str) -> dict[str, Any] | None:
+    m_limit = re.search(r"\b(?:last|recent|past)\s+(\d+)\b", lower)
+    m_type = re.search(r"\b(pdf|doc|docx|image|photo|video|spreadsheet|csv)\b", lower)
+    return {"limit": int(m_limit.group(1)) if m_limit else 10,
+            "type": m_type.group(1) if m_type else ""}
 
 
 # ── Alarm / Clock ──────────────────────────────────────────────────────────────
@@ -3162,7 +3229,7 @@ def _ext_alarm_delete(raw: str, lower: str) -> dict[str, Any] | None:
 
 
 def _ext_alarm_list(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — lists all alarms
 
 
 def _ext_clock_world(_raw: str, lower: str) -> dict[str, Any] | None:
@@ -3267,7 +3334,7 @@ def _ext_grocery_add(raw: str, lower: str) -> dict[str, Any] | None:
 
 
 def _ext_grocery_list(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — returns full grocery list
 
 
 def _ext_grocery_order(_raw: str, lower: str) -> dict[str, Any] | None:
@@ -3343,7 +3410,7 @@ def _ext_book_read(raw: str, lower: str) -> dict[str, Any] | None:
 
 
 def _ext_book_library(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — returns full book library
 
 
 def _ext_book_highlight(raw: str, _lower: str) -> dict[str, Any] | None:
@@ -3406,11 +3473,11 @@ def _ext_settings_airplane(_raw: str, lower: str) -> dict[str, Any] | None:
 
 
 def _ext_settings_battery(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — reads battery state
 
 
 def _ext_settings_storage(_raw: str, _lower: str) -> dict[str, Any] | None:
-    return {}
+    return {}  # no params needed — reads storage state
 
 
 def _ext_settings_notification(raw: str, lower: str) -> dict[str, Any] | None:
@@ -3428,17 +3495,17 @@ def _ext_settings_notification(raw: str, lower: str) -> dict[str, Any] | None:
 
 # ── Notifications ──────────────────────────────────────────────────────────────
 def _ext_notif_view(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 def _ext_notif_clear(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 def _ext_notif_clear_app(raw: str, lower: str) -> dict | None:
     m = re.search(r"(?:clear|dismiss|remove)\s+(?:all\s+)?notifications?\s+(?:from|for)\s+(.+)", lower)
     return {"app": m.group(1).strip() if m else ""}
 
 def _ext_notif_mark_read(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 def _ext_notif_settings(raw: str, lower: str) -> dict | None:
     m = re.search(r"notification\s+settings?\s+(?:for\s+)?(.+)", lower)
@@ -3450,14 +3517,14 @@ def _ext_handoff_airdrop(raw: str, lower: str) -> dict | None:
     return {"target": m.group(1).strip() if m and m.group(1) else ""}
 
 def _ext_handoff_clipboard(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed — syncs current clipboard
 
 def _ext_handoff_continue(raw: str, lower: str) -> dict | None:
     m = re.search(r"(?:continue|hand\s*off|pick\s+up)\s+(?:on|from|to)\s+(.+)", lower)
     return {"device": m.group(1).strip() if m else ""}
 
 def _ext_handoff_screen_share(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 # ── Enterprise — Jira ──────────────────────────────────────────────────────────
 def _ext_jira_create(raw: str, lower: str) -> dict | None:
@@ -3711,10 +3778,10 @@ def _ext_print_scan(raw: str, lower: str) -> dict | None:
 
 # ── Backup ─────────────────────────────────────────────────────────────────────
 def _ext_backup_now(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 def _ext_backup_status(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed
 
 # ── Accessibility ──────────────────────────────────────────────────────────────
 def _ext_access_font(raw: str, lower: str) -> dict | None:
@@ -3772,19 +3839,28 @@ def _ext_currency_convert(raw: str, lower: str) -> dict | None:
     return {"amount": amount, "from": found[0] if found else "", "to": found[1] if len(found) > 1 else ""}
 
 def _ext_currency_rates(raw: str, lower: str) -> dict | None:
-    return {}
+    return {}  # no params needed — returns all rates
 
 # ── Health extensions ──────────────────────────────────────────────────────────
 def _ext_health_cycle(raw: str, lower: str) -> dict | None:
+    # No params needed — returns current cycle data
     return {}
 
 def _ext_health_streak(raw: str, lower: str) -> dict | None:
-    return {}
+    m = re.search(r"\b(steps?|workout|water|sleep|meditation)\b", lower)
+    return {"metric": m.group(1) if m else ""}
 
 def _ext_health_goals(raw: str, lower: str) -> dict | None:
-    return {}
+    m = re.search(r"\b(steps?|calories?|weight|sleep|water|workout)\b", lower)
+    return {"metric": m.group(1) if m else ""}
 
 def _ext_health_hrv(raw: str, lower: str) -> dict | None:
+    m = re.search(r"\b(?:last\s+(\d+)\s+days?|today|this\s+week)\b", lower)
+    days = int(m.group(1)) if m and m.group(1) else 7
+    return {"days": days}
+
+
+def _ext_connections_manage(_raw: str, _lower: str) -> dict | None:
     return {}
 
 
@@ -4041,6 +4117,14 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "github_my_prs":            _ext_github_my_prs,
     "github_repo_search":       _ext_github_repo_search,
     "github_commit":            _ext_github_commit,
+    "gcal_list":                _ext_gcal_list,
+    "gcal_create":              _ext_gcal_create,
+    "gcal_update":              _ext_gcal_update,
+    "gcal_delete":              _ext_gcal_delete,
+    "gdrive_list":              _ext_gdrive_search,
+    "gdrive_open":              _ext_gdrive_search,
+    "gdrive_create":            _ext_gdrive_create,
+    "gdrive_share":             _ext_gdrive_share,
     "slack_send":               _ext_slack_send,
     "slack_read":               _ext_slack_read,
     "slack_search":             _ext_slack_search,
@@ -4105,6 +4189,7 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "health_streak":            _ext_health_streak,
     "health_goals":             _ext_health_goals,
     "health_hrv":               _ext_health_hrv,
+    "connections_manage":       _ext_connections_manage,
 }
 
 
@@ -5002,6 +5087,117 @@ TAXONOMY: dict[str, Intent] = {
         examples=["cancel the meeting with Sarah", "delete the dentist appointment",
                   "remove the Friday call from my calendar"],
         slots={"action": "cancel", "title": "event title", "date": "date/time"},
+    ),
+
+    # ── Google Calendar (gcal_* ops) ──────────────────────────────────────
+
+    "gcal.list": Intent(
+        id="gcal.list",
+        op="gcal_list",
+        domain="calendar",
+        description="List events from Google Calendar",
+        signals=["google calendar", "gcal", "my google events", "show google calendar"],
+        patterns=[r"\bgoogle\s+calendar\b", r"\bgcal\b"],
+        blockers=["create", "add", "schedule", "update", "delete", "cancel"],
+        extractor="gcal_list",
+        examples=["show my google calendar", "what's on my google calendar this week"],
+        slots={"days": "number of days to look ahead"},
+    ),
+
+    "gcal.create": Intent(
+        id="gcal.create",
+        op="gcal_create",
+        domain="calendar",
+        description="Create an event in Google Calendar",
+        signals=["add to google calendar", "create google calendar event",
+                 "schedule on google calendar", "put on google calendar"],
+        patterns=[r"\b(?:add|create|schedule)\s+(?:a\s+)?(?:google\s+calendar\s+)?event\b"],
+        blockers=["show", "list", "delete", "update"],
+        extractor="gcal_create",
+        examples=["add a meeting to Google Calendar tomorrow at 3pm"],
+        slots={"summary": "event title", "start": "start time", "end": "end time", "location": "location"},
+    ),
+
+    "gcal.update": Intent(
+        id="gcal.update",
+        op="gcal_update",
+        domain="calendar",
+        description="Update or reschedule a Google Calendar event",
+        signals=["update google calendar event", "reschedule google calendar",
+                 "change google calendar event", "move google calendar event"],
+        patterns=[r"\b(?:update|reschedule|change|move)\s+(?:google\s+calendar\s+)?event\b"],
+        extractor="gcal_update",
+        examples=["reschedule my Google Calendar meeting to Friday"],
+        slots={"summary": "event name", "eventId": "event ID"},
+    ),
+
+    "gcal.delete": Intent(
+        id="gcal.delete",
+        op="gcal_delete",
+        domain="calendar",
+        description="Delete an event from Google Calendar",
+        signals=["delete google calendar event", "remove from google calendar",
+                 "cancel google calendar event"],
+        patterns=[r"\b(?:delete|remove|cancel)\s+(?:google\s+calendar\s+)?event\b"],
+        extractor="gcal_delete",
+        examples=["delete the Monday meeting from Google Calendar"],
+        slots={"summary": "event name", "eventId": "event ID"},
+    ),
+
+    # ── Google Drive (gdrive_* ops) ───────────────────────────────────────
+
+    "gdrive.list": Intent(
+        id="gdrive.list",
+        op="gdrive_list",
+        domain="document",
+        description="List files in Google Drive",
+        signals=["google drive", "my drive", "show drive files", "gdrive",
+                 "files in drive", "drive documents"],
+        patterns=[r"\bgoogle\s+drive\b", r"\bmy\s+drive\b", r"\bgdrive\b"],
+        blockers=["create", "new", "upload", "share"],
+        extractor="gdrive_list",
+        examples=["show my Google Drive files", "what's in my Drive"],
+        slots={"query": "search query"},
+    ),
+
+    "gdrive.open": Intent(
+        id="gdrive.open",
+        op="gdrive_open",
+        domain="document",
+        description="Open a file in Google Drive",
+        signals=["open drive file", "open google drive", "open in drive",
+                 "open the doc", "open the sheet"],
+        patterns=[r"\bopen\s+(?:google\s+drive\s+)?(?:file|doc|sheet|folder)\b"],
+        extractor="gdrive_open",
+        examples=["open the Q4 report in Google Drive", "open my budget spreadsheet"],
+        slots={"query": "file name or query"},
+    ),
+
+    "gdrive.create": Intent(
+        id="gdrive.create",
+        op="gdrive_create",
+        domain="document",
+        description="Create a new file in Google Drive",
+        signals=["create google doc", "new google doc", "create google sheet",
+                 "new spreadsheet in drive", "create drive folder",
+                 "new google slides", "make a google doc"],
+        patterns=[r"\b(?:create|new|make)\s+(?:a\s+)?(?:google\s+)?(?:doc|sheet|slide|spreadsheet|presentation|folder)\b"],
+        extractor="gdrive_create",
+        examples=["create a new Google Doc for meeting notes", "make a Google Sheet for the budget"],
+        slots={"name": "file name", "mimeType": "file type"},
+    ),
+
+    "gdrive.share": Intent(
+        id="gdrive.share",
+        op="gdrive_share",
+        domain="document",
+        description="Share a Google Drive file",
+        signals=["share google drive file", "share drive file with",
+                 "share the doc with", "share the sheet with"],
+        patterns=[r"\bshare\s+(?:google\s+drive\s+)?(?:file|doc|sheet|folder)\b"],
+        extractor="gdrive_share",
+        examples=["share the Q4 report with sarah@example.com"],
+        slots={"query": "file name", "email": "recipient email"},
     ),
 
     # ── Email ─────────────────────────────────────────────────────────────
@@ -9391,6 +9587,43 @@ TAXONOMY: dict[str, Intent] = {
         extractor="health_hrv",
         examples=["what's my HRV today", "show my readiness score",
                   "body battery level"],
+        slots={},
+    ),
+    # ── Genome Mesh / Network ─────────────────────────────────────────────────
+    "network.view": Intent(
+        id="network.view",
+        op="network_view",
+        domain="network",
+        description="Show Genome mesh networks and community messages",
+        signals=["local network", "local mesh", "genome mesh", "mesh network",
+                 "network messages", "community feed", "neighborhood network",
+                 "public mesh", "nearby mesh", "local community", "mesh feed",
+                 "public network", "genome network", "who's on the mesh",
+                 "local alerts", "local broadcasts"],
+        blockers=["wifi", "internet", "vpn", "bluetooth", "network connection",
+                  "network speed", "connect to"],
+        extractor="generic",
+        examples=["show local mesh", "what's on the network",
+                  "Genome mesh messages", "local community feed"],
+    ),
+
+    # ── Connections management ─────────────────────────────────────────────────
+    "connections_manage": Intent(
+        id="connections_manage",
+        op="connections_status",
+        domain="connectors",
+        description="Show and manage connected services (Spotify, Gmail, Slack, etc.)",
+        signals=["connections", "connected apps", "connected services", "integrations",
+                 "manage connections", "connect spotify", "connect gmail",
+                 "connect slack", "connect calendar", "connect drive",
+                 "link spotify", "link gmail", "link slack",
+                 "disconnect spotify", "disconnect gmail", "disconnect slack",
+                 "my integrations", "services connected", "what's connected"],
+        blockers=["internet connection", "wifi connection", "network connection",
+                  "bluetooth connection", "vpn connection"],
+        extractor="connections_manage",
+        examples=["show my connections", "manage connected apps",
+                  "connect Spotify", "what services are connected"],
         slots={},
     ),
 }

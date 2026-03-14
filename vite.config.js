@@ -16,10 +16,10 @@ export default defineConfig({
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self' 'unsafe-inline'",
-        // ESPN CDN for team logos / venue photos; blob: for canvas exports
-        "img-src 'self' data: blob: https://a.espncdn.com https://a1.espncdn.com https://a2.espncdn.com https://a3.espncdn.com https://a4.espncdn.com",
+        // ESPN CDN for team logos / venue photos; Simple Icons CDN for brand logos; blob: for canvas exports
+        "img-src 'self' data: blob: https://a.espncdn.com https://a1.espncdn.com https://a2.espncdn.com https://a3.espncdn.com https://a4.espncdn.com https://cdn.simpleicons.org",
         // WebSocket + backend ports used in dev
-        "connect-src 'self' ws://localhost:5173 ws://localhost:7700 ws://localhost:8787 http://localhost:7700 http://localhost:8787",
+        "connect-src 'self' ws://localhost:5173 ws://localhost:8787 http://localhost:8787",
         "font-src 'self'",
         "object-src 'none'",
         "base-uri 'self'",
@@ -29,16 +29,40 @@ export default defineConfig({
     },
     proxy: {
       '/ws': {
-        target: 'ws://localhost:7700',
+        target: 'ws://localhost:8787',
         ws: true
+      },
+      // Turn requests go direct to backend — rule-based classifier handles intent,
+      // no Nous round-trip needed for latency-critical path
+      '/api/turn': {
+        target: 'http://localhost:8787',
+        changeOrigin: true
       },
       // Auth endpoints bypass Nous — credentials never touch the gateway
       '/api/auth': {
         target: 'http://localhost:8787',
         changeOrigin: true
       },
+      // OAuth callbacks bypass Nous — token exchange goes direct to backend
+      '/api/connectors/oauth': {
+        target: 'http://localhost:8787',
+        changeOrigin: true
+      },
+      // Session, status, connectors all live on backend
+      '/api/session': {
+        target: 'http://localhost:8787',
+        changeOrigin: true
+      },
+      '/api/status': {
+        target: 'http://localhost:8787',
+        changeOrigin: true
+      },
+      '/api/connectors': {
+        target: 'http://localhost:8787',
+        changeOrigin: true
+      },
       '/api': {
-        target: 'http://localhost:7700',
+        target: 'http://localhost:8787',
         changeOrigin: true
       }
     }

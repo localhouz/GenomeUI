@@ -15,22 +15,27 @@ import pathlib
 import re
 import secrets
 import time as _time
+import sqlite3 as _sqlite3
 import uuid
 from collections import deque
 
 _log = logging.getLogger("genomeui")
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlencode, urlparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from .semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY, extract_slots_for_op, classify_async  # noqa: F401 (re-exported for callers)
 from . import auth as _auth
+from . import nous_loader as _nous
+from .mesh_bridge import mesh_bridge as _mesh
+from . import identity as _identity
+from . import geolocation as _geo
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="GenomeUI Backend", version="1.0.0")
@@ -52,12 +57,56 @@ OLLAMA_MODEL_SMALL = os.getenv("OLLAMA_MODEL_SMALL", "")
 OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
 STORE_PATH = pathlib.Path(os.getenv("GENOMEUI_STORE_PATH", "backend/data/sessions.json"))
 CONNECTOR_VAULT_PATH = pathlib.Path(os.getenv("GENOMEUI_CONNECTOR_VAULT_PATH", "backend/data/connector_vault.json"))
+CONTENT_STORE_PATH = pathlib.Path(os.getenv("GENOMEUI_CONTENT_STORE_PATH", "backend/data/content_store.db"))
 MCP_CONFIG_PATH = pathlib.Path(os.getenv("GENOMEUI_MCP_CONFIG_PATH", ".mcp.json"))
 CONNECTOR_VAULT_KEY = os.getenv("GENOMEUI_CONNECTOR_VAULT_KEY", "genomeui-local-dev-key")
 CONNECTOR_PROVIDER_MODE = str(os.getenv("GENOMEUI_CONNECTOR_PROVIDER_MODE", "auto")).strip().lower()
 BANKING_PROVIDER_MODE = str(os.getenv("GENOMEUI_BANKING_PROVIDER_MODE", "scaffold")).strip().lower()
 SOCIAL_PROVIDER_MODE = str(os.getenv("GENOMEUI_SOCIAL_PROVIDER_MODE", "scaffold")).strip().lower()
 WEB_PROVIDER_MODE = str(os.getenv("GENOMEUI_WEB_PROVIDER_MODE", "scaffold")).strip().lower()
+# ── Bluesky (AT Protocol social connector) ──────────────────────────────────────
+BLUESKY_HANDLE = str(os.getenv("BLUESKY_HANDLE", "")).strip()
+BLUESKY_APP_PASSWORD = str(os.getenv("BLUESKY_APP_PASSWORD", "")).strip()
+BLUESKY_PDS = str(os.getenv("BLUESKY_PDS", "https://bsky.social")).rstrip("/")
+# ── OAuth connector provider modes ─────────────────────────────────────────────
+SPOTIFY_PROVIDER_MODE = str(os.getenv("SPOTIFY_PROVIDER_MODE", "scaffold")).strip().lower()
+GMAIL_PROVIDER_MODE = str(os.getenv("GMAIL_PROVIDER_MODE", "scaffold")).strip().lower()
+GCAL_PROVIDER_MODE = str(os.getenv("GCAL_PROVIDER_MODE", "scaffold")).strip().lower()
+GDRIVE_PROVIDER_MODE = str(os.getenv("GDRIVE_PROVIDER_MODE", "scaffold")).strip().lower()
+SLACK_PROVIDER_MODE = str(os.getenv("SLACK_PROVIDER_MODE", "scaffold")).strip().lower()
+PLAID_PROVIDER_MODE = str(os.getenv("PLAID_PROVIDER_MODE", "scaffold")).strip().lower()
+# ── OAuth client credentials (set in environment when ready for live mode) ──────
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET", "")
+GCAL_CLIENT_ID = os.getenv("GCAL_CLIENT_ID", "")
+GCAL_CLIENT_SECRET = os.getenv("GCAL_CLIENT_SECRET", "")
+GDRIVE_CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID", "")
+GDRIVE_CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET", "")
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID", "")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
+PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID", "")
+PLAID_SECRET = os.getenv("PLAID_SECRET", "")
+PLAID_ENV = os.getenv("PLAID_ENV", "sandbox")  # sandbox | development | production
+GITHUB_PROVIDER_MODE = str(os.getenv("GITHUB_PROVIDER_MODE", "scaffold")).strip().lower()
+JIRA_PROVIDER_MODE = str(os.getenv("JIRA_PROVIDER_MODE", "scaffold")).strip().lower()
+NOTION_PROVIDER_MODE = str(os.getenv("NOTION_PROVIDER_MODE", "scaffold")).strip().lower()
+ASANA_PROVIDER_MODE = str(os.getenv("ASANA_PROVIDER_MODE", "scaffold")).strip().lower()
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
+JIRA_CLIENT_ID = os.getenv("JIRA_CLIENT_ID", "")
+JIRA_CLIENT_SECRET = os.getenv("JIRA_CLIENT_SECRET", "")
+NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID", "")
+NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET", "")
+ASANA_CLIENT_ID = os.getenv("ASANA_CLIENT_ID", "")
+ASANA_CLIENT_SECRET = os.getenv("ASANA_CLIENT_SECRET", "")
+OAUTH_REDIRECT_BASE = os.getenv("OAUTH_REDIRECT_BASE", "http://localhost:5173")
+# ── Twilio (PSTN bridge) ─────────────────────────────────────────────────────
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+GENOME_TELEPHONY_WEBHOOK_URL = os.getenv("GENOME_TELEPHONY_WEBHOOK_URL", "")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TURN_LATENCY_BUDGET_MS = int(os.getenv("TURN_LATENCY_BUDGET_MS", "800"))
 SLO_BREACH_STREAK_FOR_THROTTLE = int(os.getenv("SLO_BREACH_STREAK_FOR_THROTTLE", "3"))
@@ -128,6 +177,19 @@ CONNECTOR_MANIFESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "id": "twilio.voice",
+        "version": "1.0.0",
+        "domain": "telephony",
+        "provider": "twilio",
+        "auth": "api_key",
+        "scopes": ["telephony.call.start", "telephony.call.receive"],
+        "riskMap": {"telephony.call.start": "high", "telephony.call.receive": "medium"},
+        "deviceProfiles": {
+            "telephony.call.start": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "telephony.call.receive": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    {
         "id": "banking.read",
         "version": "0.1.0",
         "domain": "bank",
@@ -156,6 +218,146 @@ CONNECTOR_MANIFESTS: list[dict[str, Any]] = [
             "social.feed.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
             "social.message.send": {"desktop": "partial", "mobile": "partial", "fallback": "confirm_in_provider"},
         },
+    },
+    {
+        "id": "social.bluesky",
+        "version": "1.0.0",
+        "domain": "social",
+        "provider": "bluesky",
+        "auth": "app_password",
+        "scopes": [
+            "social.feed.read", "social.message.send", "social.dm.send",
+            "social.profile.read", "social.react", "social.comment",
+            "social.follow", "social.notifications.read", "social.trending.read",
+        ],
+        "riskMap": {
+            "social.feed.read": "low",
+            "social.message.send": "medium",
+            "social.dm.send": "medium",
+            "social.profile.read": "low",
+            "social.react": "low",
+            "social.comment": "medium",
+            "social.follow": "medium",
+            "social.notifications.read": "low",
+            "social.trending.read": "low",
+        },
+        "deviceProfiles": {
+            "social.feed.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.message.send": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.dm.send": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.profile.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.react": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.comment": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.follow": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.notifications.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+            "social.trending.read": {"desktop": "full", "mobile": "full", "fallback": "none"},
+        },
+    },
+    # ── OAuth connectors ──────────────────────────────────────────────────────
+    {
+        "id": "spotify",
+        "version": "1.0.0",
+        "domain": "music",
+        "provider": "spotify",
+        "auth": "oauth2_pkce",
+        "scopes": ["user-read-playback-state", "user-modify-playback-state", "user-read-recently-played", "playlist-read-private"],
+        "riskMap": {"spotify.now_playing": "low", "spotify.play": "medium", "spotify.pause": "medium",
+                    "spotify.next": "medium", "spotify.prev": "medium", "spotify.volume": "medium", "spotify.queue": "low"},
+        "deviceProfiles": {"spotify.now_playing": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "gmail",
+        "version": "1.0.0",
+        "domain": "email",
+        "provider": "google",
+        "auth": "oauth2_pkce",
+        "scopes": ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/gmail.modify"],
+        "riskMap": {"gmail.list": "low", "gmail.read": "low", "gmail.send": "high", "gmail.search": "low", "gmail.trash": "medium"},
+        "deviceProfiles": {"gmail.list": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "gcal",
+        "version": "1.0.0",
+        "domain": "calendar",
+        "provider": "google",
+        "auth": "oauth2_pkce",
+        "scopes": ["https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events"],
+        "riskMap": {"gcal.list": "low", "gcal.create": "medium", "gcal.update": "medium", "gcal.delete": "high"},
+        "deviceProfiles": {"gcal.list": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "gdrive",
+        "version": "1.0.0",
+        "domain": "document",
+        "provider": "google",
+        "auth": "oauth2_pkce",
+        "scopes": ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/drive.file"],
+        "riskMap": {"gdrive.list": "low", "gdrive.open": "low", "gdrive.create": "medium", "gdrive.share": "high"},
+        "deviceProfiles": {"gdrive.list": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "slack",
+        "version": "1.0.0",
+        "domain": "messaging",
+        "provider": "slack",
+        "auth": "oauth2_pkce",
+        "scopes": ["channels:read", "channels:history", "chat:write", "users:read"],
+        "riskMap": {"slack.list_channels": "low", "slack.read": "low", "slack.send": "medium"},
+        "deviceProfiles": {"slack.list_channels": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "plaid",
+        "version": "1.0.0",
+        "domain": "banking",
+        "provider": "plaid",
+        "auth": "plaid_link",
+        "scopes": ["transactions", "accounts", "identity"],
+        "riskMap": {"plaid.link_token": "low", "plaid.exchange": "medium"},
+        "deviceProfiles": {"plaid.link_token": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "github",
+        "version": "1.0.0",
+        "domain": "developer",
+        "provider": "github",
+        "auth": "oauth2_pkce",
+        "scopes": ["repo", "user:email", "read:org"],
+        "riskMap": {"github.pr_view": "low", "github.issue_view": "low", "github.issue_create": "medium",
+                    "github.code_review": "low", "github.push_notify": "low"},
+        "deviceProfiles": {"github.pr_view": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "jira",
+        "version": "1.0.0",
+        "domain": "project",
+        "provider": "atlassian",
+        "auth": "oauth2_pkce",
+        "scopes": ["read:jira-work", "write:jira-work", "offline_access"],
+        "riskMap": {"jira.my_issues": "low", "jira.sprint": "low", "jira.view": "low",
+                    "jira.create": "medium", "jira.update": "medium"},
+        "deviceProfiles": {"jira.my_issues": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "notion",
+        "version": "1.0.0",
+        "domain": "productivity",
+        "provider": "notion",
+        "auth": "oauth2_pkce",
+        "scopes": [],
+        "riskMap": {"notion.search": "low", "notion.list_databases": "low",
+                    "notion.create_page": "medium", "notion.update_page": "medium"},
+        "deviceProfiles": {"notion.search": {"desktop": "full", "mobile": "full", "fallback": "none"}},
+    },
+    {
+        "id": "asana",
+        "version": "1.0.0",
+        "domain": "project",
+        "provider": "asana",
+        "auth": "oauth2_pkce",
+        "scopes": ["default"],
+        "riskMap": {"asana.my_tasks": "low", "asana.list_projects": "low",
+                    "asana.create_task": "medium", "asana.update_task": "medium"},
+        "deviceProfiles": {"asana.my_tasks": {"desktop": "full", "mobile": "full", "fallback": "none"}},
     },
 ]
 CONNECTOR_ADAPTER_CONTRACTS: dict[str, Any] = {
@@ -279,7 +481,7 @@ class _RateLimiter:
         self._lock = __import__("threading").Lock()
 
     def is_allowed(self, key: str) -> bool:
-        now = time.time()
+        now = _time.time()
         cutoff = now - self._period
         with self._lock:
             calls = self._buckets.get(key, [])
@@ -311,6 +513,10 @@ class TurnBody(BaseModel):
     # Pre-classification from Nous AI gateway.  When present with confidence ≥ 0.6
     # the NLU (semantics.py) is bypassed entirely and the op/slots are used directly.
     nousIntent: dict[str, Any] | None = None
+    # Confirmed: set to True when the user has approved a high-risk confirm gate.
+    confirmed: bool = False
+    # Active surface content forwarded from the frontend editor.
+    activeContent: dict[str, Any] | None = None
 
 
 class HandoffStartBody(BaseModel):
@@ -409,6 +615,10 @@ class SessionState:
 
 SESSIONS: dict[str, SessionState] = {}
 SCHEDULER_TASK: asyncio.Task | None = None
+
+# ── Twilio call state machine ─────────────────────────────────────────────────
+# keyed by Twilio Call SID → {state, to, from_, contactName, startedAt, sessionId}
+_CALL_STATES: dict[str, dict[str, Any]] = {}
 STORE_LOCK = asyncio.Lock()
 SIMULATE_PERSIST_FAILURE = False
 CONNECTOR_VAULT_LOCK = asyncio.Lock()
@@ -978,6 +1188,89 @@ def persist_connector_vault_to_disk_sync() -> bool:
         return False
 
 
+# ── Content Store (git-style, SQLite) ──────────────────────────────────────────
+
+def _content_db() -> _sqlite3.Connection:
+    """Return a SQLite connection to the content store, initialising schema on first use."""
+    CONTENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = _sqlite3.connect(str(CONTENT_STORE_PATH), check_same_thread=False)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_objects (
+            hash       TEXT PRIMARY KEY,
+            delta_from TEXT REFERENCES content_objects(hash),
+            delta_data TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_heads (
+            name       TEXT NOT NULL,
+            domain     TEXT NOT NULL,
+            hash       TEXT NOT NULL REFERENCES content_objects(hash),
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (name, domain)
+        )""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_heads_domain ON content_heads(domain, updated_at DESC)")
+    con.commit()
+    return con
+
+
+def content_commit(domain: str, name: str, data: str | dict[str, Any]) -> str:
+    """Persist a new version of content. Returns sha256 hash of the stored data."""
+    raw = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    now = _time.time()
+    with _content_db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO content_objects (hash, delta_from, delta_data, created_at) VALUES (?, NULL, ?, ?)",
+            (h, raw, now),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO content_heads (name, domain, hash, updated_at) VALUES (?, ?, ?, ?)",
+            (name, domain, h, now),
+        )
+    return h
+
+
+def content_load(domain: str, name: str) -> dict[str, Any] | None:
+    """Load the current version of a named content item. Returns None if not found."""
+    con = _content_db()
+    row = con.execute(
+        "SELECT o.delta_data, h.updated_at FROM content_heads h "
+        "JOIN content_objects o ON h.hash = o.hash "
+        "WHERE h.name = ? AND h.domain = ?",
+        (name, domain),
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    raw, updated_at = row
+    try:
+        data: Any = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        data = raw
+    return {"name": name, "domain": domain, "data": data, "updated_at": updated_at}
+
+
+def content_list(domain: str) -> list[dict[str, Any]]:
+    """List all content heads for a domain, newest first."""
+    con = _content_db()
+    rows = con.execute(
+        "SELECT name, updated_at FROM content_heads WHERE domain = ? ORDER BY updated_at DESC",
+        (domain,),
+    ).fetchall()
+    con.close()
+    return [{"name": r[0], "domain": domain, "updated_at": r[1]} for r in rows]
+
+
+def content_delete(domain: str, name: str) -> bool:
+    """Remove a content head (objects remain for history). Returns True if deleted."""
+    with _content_db() as con:
+        cur = con.execute(
+            "DELETE FROM content_heads WHERE name = ? AND domain = ?", (name, domain)
+        )
+    return cur.rowcount > 0
+
+
 # ── MCP Server Registry ────────────────────────────────────────────────────────
 
 def is_safe_mcp_url(url: str) -> tuple[bool, str]:
@@ -1511,6 +1804,83 @@ def provider_client_json_request(
         return False, {}, "request_failed"
 
 
+# ── OAuth PKCE helpers ──────────────────────────────────────────────────────────
+
+def _pkce_pair() -> tuple[str, str]:
+    """Generate a PKCE code_verifier / code_challenge pair (S256)."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+# In-memory PKCE state store: state_token → {verifier, service, redirect_uri}
+_PKCE_STATE: dict[str, dict[str, str]] = {}
+
+
+def _oauth_token_refresh(
+    service: str,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any] | None:
+    """Refresh an expired OAuth token and persist the updated token in the vault."""
+    tok = _auth.vault_retrieve(service)
+    if not tok or not tok.get("refresh_token"):
+        return None
+    try:
+        resp = httpx.post(
+            token_url,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tok["refresh_token"],
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        tok["access_token"] = data["access_token"]
+        tok["expires_at"] = _time.time() + float(data.get("expires_in", 3600))
+        if "refresh_token" in data:
+            tok["refresh_token"] = data["refresh_token"]
+        _auth.vault_store(service, tok)
+        return tok
+    except Exception:
+        return None
+
+
+def _get_live_token(
+    service: str,
+    token_url: str | None,
+    client_id: str | None,
+    client_secret: str | None,
+) -> str | None:
+    """Return a valid access token for a service, refreshing if within 60 s of expiry."""
+    tok = _auth.vault_retrieve(service)
+    if not tok:
+        return None
+    expires_at = float(tok.get("expires_at", 0))
+    # Refresh if expiring soon (or no expiry info and token_url provided)
+    if token_url and client_id and client_secret and _time.time() > expires_at - 60:
+        tok = _oauth_token_refresh(service, token_url, client_id, client_secret)
+    if not tok:
+        return None
+    return str(tok.get("access_token", "")) or None
+
+
+def _effective_mode(service: str, configured_mode: str) -> str:
+    """Return 'live' if vault already holds a token for this service (auto-detect),
+    otherwise fall back to the configured mode (scaffold/mock/live)."""
+    mode = normalize_connector_service_mode(configured_mode, default="scaffold")
+    if mode != "live" and _auth.vault_retrieve(service):
+        return "live"
+    return mode
+
+
 def banking_balance_snapshot(provider_mode: str | None = None) -> dict[str, Any]:
     mode = normalize_connector_service_mode(provider_mode or BANKING_PROVIDER_MODE, default="scaffold")
     if mode == "live":
@@ -1656,6 +2026,429 @@ def social_send_snapshot(text: str, provider_mode: str | None = None) -> dict[st
         "delivery": "queued",
         "message": trimmed,
     }
+
+
+# ── Bluesky (AT Protocol) connector ────────────────────────────────────────────
+
+# In-memory session cache; keyed by handle
+_BLUESKY_SESSION: dict[str, Any] = {}
+
+
+def _bsky_session() -> tuple[str, str, str]:
+    """Return (did, access_jwt, handle) — from cache, vault, or fresh login.
+    Raises RuntimeError if not connected.
+    """
+    import time as _bsky_time
+    cached = _BLUESKY_SESSION
+    if cached.get("access_jwt") and cached.get("expires_at", 0) > _bsky_time.time() + 60:
+        return cached["did"], cached["access_jwt"], cached["handle"]
+
+    creds = _auth.vault_retrieve("bluesky") or {}
+    handle = str(creds.get("handle") or BLUESKY_HANDLE).strip()
+    app_password = str(creds.get("app_password") or BLUESKY_APP_PASSWORD).strip()
+    pds = str(creds.get("pds") or BLUESKY_PDS).rstrip("/")
+
+    if not handle or not app_password:
+        raise RuntimeError("Bluesky not connected — use: connect bluesky")
+
+    resp = httpx.post(
+        f"{pds}/xrpc/com.atproto.server.createSession",
+        json={"identifier": handle, "password": app_password},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bluesky login failed: {resp.text[:120]}")
+    data = resp.json()
+    _BLUESKY_SESSION.update({
+        "did": data["did"],
+        "handle": data["handle"],
+        "access_jwt": data["accessJwt"],
+        "refresh_jwt": data.get("refreshJwt", ""),
+        "pds": pds,
+        "expires_at": _bsky_time.time() + 7000,  # ~2h
+    })
+    return data["did"], data["accessJwt"], data["handle"]
+
+
+def _bsky_get(path: str, params: dict | None = None) -> dict[str, Any]:
+    did, jwt, _ = _bsky_session()
+    pds = _BLUESKY_SESSION.get("pds", BLUESKY_PDS)
+    r = httpx.get(
+        f"{pds}/xrpc/{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {jwt}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _bsky_post(path: str, body: dict) -> dict[str, Any]:
+    did, jwt, _ = _bsky_session()
+    pds = _BLUESKY_SESSION.get("pds", BLUESKY_PDS)
+    r = httpx.post(
+        f"{pds}/xrpc/{path}",
+        json=body,
+        headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def bluesky_feed_snapshot() -> dict[str, Any]:
+    """Fetch Bluesky home timeline."""
+    try:
+        data = _bsky_get("app.bsky.feed.getTimeline", {"limit": 20})
+        items = []
+        for entry in data.get("feed", []):
+            post = entry.get("post", {})
+            author = post.get("author", {})
+            record = post.get("record", {})
+            items.append({
+                "id": str(post.get("uri", "")),
+                "author": str(author.get("displayName") or author.get("handle", "")),
+                "handle": str(author.get("handle", "")),
+                "summary": str(record.get("text", ""))[:200],
+                "age": "",
+                "likes": int(post.get("likeCount", 0)),
+                "replies": int(post.get("replyCount", 0)),
+                "reposts": int(post.get("repostCount", 0)),
+                "uri": str(post.get("uri", "")),
+                "cid": str(post.get("cid", "")),
+            })
+        return {"ok": True, "source": "bluesky", "items": items}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": f"Feed unavailable: {e}"}
+
+
+def bluesky_post_snapshot(text: str) -> dict[str, Any]:
+    """Create a Bluesky post."""
+    import datetime as _dt
+    try:
+        did, _, _ = _bsky_session()
+        result = _bsky_post("com.atproto.repo.createRecord", {
+            "repo": did,
+            "collection": "app.bsky.feed.post",
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": text[:300],
+                "createdAt": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            },
+        })
+        return {"ok": True, "source": "bluesky", "delivery": "sent", "uri": result.get("uri", "")}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_notifications_snapshot() -> dict[str, Any]:
+    """Fetch Bluesky notifications."""
+    try:
+        data = _bsky_get("app.bsky.notification.listNotifications", {"limit": 20})
+        items = []
+        for n in data.get("notifications", []):
+            author = n.get("author", {})
+            record = n.get("record", {})
+            items.append({
+                "reason": str(n.get("reason", "")),
+                "author": str(author.get("displayName") or author.get("handle", "")),
+                "handle": str(author.get("handle", "")),
+                "text": str(record.get("text", ""))[:140],
+                "read": bool(n.get("isRead", False)),
+                "uri": str(n.get("uri", "")),
+            })
+        unread = sum(1 for i in items if not i["read"])
+        return {"ok": True, "source": "bluesky", "items": items, "unread": unread}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_trending_snapshot() -> dict[str, Any]:
+    """Fetch Bluesky trending topics."""
+    try:
+        data = _bsky_get("app.bsky.unspecced.getTrendingTopics", {"limit": 20})
+        topics = []
+        for t in data.get("topics", []):
+            topics.append({
+                "topic": str(t.get("topic") or t.get("displayName", "")),
+                "link": str(t.get("link", "")),
+            })
+        return {"ok": True, "source": "bluesky", "topics": topics}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_profile_snapshot(actor: str) -> dict[str, Any]:
+    """Fetch a Bluesky profile."""
+    try:
+        if not actor:
+            _, _, handle = _bsky_session()
+            actor = handle
+        data = _bsky_get("app.bsky.actor.getProfile", {"actor": actor})
+        return {
+            "ok": True,
+            "source": "bluesky",
+            "did": str(data.get("did", "")),
+            "handle": str(data.get("handle", "")),
+            "displayName": str(data.get("displayName", "")),
+            "description": str(data.get("description", ""))[:300],
+            "followersCount": int(data.get("followersCount", 0)),
+            "followsCount": int(data.get("followsCount", 0)),
+            "postsCount": int(data.get("postsCount", 0)),
+            "avatar": str(data.get("avatar", "")),
+        }
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_follow_snapshot(actor: str, unfollow: bool = False) -> dict[str, Any]:
+    """Follow or unfollow a Bluesky account."""
+    import datetime as _dt
+    try:
+        did, _, _ = _bsky_session()
+        # Resolve actor to DID if it's a handle
+        if not actor.startswith("did:"):
+            prof = _bsky_get("app.bsky.actor.getProfile", {"actor": actor})
+            target_did = str(prof.get("did", ""))
+        else:
+            target_did = actor
+        if not target_did:
+            return {"ok": False, "source": "bluesky", "error": "Could not resolve actor."}
+        if unfollow:
+            # Find existing follow record
+            follows = _bsky_get("app.bsky.graph.getFollows", {"actor": did, "limit": 100})
+            rkey = None
+            for f in follows.get("follows", []):
+                if f.get("did") == target_did:
+                    rkey = str(f.get("viewer", {}).get("followedBy", "") or "").split("/")[-1]
+                    break
+            if rkey:
+                _bsky_post("com.atproto.repo.deleteRecord", {
+                    "repo": did, "collection": "app.bsky.graph.follow", "rkey": rkey,
+                })
+            return {"ok": True, "source": "bluesky", "action": "unfollowed", "actor": actor}
+        else:
+            _bsky_post("com.atproto.repo.createRecord", {
+                "repo": did,
+                "collection": "app.bsky.graph.follow",
+                "record": {
+                    "$type": "app.bsky.graph.follow",
+                    "subject": target_did,
+                    "createdAt": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                },
+            })
+            return {"ok": True, "source": "bluesky", "action": "followed", "actor": actor}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_like_snapshot(uri: str, cid: str) -> dict[str, Any]:
+    """Like a Bluesky post."""
+    import datetime as _dt
+    try:
+        did, _, _ = _bsky_session()
+        _bsky_post("com.atproto.repo.createRecord", {
+            "repo": did,
+            "collection": "app.bsky.feed.like",
+            "record": {
+                "$type": "app.bsky.feed.like",
+                "subject": {"uri": uri, "cid": cid},
+                "createdAt": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            },
+        })
+        return {"ok": True, "source": "bluesky", "action": "liked", "uri": uri}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_reply_snapshot(uri: str, cid: str, text: str) -> dict[str, Any]:
+    """Reply to a Bluesky post."""
+    import datetime as _dt
+    try:
+        did, _, _ = _bsky_session()
+        _bsky_post("com.atproto.repo.createRecord", {
+            "repo": did,
+            "collection": "app.bsky.feed.post",
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": text[:300],
+                "reply": {"root": {"uri": uri, "cid": cid}, "parent": {"uri": uri, "cid": cid}},
+                "createdAt": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            },
+        })
+        return {"ok": True, "source": "bluesky", "action": "replied", "uri": uri}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+def bluesky_dm_snapshot(recipient: str, text: str) -> dict[str, Any]:
+    """Send a DM to a Bluesky user via the chat.bsky.convo API."""
+    try:
+        did, _, _ = _bsky_session()
+        pds = _BLUESKY_SESSION.get("pds", BLUESKY_PDS)
+        # Resolve recipient DID
+        prof_data = _bsky_get("app.bsky.actor.getProfile", {"actor": recipient})
+        recipient_did = str(prof_data.get("did", "")).strip()
+        if not recipient_did:
+            return {"ok": False, "source": "bluesky", "error": f"Could not resolve recipient: {recipient}"}
+        # Get or create convo
+        convo_data = _bsky_post("chat.bsky.convo.getConvoForMembers", {"members": [did, recipient_did]})
+        convo_id = str(convo_data.get("convo", {}).get("id", "")).strip()
+        if not convo_id:
+            return {"ok": False, "source": "bluesky", "error": "Could not create DM conversation."}
+        # Send message
+        _bsky_post("chat.bsky.convo.sendMessage", {
+            "convoId": convo_id,
+            "message": {"$type": "chat.bsky.convo.defs#messageInput", "text": text[:1000]},
+        })
+        return {"ok": True, "source": "bluesky", "action": "dm_sent", "recipient": recipient, "convoId": convo_id}
+    except RuntimeError as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "source": "bluesky", "error": str(e)}
+
+
+# ── Dictionary / Reference helpers ────────────────────────────────────────────
+
+def _dict_lookup(word: str) -> dict[str, Any]:
+    """Fetch definition + phonetic + etymology from dictionaryapi.dev."""
+    try:
+        import httpx
+        r = httpx.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word.strip()}", timeout=6)
+        if r.status_code != 200:
+            return {"ok": False, "word": word, "error": f"not found ({r.status_code})"}
+        data = r.json()
+        entry = data[0] if data else {}
+        phonetic = str(entry.get("phonetic", ""))
+        origin = str(entry.get("origin", ""))
+        meanings = []
+        for m in entry.get("meanings", [])[:3]:
+            pos = str(m.get("partOfSpeech", ""))
+            defs = [str(d.get("definition", "")) for d in m.get("definitions", [])[:2]]
+            examples = [str(d.get("example", "")) for d in m.get("definitions", [])[:2] if d.get("example")]
+            meanings.append({"pos": pos, "definitions": defs, "examples": examples})
+        return {"ok": True, "word": word, "phonetic": phonetic, "origin": origin, "meanings": meanings}
+    except Exception as e:
+        return {"ok": False, "word": word, "error": str(e)}
+
+
+def _thesaurus_lookup(word: str) -> dict[str, Any]:
+    """Fetch synonyms + antonyms from Datamuse API."""
+    try:
+        import httpx
+        syn_r = httpx.get(f"https://api.datamuse.com/words?rel_syn={word.strip()}&max=15", timeout=6)
+        ant_r = httpx.get(f"https://api.datamuse.com/words?rel_ant={word.strip()}&max=8", timeout=6)
+        synonyms = [w["word"] for w in (syn_r.json() if syn_r.status_code == 200 else [])]
+        antonyms = [w["word"] for w in (ant_r.json() if ant_r.status_code == 200 else [])]
+        return {"ok": True, "word": word, "synonyms": synonyms, "antonyms": antonyms}
+    except Exception as e:
+        return {"ok": False, "word": word, "error": str(e)}
+
+
+def _wiki_lookup(query: str) -> dict[str, Any]:
+    """Fetch Wikipedia summary for a query."""
+    try:
+        import httpx, urllib.parse
+        title = urllib.parse.quote(query.strip().replace(" ", "_"))
+        r = httpx.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}",
+            headers={"Accept": "application/json"},
+            timeout=6,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "query": query, "error": f"not found ({r.status_code})"}
+        d = r.json()
+        return {
+            "ok": True,
+            "title": str(d.get("title", query)),
+            "description": str(d.get("description", "")),
+            "extract": str(d.get("extract", ""))[:800],
+            "thumbnail": str((d.get("thumbnail") or {}).get("source", "")),
+            "url": str(d.get("content_urls", {}).get("desktop", {}).get("page", "")),
+        }
+    except Exception as e:
+        return {"ok": False, "query": query, "error": str(e)}
+
+
+# ── Currency helper ────────────────────────────────────────────────────────────
+
+def _currency_fetch(base: str = "USD") -> dict[str, Any]:
+    """Fetch live exchange rates from open.er-api.com (free, no auth)."""
+    try:
+        import httpx
+        r = httpx.get(f"https://open.er-api.com/v6/latest/{base.upper()}", timeout=6)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"rates unavailable ({r.status_code})"}
+        d = r.json()
+        if d.get("result") != "success":
+            return {"ok": False, "error": d.get("error-type", "unknown")}
+        return {"ok": True, "base": str(d.get("base_code", base)), "rates": d.get("rates", {}), "time_last_update": str(d.get("time_last_update_utc", ""))}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── Unit conversion (pure computation) ────────────────────────────────────────
+
+_UNIT_TABLE: dict[str, dict[str, float]] = {
+    # to base: meters
+    "length": {"mm": 0.001, "cm": 0.01, "m": 1, "km": 1000, "in": 0.0254, "ft": 0.3048, "yd": 0.9144, "mi": 1609.344},
+    # to base: grams
+    "mass":   {"mg": 0.001, "g": 1, "kg": 1000, "oz": 28.3495, "lb": 453.592, "ton": 907185},
+    # to base: liters
+    "volume": {"ml": 0.001, "l": 1, "fl_oz": 0.0295735, "cup": 0.236588, "pt": 0.473176, "qt": 0.946353, "gal": 3.78541},
+    # speed: to m/s
+    "speed":  {"m/s": 1, "km/h": 0.277778, "mph": 0.44704, "knot": 0.514444},
+    # area: to m²
+    "area":   {"cm2": 0.0001, "m2": 1, "km2": 1e6, "ft2": 0.092903, "mi2": 2.59e6, "acre": 4046.86},
+}
+
+def _unit_convert_compute(value: float, from_u: str, to_u: str) -> dict[str, Any]:
+    from_u = from_u.lower().strip().replace(" ", "")
+    to_u   = to_u.lower().strip().replace(" ", "")
+    # Temperature special case
+    if from_u in ("c", "celsius") or to_u in ("c", "celsius") or from_u in ("f", "fahrenheit") or to_u in ("f", "fahrenheit") or from_u == "k" or to_u == "k":
+        fc = {"c": "celsius", "celsius": "celsius", "f": "fahrenheit", "fahrenheit": "fahrenheit", "k": "kelvin", "kelvin": "kelvin"}
+        fn = fc.get(from_u, from_u)
+        tn = fc.get(to_u, to_u)
+        if fn == tn:
+            result = value
+        elif fn == "celsius" and tn == "fahrenheit":
+            result = value * 9 / 5 + 32
+        elif fn == "fahrenheit" and tn == "celsius":
+            result = (value - 32) * 5 / 9
+        elif fn == "celsius" and tn == "kelvin":
+            result = value + 273.15
+        elif fn == "kelvin" and tn == "celsius":
+            result = value - 273.15
+        elif fn == "fahrenheit" and tn == "kelvin":
+            result = (value - 32) * 5 / 9 + 273.15
+        elif fn == "kelvin" and tn == "fahrenheit":
+            result = (value - 273.15) * 9 / 5 + 32
+        else:
+            return {"ok": False, "error": f"unsupported temperature conversion: {from_u} → {to_u}"}
+        return {"ok": True, "value": value, "from": from_u, "to": to_u, "result": round(result, 6)}
+    for category, table in _UNIT_TABLE.items():
+        if from_u in table and to_u in table:
+            base = value * table[from_u]
+            result = base / table[to_u]
+            return {"ok": True, "value": value, "from": from_u, "to": to_u, "result": round(result, 6), "category": category}
+    return {"ok": False, "error": f"unknown units: {from_u} → {to_u}"}
 
 
 def web_fetch_snapshot(url: str, provider_mode: str | None = None) -> dict[str, Any]:
@@ -1909,6 +2702,531 @@ def contacts_lookup_snapshot(query: str = "") -> dict[str, Any]:
         if q in haystack:
             out.append({"name": name, "phone": phone, "label": label})
     return {"ok": True, "source": "scaffold", "items": out[:8]}
+
+
+# ── OAuth connector snapshots ───────────────────────────────────────────────────
+
+_SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+
+MOCK_SPOTIFY_NOW_PLAYING: dict[str, Any] = {
+    "track": "Bohemian Rhapsody",
+    "artist": "Queen",
+    "album": "A Night at the Opera",
+    "progress_ms": 127000,
+    "duration_ms": 354000,
+    "is_playing": True,
+    "album_art": "",
+}
+
+MOCK_GMAIL_MESSAGES: list[dict[str, Any]] = [
+    {"id": "msg1", "from": "alice@example.com", "subject": "Q4 Review", "snippet": "Please review the attached report...", "date": "2026-03-01", "unread": True},
+    {"id": "msg2", "from": "bob@example.com", "subject": "Lunch tomorrow?", "snippet": "Are you free around noon?", "date": "2026-02-28", "unread": False},
+    {"id": "msg3", "from": "carol@example.com", "subject": "Project update", "snippet": "Here is the latest status...", "date": "2026-02-27", "unread": True},
+]
+
+MOCK_GCAL_EVENTS: list[dict[str, Any]] = [
+    {"id": "evt1", "summary": "Team Standup", "start": "2026-03-02T09:00:00", "end": "2026-03-02T09:30:00", "location": ""},
+    {"id": "evt2", "summary": "Design Review", "start": "2026-03-03T14:00:00", "end": "2026-03-03T15:00:00", "location": "Conf Room B"},
+    {"id": "evt3", "summary": "1:1 with Manager", "start": "2026-03-04T11:00:00", "end": "2026-03-04T11:30:00", "location": ""},
+]
+
+MOCK_GDRIVE_FILES: list[dict[str, Any]] = [
+    {"id": "file1", "name": "Q4 Report.docx", "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "modifiedTime": "2026-02-20"},
+    {"id": "file2", "name": "Budget 2026.xlsx", "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "modifiedTime": "2026-02-15"},
+    {"id": "file3", "name": "Roadmap Q1.pptx", "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation", "modifiedTime": "2026-02-10"},
+]
+
+MOCK_SLACK_CHANNELS: list[dict[str, Any]] = [
+    {"id": "C001", "name": "general", "unread_count": 3, "is_private": False},
+    {"id": "C002", "name": "engineering", "unread_count": 7, "is_private": False},
+    {"id": "C003", "name": "design", "unread_count": 0, "is_private": False},
+    {"id": "C004", "name": "product", "unread_count": 2, "is_private": False},
+]
+
+MOCK_GITHUB_PRS: list[dict[str, Any]] = [
+    {"number": 42, "title": "Add OAuth connector for Slack", "state": "open",
+     "repo": "org/genomeui", "author": "steve", "created_at": "2026-03-01"},
+    {"number": 41, "title": "Fix semantic cache TTL for sports", "state": "open",
+     "repo": "org/genomeui", "author": "alice", "created_at": "2026-02-28"},
+    {"number": 39, "title": "Taxonomy wave-4 build-out", "state": "open",
+     "repo": "org/genomeui", "author": "bob", "created_at": "2026-02-25"},
+]
+
+MOCK_GITHUB_ISSUES: list[dict[str, Any]] = [
+    {"number": 88, "title": "Terminal surface breaks on Windows", "state": "open",
+     "repo": "org/genomeui", "author": "carol", "created_at": "2026-03-04"},
+    {"number": 87, "title": "Spreadsheet formula evaluator missing AVERAGE", "state": "open",
+     "repo": "org/genomeui", "author": "steve", "created_at": "2026-03-02"},
+]
+
+MOCK_JIRA_ISSUES: list[dict[str, Any]] = [
+    {"key": "PROJ-101", "summary": "Login button not responding on mobile",
+     "status": "In Progress", "priority": "High", "assignee": "Steve"},
+    {"key": "PROJ-102", "summary": "Add dark mode to settings page",
+     "status": "To Do", "priority": "Medium", "assignee": "Steve"},
+    {"key": "PROJ-103", "summary": "API rate limit exceeded in production",
+     "status": "Open", "priority": "Critical", "assignee": "Steve"},
+]
+
+MOCK_NOTION_PAGES: list[dict[str, Any]] = [
+    {"id": "page1", "title": "Product Roadmap Q2 2026", "type": "page", "last_edited": "2026-03-05"},
+    {"id": "page2", "title": "Engineering Design Docs", "type": "database", "last_edited": "2026-03-04"},
+    {"id": "page3", "title": "Meeting Notes — March", "type": "page", "last_edited": "2026-03-03"},
+]
+
+MOCK_ASANA_TASKS: list[dict[str, Any]] = [
+    {"gid": "task1", "name": "Finalize OAuth integration", "completed": False,
+     "due_on": "2026-03-10", "project": "GenomeUI"},
+    {"gid": "task2", "name": "Write integration tests for connectors", "completed": False,
+     "due_on": "2026-03-15", "project": "GenomeUI"},
+    {"gid": "task3", "name": "Update .env.example documentation", "completed": False,
+     "due_on": "2026-03-08", "project": "GenomeUI"},
+]
+
+
+def spotify_now_playing_snapshot() -> dict[str, Any]:
+    mode = _effective_mode("spotify", SPOTIFY_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Spotify not connected — connect via /api/connectors/oauth/spotify/begin"}
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(
+                    "https://api.spotify.com/v1/me/player/currently-playing",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if resp.status_code == 204:
+                return {"ok": True, "source": "live", "is_playing": False, "track": None}
+            data = resp.json()
+            item = data.get("item") or {}
+            artists = item.get("artists") or [{}]
+            images = (item.get("album") or {}).get("images") or [{}]
+            return {
+                "ok": True,
+                "source": "live",
+                "track": item.get("name"),
+                "artist": artists[0].get("name"),
+                "album": (item.get("album") or {}).get("name"),
+                "progress_ms": data.get("progress_ms"),
+                "duration_ms": item.get("duration_ms"),
+                "is_playing": data.get("is_playing", False),
+                "album_art": images[0].get("url", ""),
+            }
+        except Exception:
+            return {"ok": False, "source": "live", "error": "Spotify request failed"}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, **MOCK_SPOTIFY_NOW_PLAYING}
+
+
+def gmail_list_snapshot(max_results: int = 10) -> dict[str, Any]:
+    import concurrent.futures as _cf
+    import re as _re
+    from email.utils import parsedate_to_datetime as _p2dt
+    mode = _effective_mode("gmail", GMAIL_PROVIDER_MODE)
+    capped = max(1, min(int(max_results or 10), 20))
+    if mode == "live":
+        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Gmail not connected", "messages": []}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                hdrs = {"Authorization": f"Bearer {token}"}
+                # 1. List — returns IDs only
+                resp = client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={capped}&q=in:inbox",
+                    headers=hdrs,
+                )
+                ids = [m["id"] for m in resp.json().get("messages", [])][:capped]
+
+                # 2. Fetch metadata for each message in parallel
+                def _meta(msg_id: str) -> dict:
+                    r = client.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
+                        f"?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+                        headers=hdrs,
+                    )
+                    return r.json() if r.status_code == 200 else {}
+
+                with _cf.ThreadPoolExecutor(max_workers=5) as pool:
+                    metas = list(pool.map(_meta, ids))
+
+            # 3. Normalize
+            def _hdr(headers: list, name: str) -> str:
+                for h in headers:
+                    if h.get("name", "").lower() == name.lower():
+                        return h.get("value", "")
+                return ""
+
+            messages: list[dict] = []
+            unread_count = 0
+            for meta in metas:
+                if not meta:
+                    continue
+                payload_headers = meta.get("payload", {}).get("headers", [])
+                labels = meta.get("labelIds", [])
+                is_unread = "UNREAD" in labels
+                if is_unread:
+                    unread_count += 1
+                from_raw = _hdr(payload_headers, "From")
+                m = _re.match(r'^(.*?)\s*<', from_raw)
+                from_name = m.group(1).strip().strip('"') if m else from_raw
+                date_raw = _hdr(payload_headers, "Date")
+                try:
+                    date_str = _p2dt(date_raw).strftime("%b %d")
+                except Exception:
+                    date_str = date_raw[:10] if date_raw else ""
+                messages.append({
+                    "id": meta.get("id", ""),
+                    "from": from_name or from_raw,
+                    "subject": _hdr(payload_headers, "Subject"),
+                    "snippet": meta.get("snippet", ""),
+                    "date": date_str,
+                    "unread": is_unread,
+                })
+            return {"ok": True, "source": "live", "messages": messages, "unread_count": unread_count}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"Gmail request failed: {exc}", "messages": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "messages": copy.deepcopy(MOCK_GMAIL_MESSAGES[:capped]), "unread_count": 3}
+
+
+def gcal_events_snapshot(days: int = 7) -> dict[str, Any]:
+    mode = _effective_mode("gcal", GCAL_PROVIDER_MODE)
+    d = max(1, min(int(days or 7), 90))
+    if mode == "live":
+        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Google Calendar not connected", "events": []}
+        try:
+            from datetime import timedelta
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_iso = (datetime.now(timezone.utc) + timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(
+                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events"
+                    f"?timeMin={now_iso}&timeMax={end_iso}&singleEvents=true&orderBy=startTime",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                data = resp.json()
+            # Normalize: Google returns start as {dateTime: ..., timeZone: ...} or {date: ...}
+            def _norm_event(e: dict) -> dict:
+                start_obj = e.get("start", {})
+                start = start_obj.get("dateTime") or start_obj.get("date") or ""
+                end_obj = e.get("end", {})
+                end = end_obj.get("dateTime") or end_obj.get("date") or ""
+                return {"id": e.get("id", ""), "summary": e.get("summary", ""),
+                        "start": start, "end": end, "location": e.get("location", "")}
+            events = [_norm_event(e) for e in data.get("items", [])]
+            return {"ok": True, "source": "live", "events": events}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"Google Calendar request failed: {exc}", "events": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "events": copy.deepcopy(MOCK_GCAL_EVENTS)}
+
+
+def gdrive_list_snapshot(query: str = "") -> dict[str, Any]:
+    mode = _effective_mode("gdrive", GDRIVE_PROVIDER_MODE)
+    q = str(query or "").strip()
+    if mode == "live":
+        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Google Drive not connected", "files": []}
+        try:
+            q_param = f"&q={quote_plus(q)}" if q else ""
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(
+                    f"https://www.googleapis.com/drive/v3/files"
+                    f"?pageSize=20&fields=files(id,name,mimeType,modifiedTime){q_param}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                data = resp.json()
+            return {"ok": True, "source": "live", "files": data.get("files", [])}
+        except Exception:
+            return {"ok": False, "source": "live", "error": "Google Drive request failed", "files": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    files = copy.deepcopy(MOCK_GDRIVE_FILES)
+    if q:
+        files = [f for f in files if q.lower() in f["name"].lower()]
+    return {"ok": True, "source": source, "files": files}
+
+
+def slack_channels_snapshot() -> dict[str, Any]:
+    mode = _effective_mode("slack", SLACK_PROVIDER_MODE)
+    if mode == "live":
+        # Slack user tokens don't expire; no refresh needed
+        token = _get_live_token("slack", None, None, None)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Slack not connected", "channels": []}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(
+                    "https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=50",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                data = resp.json()
+            return {"ok": bool(data.get("ok")), "source": "live", "channels": data.get("channels", [])}
+        except Exception:
+            return {"ok": False, "source": "live", "error": "Slack request failed", "channels": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "channels": copy.deepcopy(MOCK_SLACK_CHANNELS)}
+
+
+def github_snapshot(repo: str = "", kind: str = "prs") -> dict[str, Any]:
+    """Fetch open PRs or assigned issues from GitHub."""
+    mode = _effective_mode("github", GITHUB_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("github", None, None, None)
+        if not token:
+            return {"ok": False, "source": "live", "error": "GitHub not connected", "items": []}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"}
+            with httpx.Client(timeout=8.0) as client:
+                if kind == "issues":
+                    resp = client.get(
+                        "https://api.github.com/issues?filter=assigned&state=open&per_page=10",
+                        headers=hdrs,
+                    )
+                    raw = resp.json() if isinstance(resp.json(), list) else []
+                    items = [{"number": i.get("number"), "title": i.get("title"), "state": i.get("state"),
+                              "repo": (i.get("repository") or {}).get("full_name", ""),
+                              "author": (i.get("user") or {}).get("login", ""),
+                              "created_at": str(i.get("created_at") or "")[:10], "type": "issue"}
+                             for i in raw if not i.get("pull_request")]
+                else:
+                    endpoint = f"https://api.github.com/repos/{repo}/pulls?state=open&per_page=10" if repo else \
+                               "https://api.github.com/issues?filter=assigned&state=open&per_page=10&is=pr"
+                    resp = client.get(endpoint, headers=hdrs)
+                    raw = resp.json() if isinstance(resp.json(), list) else []
+                    items = [{"number": i.get("number"), "title": i.get("title"), "state": i.get("state"),
+                              "repo": (i.get("repository") or {}).get("full_name", repo),
+                              "author": (i.get("user") or {}).get("login", ""),
+                              "created_at": str(i.get("created_at") or "")[:10], "type": "pr"}
+                             for i in raw]
+            return {"ok": True, "source": "live", "items": items}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"GitHub request failed: {exc}", "items": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    if kind == "issues":
+        return {"ok": True, "source": source, "items": copy.deepcopy(MOCK_GITHUB_ISSUES)}
+    return {"ok": True, "source": source, "items": copy.deepcopy(MOCK_GITHUB_PRS)}
+
+
+def jira_snapshot(jql: str = "assignee = currentUser() ORDER BY updated DESC", max_results: int = 10) -> dict[str, Any]:
+    """Fetch Jira issues using JQL."""
+    mode = _effective_mode("jira", JIRA_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("jira", "https://auth.atlassian.com/oauth/token", JIRA_CLIENT_ID, JIRA_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Jira not connected", "issues": []}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            with httpx.Client(timeout=10.0) as client:
+                # Get accessible resources (cloud ID)
+                res_resp = client.get("https://api.atlassian.com/oauth/token/accessible-resources", headers=hdrs)
+                resources = res_resp.json() if res_resp.status_code == 200 else []
+                cloud_id = resources[0]["id"] if resources else ""
+                if not cloud_id:
+                    return {"ok": False, "source": "live", "error": "No Jira cloud found", "issues": []}
+                resp = client.get(
+                    f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue/search",
+                    params={"jql": jql, "maxResults": max_results, "fields": "summary,status,priority,assignee"},
+                    headers=hdrs,
+                )
+            data = resp.json()
+            issues = []
+            for issue in data.get("issues", []):
+                fields = issue.get("fields", {})
+                issues.append({
+                    "key": issue.get("key", ""),
+                    "summary": str(fields.get("summary", "")),
+                    "status": str((fields.get("status") or {}).get("name", "")),
+                    "priority": str((fields.get("priority") or {}).get("name", "")),
+                    "assignee": str((fields.get("assignee") or {}).get("displayName", "")),
+                })
+            return {"ok": True, "source": "live", "issues": issues}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"Jira request failed: {exc}", "issues": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "issues": copy.deepcopy(MOCK_JIRA_ISSUES)}
+
+
+def notion_snapshot(query: str = "") -> dict[str, Any]:
+    """Search Notion pages and databases."""
+    mode = _effective_mode("notion", NOTION_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("notion", None, None, None)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Notion not connected", "pages": []}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json"}
+            body: dict[str, Any] = {"page_size": 10}
+            if query:
+                body["query"] = query
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post("https://api.notion.com/v1/search", json=body, headers=hdrs)
+            data = resp.json()
+            pages = []
+            for result in data.get("results", []):
+                title_prop = (result.get("properties") or {}).get("title") or \
+                             (result.get("properties") or {}).get("Name") or {}
+                title_parts = (title_prop.get("title") or title_prop.get("rich_text") or [])
+                title = "".join(p.get("plain_text", "") for p in title_parts) if isinstance(title_parts, list) else ""
+                pages.append({
+                    "id": result.get("id", ""),
+                    "title": title or "(untitled)",
+                    "type": result.get("object", "page"),
+                    "last_edited": str(result.get("last_edited_time", ""))[:10],
+                })
+            return {"ok": True, "source": "live", "pages": pages}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"Notion request failed: {exc}", "pages": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "pages": copy.deepcopy(MOCK_NOTION_PAGES)}
+
+
+def asana_snapshot() -> dict[str, Any]:
+    """Fetch tasks assigned to me from Asana."""
+    mode = _effective_mode("asana", ASANA_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("asana", "https://app.asana.com/-/oauth_token", ASANA_CLIENT_ID, ASANA_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Asana not connected", "tasks": []}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}"}
+            with httpx.Client(timeout=10.0) as client:
+                # Get user's workspace
+                me_resp = client.get("https://app.asana.com/api/1.0/users/me?opt_fields=workspaces", headers=hdrs)
+                me = me_resp.json().get("data", {})
+                workspaces = me.get("workspaces", [])
+                workspace_gid = workspaces[0]["gid"] if workspaces else ""
+                if not workspace_gid:
+                    return {"ok": False, "source": "live", "error": "No Asana workspace found", "tasks": []}
+                resp = client.get(
+                    f"https://app.asana.com/api/1.0/tasks?assignee=me&workspace={workspace_gid}"
+                    f"&completed_since=now&opt_fields=name,completed,due_on,projects.name&limit=15",
+                    headers=hdrs,
+                )
+            data = resp.json()
+            tasks = []
+            for task in data.get("data", []):
+                projects = task.get("projects", [])
+                tasks.append({
+                    "gid": task.get("gid", ""),
+                    "name": str(task.get("name", "")),
+                    "completed": bool(task.get("completed", False)),
+                    "due_on": str(task.get("due_on") or ""),
+                    "project": projects[0].get("name", "") if projects else "",
+                })
+            return {"ok": True, "source": "live", "tasks": tasks}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": f"Asana request failed: {exc}", "tasks": []}
+    source = "mock" if mode == "mock" else "scaffold"
+    return {"ok": True, "source": source, "tasks": copy.deepcopy(MOCK_ASANA_TASKS)}
+
+
+def github_issue_create_snapshot(repo: str, title: str, body: str = "") -> dict[str, Any]:
+    """Create a GitHub issue in the given repo."""
+    mode = _effective_mode("github", GITHUB_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("github", None, None, None)
+        if not token:
+            return {"ok": False, "source": "live", "error": "GitHub not connected"}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"}
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(f"https://api.github.com/repos/{repo}/issues",
+                                   json={"title": title, "body": body}, headers=hdrs)
+            data = resp.json()
+            return {"ok": True, "source": "live", "number": data.get("number"),
+                    "url": data.get("html_url", ""), "title": title, "repo": repo}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": str(exc)}
+    return {"ok": True, "source": "scaffold", "number": 99, "url": "", "title": title, "repo": repo}
+
+
+def jira_create_snapshot(project_key: str, summary: str, issue_type: str = "Task") -> dict[str, Any]:
+    """Create a Jira issue."""
+    mode = _effective_mode("jira", JIRA_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("jira", "https://auth.atlassian.com/oauth/token", JIRA_CLIENT_ID, JIRA_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Jira not connected"}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+                    "Content-Type": "application/json"}
+            with httpx.Client(timeout=10.0) as client:
+                res_resp = client.get("https://api.atlassian.com/oauth/token/accessible-resources", headers=hdrs)
+                resources = res_resp.json() if res_resp.status_code == 200 else []
+                cloud_id = resources[0]["id"] if resources else ""
+                if not cloud_id:
+                    return {"ok": False, "source": "live", "error": "No Jira cloud found"}
+                resp = client.post(
+                    f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue",
+                    json={"fields": {"project": {"key": project_key}, "summary": summary,
+                                     "issuetype": {"name": issue_type}}},
+                    headers=hdrs,
+                )
+            data = resp.json()
+            return {"ok": True, "source": "live", "key": data.get("key", ""), "summary": summary}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": str(exc)}
+    return {"ok": True, "source": "scaffold", "key": f"{project_key}-?", "summary": summary}
+
+
+def notion_create_snapshot(title: str, parent_id: str = "") -> dict[str, Any]:
+    """Create a Notion page."""
+    mode = _effective_mode("notion", NOTION_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("notion", None, None, None)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Notion not connected"}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json"}
+            parent: dict[str, Any] = {"page_id": parent_id} if parent_id else {"type": "workspace", "workspace": True}
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(
+                    "https://api.notion.com/v1/pages",
+                    json={"parent": parent,
+                          "properties": {"title": {"title": [{"text": {"content": title}}]}}},
+                    headers=hdrs,
+                )
+            data = resp.json()
+            return {"ok": True, "source": "live", "id": data.get("id", ""), "title": title}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": str(exc)}
+    return {"ok": True, "source": "scaffold", "id": "new-page", "title": title}
+
+
+def asana_create_snapshot(name: str) -> dict[str, Any]:
+    """Create an Asana task assigned to me."""
+    mode = _effective_mode("asana", ASANA_PROVIDER_MODE)
+    if mode == "live":
+        token = _get_live_token("asana", "https://app.asana.com/-/oauth_token", ASANA_CLIENT_ID, ASANA_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "source": "live", "error": "Asana not connected"}
+        try:
+            hdrs = {"Authorization": f"Bearer {token}"}
+            with httpx.Client(timeout=10.0) as client:
+                me_resp = client.get("https://app.asana.com/api/1.0/users/me?opt_fields=workspaces", headers=hdrs)
+                workspaces = me_resp.json().get("data", {}).get("workspaces", [])
+                workspace_gid = workspaces[0]["gid"] if workspaces else ""
+                if not workspace_gid:
+                    return {"ok": False, "source": "live", "error": "No Asana workspace"}
+                resp = client.post(
+                    "https://app.asana.com/api/1.0/tasks",
+                    json={"data": {"name": name, "assignee": "me", "workspace": workspace_gid}},
+                    headers=hdrs,
+                )
+            data = resp.json().get("data", {})
+            return {"ok": True, "source": "live", "gid": data.get("gid", ""), "name": name}
+        except Exception as exc:
+            return {"ok": False, "source": "live", "error": str(exc)}
+    return {"ok": True, "source": "scaffold", "gid": "new-task", "name": name}
 
 
 def shopping_catalog_snapshot(query: str = "", category: str = "") -> dict[str, Any]:
@@ -3102,6 +4420,7 @@ async def load_sessions_from_disk() -> None:
 @app.on_event("startup")
 async def startup_scheduler() -> None:
     await load_sessions_from_disk()
+    _content_db().close()  # ensure content store schema is initialised
     async with CONNECTOR_VAULT_LOCK:
         load_connector_vault_from_disk_sync()
     # Auto-grant low-risk connectors so core experiences work without manual setup.
@@ -3120,6 +4439,25 @@ async def startup_scheduler() -> None:
             "║     Set GENOME_AUTH_ENABLED=true before any public exposure. ║\n"
             "╚══════════════════════════════════════════════════════════════╝"
         )
+    # Load persistent Genome identity (generate once, stored in OS keychain)
+    global _genome_identity
+    _genome_identity = await asyncio.to_thread(_identity.load)
+    _log.info("Genome identity: %s", _genome_identity.did)
+    # Load embedded Nous model (non-blocking — degrades gracefully if GGUF missing)
+    await asyncio.to_thread(_nous.load)
+    # Start Nous mesh bridge — connects all Genome nodes on the local network.
+    # Pass the identity seed so every device has a stable, user-tied peer ID.
+    _mesh.on_message(_apply_mesh_sync)
+    _mesh.on_network_message(_handle_network_message)
+    _mesh.on_relay_message(_handle_network_message_relay)
+    asyncio.create_task(
+        _mesh.start(seed_hex=_genome_identity.seed_hex, did=_genome_identity.did),
+        name="mesh-bridge-start",
+    )
+    # Auto-connect to relay if configured — enables internet-tier delivery + mobile wakeup
+    _relay_url = os.environ.get("GENOME_RELAY_URL", "")
+    if _relay_url:
+        asyncio.create_task(_connect_relay_when_ready(_relay_url), name="relay-connect")
     # Connect to MCP servers defined in .mcp.json — non-blocking, errors are stored per server
     asyncio.create_task(load_mcp_servers_from_config())
     global SCHEDULER_TASK
@@ -3217,6 +4555,734 @@ async def auth_disconnect_service(service: str) -> dict[str, Any]:
     _auth.vault_delete(service)
     return {"ok": True, "service": service}
 
+# ── Networks ───────────────────────────────────────────────────────────────────
+#
+# These endpoints let the frontend (and eventually other apps) join/leave
+# Genome networks and send signed messages.  The backend holds the signing key
+# so the frontend never touches private key material.
+#
+# Network types:
+#   personal       — always joined, session sync (default mesh topic)
+#   p2p            — direct encrypted channel between two DIDs
+#   private_group  — invite-only group (groupId supplied by caller)
+#   public_local   — local area, derived from IP geolocation
+#   public_topic   — open topic group by name
+#   public_global  — PSA / broadcast to all Genome nodes
+
+# Populated at startup by the lifespan handler
+_genome_identity: "_identity.GenomedIdentity | None" = None  # type: ignore[assignment]
+# In-memory joined-network registry {topic → descriptor dict}
+_joined_networks: dict[str, dict[str, Any]] = {}
+# In-memory per-topic message log (last 100 messages each)
+_network_messages: dict[str, list[dict[str, Any]]] = {}
+_MAX_NET_MSGS = 100
+
+# Sybil detection — per-DID trust scoring + message rate limiting
+_peer_trust: dict[str, float] = {}           # DID → trust score [0.0, 1.0]
+_peer_msg_times: dict[str, list[float]] = {} # DID → recent message timestamps
+_DID_RATE_LIMIT = 20    # max messages from one DID per minute before trust decay
+_TRUST_THRESHOLD = 0.1  # messages from peers below this score are dropped
+
+
+def _p2p_network_id(did_a: str, did_b: str) -> str:
+    """FNV-1a hash of the sorted DID pair — mirrors TypeScript p2pNetworkId()."""
+    pair = "|".join(sorted([did_a, did_b]))
+    h = 0x811C9DC5
+    for ch in pair:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return format(h, "08x")
+
+
+def _topic_for(network_type: str, network_id: str) -> str:
+    """Mirror the TypeScript topicForNetwork() logic."""
+    if network_type == "personal":
+        return "genome-session-sync"
+    if network_type == "public_global":
+        return "genome-global"
+    prefixes = {
+        "p2p": "genome-p2p-",
+        "private_group": "genome-group-",
+        "public_local": "genome-local-",
+        "public_topic": "genome-topic-",
+    }
+    prefix = prefixes.get(network_type, "genome-net-")
+    return prefix + network_id
+
+
+async def _connect_relay_when_ready(relay_url: str) -> None:
+    """Wait for mesh bridge to start, then connect to the relay server."""
+    import asyncio as _asyncio
+    for _ in range(30):  # up to 30s
+        if _mesh.ready:
+            await _mesh.connect_relay(relay_url)
+            _log.info("Relay connect requested: %s", relay_url)
+            return
+        await _asyncio.sleep(1.0)
+    _log.warning("Relay connect skipped — mesh bridge not ready after 30s")
+
+
+async def _handle_network_message_relay(from_did: str, envelope: dict[str, Any]) -> None:
+    """Handle a message that arrived via the relay tier.
+
+    The relay delivers targeted messages (p2p / private_group) that couldn't
+    reach us via gossipsub. We reconstruct the topic from the envelope fields
+    and delegate to the same handler as mesh messages.
+    """
+    topic_type = str(envelope.get("networkType") or "")
+    network_id = str(envelope.get("networkId") or "")
+    if not topic_type or not network_id:
+        return
+    # Derive topic string — mirrors _topic_for() in this file
+    topic = _topic_for(topic_type, network_id)
+    await _handle_network_message(topic, from_did, envelope)
+
+
+async def _handle_network_message(topic: str, from_did: str, envelope: dict[str, Any]) -> None:
+    """Store incoming signed network messages — with sybil detection and E2E decrypt."""
+    import time as _t
+    import json as _j
+
+    now = _t.time()
+
+    # ── Sybil: per-DID rate limit ────────────────────────────────────────────
+    times = _peer_msg_times.setdefault(from_did, [])
+    times[:] = [ts for ts in times if ts > now - 60]
+    if len(times) >= _DID_RATE_LIMIT:
+        trust = _peer_trust.get(from_did, 0.5)
+        _peer_trust[from_did] = max(0.0, trust - 0.05)
+        return
+    times.append(now)
+
+    # ── Sybil: trust threshold ────────────────────────────────────────────────
+    trust = _peer_trust.get(from_did, 0.5)
+    if trust < _TRUST_THRESHOLD:
+        return
+
+    net = _joined_networks.get(topic)
+    net_type = net.get("type") if net else None
+
+    # ── Group member filter ───────────────────────────────────────────────────
+    if net_type == "private_group":
+        allowed = net.get("memberDids") or []  # type: ignore[union-attr]
+        if allowed and from_did not in allowed:
+            return
+
+    # ── E2E decrypt ───────────────────────────────────────────────────────────
+    payload: dict[str, Any] = dict(envelope.get("payload") or {})
+    if payload.get("enc") and net_type in ("p2p", "private_group") and _genome_identity:
+        raw: bytes | None = None
+        if net_type == "p2p":
+            peer_did = (net or {}).get("peerDid", "")
+            if peer_did:
+                raw = _genome_identity.ecdh_decrypt(peer_did, str(payload["enc"]))
+        elif net_type == "private_group":
+            group_key = (net or {}).get("groupKey", "")
+            if group_key:
+                raw = _genome_identity.group_decrypt(group_key, str(payload["enc"]))
+        if raw is not None:
+            try:
+                payload = _j.loads(raw)
+            except Exception:  # noqa: BLE001
+                payload = {}
+        else:
+            return  # undecryptable — drop silently
+
+    # ── Trust increment on valid message ─────────────────────────────────────
+    _peer_trust[from_did] = min(1.0, trust + 0.01)
+
+    msgs = _network_messages.setdefault(topic, [])
+    msgs.append({
+        "from": from_did,
+        "payload": payload,
+        "envelope": envelope,
+        "receivedAt": int(now * 1000),
+    })
+    if len(msgs) > _MAX_NET_MSGS:
+        del msgs[:-_MAX_NET_MSGS]
+
+
+class _JoinNetworkBody(BaseModel):
+    networkType: str
+    networkId: str = ""
+    label: str = ""
+    peerDid: str = ""          # p2p: the other party's DID (backend derives topic)
+    groupKey: str = ""         # private_group: AES-256 key hex (auto-generated if empty)
+    memberDids: list[str] = [] # private_group: initial allowed member DIDs
+
+
+class _NetworkMessageBody(BaseModel):
+    networkType: str
+    networkId: str
+    payload: dict[str, Any]
+
+
+class _MemberBody(BaseModel):
+    did: str
+
+
+@app.get("/api/networks")
+async def list_networks() -> dict[str, Any]:
+    """Return all networks this node is joined to."""
+    local_geohash = await _geo.get_local_geohash()
+    return {
+        "networks": list(_joined_networks.values()),
+        "localGeohash": local_geohash,
+        "did": _genome_identity.did if _genome_identity else None,
+    }
+
+
+@app.post("/api/networks/join")
+async def join_network(body: _JoinNetworkBody) -> dict[str, Any]:
+    """Join a Genome network.
+
+    - public_local: networkId may be omitted; server derives geohash from IP.
+    - p2p: peerDid required; server derives the topic from both DIDs.
+    - private_group: groupKey auto-generated if omitted (returned in response).
+    """
+    network_type = body.networkType
+    network_id = body.networkId
+    group_key = ""
+
+    VALID_TYPES = {"p2p", "private_group", "public_local", "public_topic", "public_global"}
+    if network_type not in VALID_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown networkType: {network_type}")
+
+    if network_type == "public_local" and not network_id:
+        geohash = await _geo.get_local_geohash()
+        if not geohash:
+            raise HTTPException(status_code=503, detail="Geolocation unavailable — supply networkId manually")
+        network_id = geohash
+
+    if network_type == "p2p":
+        if not body.peerDid:
+            raise HTTPException(status_code=400, detail="peerDid is required for p2p network")
+        if not _genome_identity:
+            raise HTTPException(status_code=503, detail="Identity not loaded")
+        network_id = _p2p_network_id(_genome_identity.did, body.peerDid)
+
+    if network_type == "private_group":
+        group_key = body.groupKey or __import__("secrets").token_hex(32)
+        if not network_id:
+            network_id = __import__("secrets").token_hex(8)
+
+    if not network_id:
+        raise HTTPException(status_code=400, detail="networkId is required for this networkType")
+
+    topic = _topic_for(network_type, network_id)
+    _joined_networks[topic] = {
+        "type": network_type,
+        "networkId": network_id,
+        "label": body.label or network_id,
+        "topic": topic,
+        "peerDid": body.peerDid,
+        "groupKey": group_key,
+        "memberDids": list(body.memberDids),
+    }
+    await _mesh.join_topic(topic)
+    result: dict[str, Any] = {"ok": True, "topic": topic, "networkId": network_id}
+    if network_type == "private_group":
+        result["groupKey"] = group_key
+    return result
+
+
+@app.post("/api/networks/leave")
+async def leave_network(body: _JoinNetworkBody) -> dict[str, Any]:
+    """Leave a Genome network."""
+    topic = _topic_for(body.networkType, body.networkId)
+    _joined_networks.pop(topic, None)
+    _network_messages.pop(topic, None)
+    await _mesh.leave_topic(topic)
+    return {"ok": True, "topic": topic}
+
+
+@app.post("/api/networks/send")
+async def network_send(body: _NetworkMessageBody) -> dict[str, Any]:
+    """Send a signed (and optionally E2E-encrypted) message to a Genome network.
+
+    - p2p / private_group: payload is ECDH or group-key encrypted before signing.
+    - public_* / personal: payload is sent plaintext (signed only).
+    The backend holds all key material; the frontend never touches secrets.
+    """
+    if not _genome_identity:
+        raise HTTPException(status_code=503, detail="Identity not loaded")
+
+    topic = _topic_for(body.networkType, body.networkId)
+    import time as _time, json as _json
+
+    # ── E2E encrypt for private network types ────────────────────────────────
+    wire_payload: dict[str, Any] = body.payload
+    net = _joined_networks.get(topic)
+    if body.networkType == "p2p":
+        peer_did = (net or {}).get("peerDid", "")
+        if peer_did:
+            enc = _genome_identity.ecdh_encrypt(
+                peer_did,
+                _json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False).encode(),
+            )
+            if enc:
+                wire_payload = {"enc": enc}
+    elif body.networkType == "private_group":
+        group_key = (net or {}).get("groupKey", "")
+        if group_key:
+            enc = _genome_identity.group_encrypt(
+                group_key,
+                _json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False).encode(),
+            )
+            if enc:
+                wire_payload = {"enc": enc}
+
+    unsigned = {
+        "v": 1,
+        "networkType": body.networkType,
+        "networkId": body.networkId,
+        "from": _genome_identity.did,
+        "payload": wire_payload,
+        "ts": int(_time.time() * 1000),
+    }
+    # Canonical bytes: JSON with keys in the fixed order (mirrors genome_envelope.ts)
+    canonical = _json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False)
+    sig = _genome_identity.sign(canonical.encode("utf-8"))
+    envelope = {**unsigned, "sig": sig}
+    # Tier 1: libp2p gossipsub broadcast (LAN + peered nodes)
+    await _mesh.network_broadcast(topic, envelope)
+
+    # Tier 2: relay targeted routing for p2p channels
+    # Relay routes directly to the peer DID — reaches mobile / cross-NAT devices
+    if body.networkType == "p2p" and net:
+        peer_did = net.get("peerDid", "")
+        if peer_did and _mesh.relay_connected:
+            await _mesh.relay_route(peer_did, envelope)
+
+    return {"ok": True, "topic": topic, "relayRouted": body.networkType == "p2p" and _mesh.relay_connected}
+
+
+@app.get("/api/networks/messages")
+async def network_messages(topic: str = Query(...)) -> dict[str, Any]:
+    """Return buffered messages received on a network topic."""
+    return {"topic": topic, "messages": list(_network_messages.get(topic, []))}
+
+
+@app.get("/api/networks/{topic}/members")
+async def get_network_members(topic: str) -> dict[str, Any]:
+    """Return the allowed member DID list for a private_group network."""
+    net = _joined_networks.get(topic)
+    if not net:
+        raise HTTPException(status_code=404, detail="Network not found")
+    return {"topic": topic, "memberDids": list(net.get("memberDids") or [])}
+
+
+@app.post("/api/networks/{topic}/members")
+async def add_network_member(topic: str, body: _MemberBody) -> dict[str, Any]:
+    """Add a DID to the allowed member list of a private_group network."""
+    net = _joined_networks.get(topic)
+    if not net:
+        raise HTTPException(status_code=404, detail="Network not found")
+    if net.get("type") != "private_group":
+        raise HTTPException(status_code=400, detail="Member control is only for private_group")
+    members: list[str] = net.setdefault("memberDids", [])  # type: ignore[assignment]
+    if body.did not in members:
+        members.append(body.did)
+    return {"ok": True, "memberDids": list(members)}
+
+
+@app.delete("/api/networks/{topic}/members/{did}")
+async def remove_network_member(topic: str, did: str) -> dict[str, Any]:
+    """Remove a DID from the allowed member list of a private_group network."""
+    net = _joined_networks.get(topic)
+    if not net:
+        raise HTTPException(status_code=404, detail="Network not found")
+    members: list[str] = list(net.get("memberDids") or [])
+    net["memberDids"] = [d for d in members if d != did]
+    return {"ok": True, "memberDids": list(net["memberDids"])}
+
+
+# ── Telephony (Twilio PSTN bridge) ─────────────────────────────────────────────
+
+class _TwilioInboundBody(BaseModel):
+    CallSid: str = ""
+    From: str = ""
+    To: str = ""
+    CallStatus: str = ""
+
+class _TwilioStatusBody(BaseModel):
+    CallSid: str = ""
+    CallStatus: str = ""
+    Duration: str | None = None
+
+_TWILIO_STATUS_MAP = {
+    "queued": "ringing",
+    "ringing": "ringing",
+    "in-progress": "active",
+    "completed": "ended",
+    "busy": "ended",
+    "failed": "ended",
+    "no-answer": "ended",
+    "canceled": "ended",
+}
+
+async def _push_call_state(call_sid: str) -> None:
+    """Push a phone_state_update event to all WS subscribers for the owning session."""
+    state = _CALL_STATES.get(call_sid)
+    if not state:
+        return
+    session_id = state.get("sessionId")
+    if not session_id:
+        return
+    session = SESSIONS.get(session_id)
+    if not session:
+        return
+    payload = {
+        "type": "phone_state_update",
+        "sessionId": session_id,
+        "callSid": call_sid,
+        "state": state.get("state"),
+        "to": state.get("to"),
+        "from_": state.get("from_"),
+        "contactName": state.get("contactName"),
+        "duration": state.get("duration"),
+    }
+    for ws in list(session.sockets):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            session.sockets.discard(ws)
+
+@app.post("/api/telephony/twiml/connect")
+async def telephony_twiml_connect(request: Request) -> PlainTextResponse:
+    """TwiML webhook — bridges incoming PSTN leg to device audio stream."""
+    form = await request.form()
+    call_sid = str(form.get("CallSid", ""))
+    state = _CALL_STATES.get(call_sid, {})
+    to_number = state.get("to", str(form.get("To", "")))
+    # Stream the PSTN leg audio to the device via Media Streams
+    webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial callerId="{html.escape(state.get('from_', ''))}">
+    <Number>{html.escape(to_number)}</Number>
+  </Dial>
+</Response>"""
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+@app.post("/api/telephony/inbound")
+async def telephony_inbound(body: _TwilioInboundBody) -> PlainTextResponse:
+    """Twilio webhook — incoming PSTN call to the Genome number."""
+    call_sid = body.CallSid
+    caller = body.From or "unknown"
+    # Try to resolve caller to a contact name
+    contact_name = caller
+    twiml_status = str(body.CallStatus or "ringing")
+    genome_state = _TWILIO_STATUS_MAP.get(twiml_status, "ringing")
+
+    _CALL_STATES[call_sid] = {
+        "state": genome_state,
+        "to": body.To,
+        "from_": caller,
+        "contactName": contact_name,
+        "startedAt": _time.time(),
+        "sessionId": "",  # No session yet — device picks up on push
+        "direction": "inbound",
+    }
+
+    webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Number>{html.escape(body.To)}</Number>
+  </Dial>
+</Response>"""
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+@app.post("/api/telephony/status/{call_sid}")
+async def telephony_status_callback(call_sid: str, body: _TwilioStatusBody) -> dict[str, Any]:
+    """Twilio status callback — updates call state machine on every transition."""
+    twiml_status = body.CallStatus or ""
+    genome_state = _TWILIO_STATUS_MAP.get(twiml_status, twiml_status)
+
+    state = _CALL_STATES.get(call_sid)
+    if state is not None:
+        state["state"] = genome_state
+        if body.Duration:
+            state["duration"] = int(body.Duration)
+        await _push_call_state(call_sid)
+
+        if genome_state == "ended":
+            # Keep for a short TTL then clean up
+            asyncio.get_event_loop().call_later(300, _CALL_STATES.pop, call_sid, None)
+
+    return {"ok": True}
+
+@app.get("/api/telephony/status/{call_sid}")
+async def telephony_call_status(call_sid: str) -> dict[str, Any]:
+    """Poll endpoint — returns normalized call state for the given Call SID."""
+    state = _CALL_STATES.get(call_sid)
+    if state is None:
+        # Proxy to Twilio if not in local cache
+        twilio_creds = _auth.vault_retrieve("twilio.voice")
+        acct_sid = (twilio_creds or {}).get("account_sid") or TWILIO_ACCOUNT_SID
+        auth_tok = (twilio_creds or {}).get("auth_token") or TWILIO_AUTH_TOKEN
+        if acct_sid and auth_tok:
+            try:
+                async with httpx.AsyncClient(timeout=5) as hc:
+                    r = await hc.get(
+                        f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Calls/{call_sid}.json",
+                        auth=(acct_sid, auth_tok),
+                    )
+                    if r.status_code == 200:
+                        d = r.json()
+                        twilio_state = str(d.get("status", ""))
+                        genome_state = _TWILIO_STATUS_MAP.get(twilio_state, twilio_state)
+                        return {
+                            "ok": True,
+                            "callSid": call_sid,
+                            "state": genome_state,
+                            "duration": d.get("duration"),
+                        }
+            except Exception:
+                pass
+        return {"ok": False, "callSid": call_sid, "state": "unknown"}
+
+    return {
+        "ok": True,
+        "callSid": call_sid,
+        "state": state.get("state"),
+        "to": state.get("to"),
+        "from_": state.get("from_"),
+        "contactName": state.get("contactName"),
+        "duration": state.get("duration"),
+        "direction": state.get("direction", "outbound"),
+    }
+
+
+# ── Telephony control endpoints ────────────────────────────────────────────────
+
+# Temporary storage for in-flight DTMF digits so the TwiML endpoint can serve them
+_PENDING_DTMF: dict[str, str] = {}
+
+
+class _TelephonyHoldBody(BaseModel):
+    model_config = {"extra": "ignore"}
+    hold: bool = True
+
+
+class _TelephonyDtmfBody(BaseModel):
+    model_config = {"extra": "ignore"}
+    digits: str = ""
+
+
+class _E911Body(BaseModel):
+    model_config = {"extra": "ignore"}
+    address: str = ""
+    city: str = ""
+    state: str = ""
+    zip: str = ""
+    phoneNumber: str | None = None
+
+
+def _twilio_creds() -> tuple[str, str, str]:
+    """Return (acct_sid, auth_tok, from_num) from vault or env vars."""
+    creds = _auth.vault_retrieve("twilio.voice") or {}
+    return (
+        str(creds.get("account_sid") or TWILIO_ACCOUNT_SID),
+        str(creds.get("auth_token") or TWILIO_AUTH_TOKEN),
+        str(creds.get("phone_number") or TWILIO_PHONE_NUMBER),
+    )
+
+
+@app.post("/api/telephony/hangup/{call_sid}")
+async def telephony_hangup(call_sid: str) -> dict[str, Any]:
+    """Terminate an active call via Twilio REST."""
+    acct_sid, auth_tok, _ = _twilio_creds()
+    if not (acct_sid and auth_tok):
+        return {"ok": False, "message": "Twilio not configured."}
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            r = await hc.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Calls/{call_sid}.json",
+                auth=(acct_sid, auth_tok),
+                data={"Status": "completed"},
+            )
+            r.raise_for_status()
+    except Exception as err:
+        return {"ok": False, "message": str(err)}
+    state = _CALL_STATES.get(call_sid)
+    if state:
+        state["state"] = "ended"
+        await _push_call_state(call_sid)
+        asyncio.get_event_loop().call_later(300, _CALL_STATES.pop, call_sid, None)
+    return {"ok": True, "callSid": call_sid, "state": "ended"}
+
+
+@app.post("/api/telephony/hold/{call_sid}")
+async def telephony_hold(call_sid: str, body: _TelephonyHoldBody) -> dict[str, Any]:
+    """Put a call on hold or resume it by redirecting the Twilio leg."""
+    acct_sid, auth_tok, _ = _twilio_creds()
+    if not (acct_sid and auth_tok):
+        return {"ok": False, "message": "Twilio not configured."}
+    webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+    twiml_url = (
+        f"{webhook_base}/api/telephony/twiml/hold"
+        if body.hold
+        else f"{webhook_base}/api/telephony/twiml/connect"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            r = await hc.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Calls/{call_sid}.json",
+                auth=(acct_sid, auth_tok),
+                data={"Url": twiml_url, "Method": "POST"},
+            )
+            r.raise_for_status()
+    except Exception as err:
+        return {"ok": False, "message": str(err)}
+    new_state = "held" if body.hold else "active"
+    state = _CALL_STATES.get(call_sid)
+    if state:
+        state["state"] = new_state
+        await _push_call_state(call_sid)
+    return {"ok": True, "callSid": call_sid, "state": new_state}
+
+
+@app.post("/api/telephony/twiml/hold")
+async def telephony_twiml_hold() -> PlainTextResponse:
+    """TwiML served while a call is on hold — plays loop music."""
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        '<Play loop="0">https://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3</Play>'
+        "</Response>"
+    )
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+
+@app.post("/api/telephony/dtmf/{call_sid}")
+async def telephony_dtmf(call_sid: str, body: _TelephonyDtmfBody) -> dict[str, Any]:
+    """Send DTMF digits mid-call by redirecting to a one-shot TwiML document."""
+    digits = re.sub(r"[^0-9#*]", "", str(body.digits or ""))
+    if not digits:
+        return {"ok": False, "message": "Invalid DTMF digits (0-9, #, * only)."}
+    acct_sid, auth_tok, _ = _twilio_creds()
+    if not (acct_sid and auth_tok):
+        return {"ok": False, "message": "Twilio not configured."}
+    webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+    _PENDING_DTMF[call_sid] = digits
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            r = await hc.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Calls/{call_sid}.json",
+                auth=(acct_sid, auth_tok),
+                data={
+                    "Url": f"{webhook_base}/api/telephony/twiml/dtmf/{call_sid}",
+                    "Method": "POST",
+                },
+            )
+            r.raise_for_status()
+    except Exception as err:
+        _PENDING_DTMF.pop(call_sid, None)
+        return {"ok": False, "message": str(err)}
+    return {"ok": True, "callSid": call_sid, "digits": digits}
+
+
+@app.post("/api/telephony/twiml/dtmf/{call_sid}")
+async def telephony_twiml_dtmf(call_sid: str) -> PlainTextResponse:
+    """One-shot TwiML that plays the buffered DTMF digits then resumes the call."""
+    digits = _PENDING_DTMF.pop(call_sid, "")
+    safe = re.sub(r"[^0-9#*]", "", digits)
+    webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Play digits="{html.escape(safe)}"/>'
+        f'<Redirect method="POST">{html.escape(f"{webhook_base}/api/telephony/twiml/connect")}</Redirect>'
+        "</Response>"
+    )
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+
+@app.post("/api/telephony/handoff/{call_sid}")
+async def telephony_handoff_generate(call_sid: str) -> dict[str, Any]:
+    """Generate a one-time handoff token so a mobile device can claim the call."""
+    state = _CALL_STATES.get(call_sid)
+    if not state:
+        return {"ok": False, "message": "Unknown call SID."}
+    token = secrets.token_urlsafe(16)
+    state["handoffToken"] = token
+    state["handoffExpiry"] = _time.time() + 120  # 2-minute window
+    return {"ok": True, "callSid": call_sid, "handoffToken": token, "expiresIn": 120}
+
+
+@app.post("/api/telephony/handoff/{call_sid}/claim")
+async def telephony_handoff_claim(call_sid: str, request: Request) -> dict[str, Any]:
+    """Mobile device claims a handoff token and associates its session with the call."""
+    body = await request.json()
+    token = str(body.get("handoffToken", "")).strip()
+    mobile_session_id = str(body.get("sessionId", "")).strip()
+    state = _CALL_STATES.get(call_sid)
+    if not state:
+        return {"ok": False, "message": "Unknown call SID."}
+    if state.get("handoffToken") != token:
+        return {"ok": False, "message": "Invalid handoff token."}
+    if _time.time() > float(state.get("handoffExpiry", 0)):
+        return {"ok": False, "message": "Handoff token expired."}
+    state["sessionId"] = mobile_session_id
+    state.pop("handoffToken", None)
+    state.pop("handoffExpiry", None)
+    await _push_call_state(call_sid)
+    return {"ok": True, "callSid": call_sid, "state": state.get("state")}
+
+
+@app.post("/api/telephony/e911")
+async def telephony_e911_register(body: _E911Body) -> dict[str, Any]:
+    """Register an E911 emergency address with Twilio for the Genome phone number."""
+    acct_sid, auth_tok, phone_num = _twilio_creds()
+    phone_num = body.phoneNumber or phone_num
+    if not (acct_sid and auth_tok):
+        return {"ok": False, "message": "Twilio not configured."}
+    if not all([body.address, body.city, body.state, body.zip]):
+        return {"ok": False, "message": "address, city, state, and zip are required."}
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            ar = await hc.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Addresses.json",
+                auth=(acct_sid, auth_tok),
+                data={
+                    "FriendlyName": "Genome E911",
+                    "CustomerName": "Genome Device",
+                    "Street": body.address,
+                    "City": body.city,
+                    "Region": body.state,
+                    "PostalCode": body.zip,
+                    "IsoCountry": "US",
+                    "EmergencyEnabled": "true",
+                },
+            )
+            ar.raise_for_status()
+            address_sid = str(ar.json().get("sid", ""))
+            # If we have a phone number, associate the address
+            if phone_num:
+                number_list = await hc.get(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/IncomingPhoneNumbers.json",
+                    auth=(acct_sid, auth_tok),
+                    params={"PhoneNumber": phone_num},
+                )
+                numbers = number_list.json().get("incoming_phone_numbers", [])
+                if numbers:
+                    number_sid = str(numbers[0].get("sid", ""))
+                    await hc.post(
+                        f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/IncomingPhoneNumbers/{number_sid}.json",
+                        auth=(acct_sid, auth_tok),
+                        data={"AddressSid": address_sid, "EmergencyAddressSid": address_sid},
+                    )
+            return {
+                "ok": True,
+                "addressSid": address_sid,
+                "message": "E911 address registered successfully.",
+            }
+    except Exception as err:
+        return {"ok": False, "message": f"E911 registration failed: {err}"}
+
+
 # ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -3304,9 +5370,61 @@ async def get_connector_provider_status() -> dict[str, Any]:
                     str(os.getenv("SOCIAL_API_BASE_URL", "") or "").strip()
                     and connector_secret_provider_value("SOCIAL_API_TOKEN", "social.api.token")
                 ),
-            }
+            },
+            # ── OAuth connectors ──────────────────────────────────────────────
+            "spotify": {
+                "mode": normalize_connector_service_mode(SPOTIFY_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("spotify")),
+                "configured": _is_service_configured("spotify", SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+                "authUrl": "/api/connectors/oauth/spotify/begin",
+            },
+            "gmail": {
+                "mode": normalize_connector_service_mode(GMAIL_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("gmail")),
+                "configured": _is_service_configured("gmail", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET),
+                "authUrl": "/api/connectors/oauth/gmail/begin",
+            },
+            "gcal": {
+                "mode": normalize_connector_service_mode(GCAL_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("gcal")),
+                "configured": _is_service_configured("gcal", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET),
+                "authUrl": "/api/connectors/oauth/gcal/begin",
+            },
+            "gdrive": {
+                "mode": normalize_connector_service_mode(GDRIVE_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("gdrive")),
+                "configured": _is_service_configured("gdrive", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET),
+                "authUrl": "/api/connectors/oauth/gdrive/begin",
+            },
+            "slack": {
+                "mode": normalize_connector_service_mode(SLACK_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("slack")),
+                "configured": _is_service_configured("slack", SLACK_CLIENT_ID, SLACK_CLIENT_SECRET),
+                "authUrl": "/api/connectors/oauth/slack/begin",
+            },
+            "plaid": {
+                "mode": normalize_connector_service_mode(PLAID_PROVIDER_MODE, default="scaffold"),
+                "connected": bool(_auth.vault_retrieve("plaid")),
+                "configured": _is_service_configured("plaid", PLAID_CLIENT_ID, PLAID_SECRET),
+                "authUrl": "/api/connectors/plaid/link_token",
+            },
         },
     }
+
+
+@app.delete("/api/auth/connections/{service}")
+async def disconnect_service(service: str, req: Request) -> dict[str, Any]:
+    """Remove stored OAuth tokens for a connected service."""
+    _require_auth(req)
+    allowed = {"spotify", "gmail", "gcal", "gdrive", "slack", "plaid"}
+    svc = str(service or "").strip().lower()
+    if svc not in allowed:
+        raise HTTPException(status_code=400, detail="Unknown service")
+    try:
+        _auth.vault_delete(svc)
+    except Exception:
+        pass  # already not connected — treat as success
+    return {"ok": True, "service": svc, "disconnected": True}
 
 
 @app.get("/api/connectors/contracts")
@@ -3394,6 +5512,392 @@ async def upsert_connector_grant(body: ConnectorGrantBody) -> dict[str, Any]:
             item = connector_revoke_scope(scope)
         report = connector_grants_report()
     return {"ok": True, "item": item, **report}
+
+
+# ── OAuth connector routes ──────────────────────────────────────────────────────
+
+_OAUTH_SERVICE_CONFIGS: dict[str, tuple[str, str, str]] = {
+    # service → (auth_url, token_url, scope)
+    "spotify": (
+        "https://accounts.spotify.com/authorize",
+        "https://accounts.spotify.com/api/token",
+        "user-read-playback-state user-modify-playback-state user-read-recently-played playlist-read-private",
+    ),
+    "gmail": (
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://oauth2.googleapis.com/token",
+        "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify",
+    ),
+    "gcal": (
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://oauth2.googleapis.com/token",
+        "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events",
+    ),
+    "gdrive": (
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://oauth2.googleapis.com/token",
+        "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
+    ),
+    "slack": (
+        "https://slack.com/oauth/v2/authorize",
+        "https://slack.com/api/oauth.v2.access",
+        "channels:read channels:history chat:write users:read",
+    ),
+    "github": (
+        "https://github.com/login/oauth/authorize",
+        "https://github.com/login/oauth/access_token",
+        "repo user:email read:org",
+    ),
+    "jira": (
+        "https://auth.atlassian.com/authorize?audience=api.atlassian.com&prompt=consent",
+        "https://auth.atlassian.com/oauth/token",
+        "read:jira-work write:jira-work offline_access",
+    ),
+    "notion": (
+        "https://api.notion.com/v1/oauth/authorize",
+        "https://api.notion.com/v1/oauth/token",
+        "",
+    ),
+    "asana": (
+        "https://app.asana.com/-/oauth_authorize",
+        "https://app.asana.com/-/oauth_token",
+        "default",
+    ),
+}
+
+_OAUTH_CLIENT_PAIRS: dict[str, tuple[str, str]] = {
+    "spotify": (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+    "gmail":   (GMAIL_CLIENT_ID,   GMAIL_CLIENT_SECRET),
+    "gcal":    (GCAL_CLIENT_ID,    GCAL_CLIENT_SECRET),
+    "gdrive":  (GDRIVE_CLIENT_ID,  GDRIVE_CLIENT_SECRET),
+    "slack":   (SLACK_CLIENT_ID,   SLACK_CLIENT_SECRET),
+    "github":  (GITHUB_CLIENT_ID,  GITHUB_CLIENT_SECRET),
+    "jira":    (JIRA_CLIENT_ID,    JIRA_CLIENT_SECRET),
+    "notion":  (NOTION_CLIENT_ID,  NOTION_CLIENT_SECRET),
+    "asana":   (ASANA_CLIENT_ID,   ASANA_CLIENT_SECRET),
+}
+
+
+def _get_oauth_client_pair(service: str) -> tuple[str, str]:
+    """Return (client_id, client_secret) — env vars take priority, vault creds are fallback."""
+    env_id, env_secret = _OAUTH_CLIENT_PAIRS.get(service, ("", ""))
+    if env_id and env_secret:
+        return env_id, env_secret
+    stored = _auth.vault_retrieve(f"{service}_creds")
+    if stored:
+        return stored.get("client_id", ""), stored.get("client_secret", "")
+    return "", ""
+
+
+def _is_service_configured(service: str, env_id: str, env_secret: str) -> bool:
+    """True if env vars are set OR vault credentials exist for this service."""
+    if env_id and env_secret:
+        return True
+    stored = _auth.vault_retrieve(f"{service}_creds")
+    return bool(stored and stored.get("client_id") and stored.get("client_secret"))
+
+# Extra OAuth params per service (e.g. Google needs access_type + prompt for refresh tokens)
+_OAUTH_EXTRA_PARAMS: dict[str, dict[str, str]] = {
+    "gmail":  {"access_type": "offline", "prompt": "consent"},
+    "gcal":   {"access_type": "offline", "prompt": "consent"},
+    "gdrive": {"access_type": "offline", "prompt": "consent"},
+}
+
+
+class _BlueskyCreds(BaseModel):
+    model_config = {"extra": "ignore"}
+    handle: str
+    appPassword: str
+    pds: str = "https://bsky.social"
+
+
+@app.post("/api/connectors/bluesky/connect")
+async def bluesky_connect(
+    body: _BlueskyCreds,
+    x_genome_auth: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Authenticate with Bluesky using handle + app-password and store session in vault."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    handle = body.handle.strip().lstrip("@")
+    pds = body.pds.rstrip("/") or BLUESKY_PDS
+    try:
+        async with httpx.AsyncClient(timeout=12) as hc:
+            r = await hc.post(
+                f"{pds}/xrpc/com.atproto.server.createSession",
+                json={"identifier": handle, "password": body.appPassword},
+            )
+            if r.status_code != 200:
+                return {"ok": False, "message": f"Bluesky login failed: {r.text[:120]}"}
+            data = r.json()
+    except Exception as err:
+        return {"ok": False, "message": f"Connection error: {err}"}
+    _auth.vault_store("bluesky", {
+        "handle": data["handle"],
+        "did": data["did"],
+        "app_password": body.appPassword,
+        "pds": pds,
+    })
+    # Reset in-memory cache so next call re-auths cleanly
+    _BLUESKY_SESSION.clear()
+    return {"ok": True, "handle": data["handle"], "did": data["did"]}
+
+
+@app.delete("/api/connectors/bluesky/connect")
+async def bluesky_disconnect(
+    x_genome_auth: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Remove stored Bluesky credentials from vault."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    _auth.vault_delete("bluesky") if hasattr(_auth, "vault_delete") else _auth.vault_store("bluesky", {})
+    _BLUESKY_SESSION.clear()
+    return {"ok": True}
+
+
+@app.get("/api/connectors/oauth/{service}/begin")
+async def oauth_begin(
+    service: str,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    """Initiate PKCE OAuth flow. Returns a redirect URL for the frontend to open."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if service not in _OAUTH_SERVICE_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"Unknown OAuth service: {service}")
+    auth_url, _token_url, scope = _OAUTH_SERVICE_CONFIGS[service]
+    client_id, _ = _get_oauth_client_pair(service)
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{service} OAuth is not configured — set {service.upper()}_CLIENT_ID and {service.upper()}_CLIENT_SECRET env vars",
+        )
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(16)
+    redirect_uri = f"{OAUTH_REDIRECT_BASE}/api/connectors/oauth/{service}/callback"
+    _PKCE_STATE[state] = {"verifier": verifier, "service": service, "redirect_uri": redirect_uri}
+    params: dict[str, str] = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    params.update(_OAUTH_EXTRA_PARAMS.get(service, {}))
+    return JSONResponse({"ok": True, "url": f"{auth_url}?{urlencode(params)}", "service": service})
+
+
+@app.post("/api/connectors/oauth/{service}/credentials")
+async def save_oauth_credentials(
+    service: str,
+    req: Request,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    """Store OAuth client_id + client_secret in the OS keychain vault."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if service not in _OAUTH_SERVICE_CONFIGS and service != "plaid":
+        raise HTTPException(status_code=400, detail=f"Unknown service: {service}")
+    body = await req.json()
+    client_id = str(body.get("client_id", "") or "").strip()
+    client_secret = str(body.get("client_secret", "") or "").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="client_id and client_secret are required")
+    _auth.vault_store(f"{service}_creds", {"client_id": client_id, "client_secret": client_secret})
+    return JSONResponse({"ok": True, "service": service})
+
+
+@app.get("/api/connectors/oauth/{service}/callback")
+async def oauth_callback(
+    service: str,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+) -> RedirectResponse:
+    """Handle OAuth authorization code callback, exchange for tokens, store in vault."""
+    if error:
+        return RedirectResponse(f"/?oauth_error={quote_plus(error)}&service={service}")
+    if not state or state not in _PKCE_STATE:
+        return RedirectResponse(f"/?oauth_error=invalid_state&service={service}")
+    entry = _PKCE_STATE.pop(state)
+    if entry["service"] != service:
+        return RedirectResponse(f"/?oauth_error=service_mismatch&service={service}")
+    _auth_url, token_url, _scope = _OAUTH_SERVICE_CONFIGS[service]
+    client_id, client_secret = _get_oauth_client_pair(service)
+    try:
+        resp = httpx.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": entry["redirect_uri"],
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code_verifier": entry["verifier"],
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            _log.warning("OAuth token exchange failed for %s: %s", service, resp.text[:200])
+            return RedirectResponse(f"/?oauth_error=token_exchange_failed&service={service}")
+        data = resp.json()
+        # Slack v2 nests token differently
+        if service == "slack":
+            access_token = data.get("authed_user", {}).get("access_token") or data.get("access_token", "")
+        else:
+            access_token = data.get("access_token", "")
+        _auth.vault_store(service, {
+            "access_token": access_token,
+            "refresh_token": data.get("refresh_token", ""),
+            "expires_at": _time.time() + float(data.get("expires_in", 315360000)),  # Slack tokens don't expire
+        })
+        return RedirectResponse(f"/?oauth_success={service}")
+    except Exception as exc:
+        _log.error("OAuth callback error for %s: %s", service, exc)
+        return RedirectResponse(f"/?oauth_error=server_error&service={service}")
+
+
+@app.post("/api/connectors/plaid/link_token")
+async def plaid_link_token_endpoint(
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    """Create a Plaid Link token for initiating the Plaid Link flow."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if _effective_mode("plaid", PLAID_PROVIDER_MODE) != "live":
+        return JSONResponse({"ok": True, "source": "scaffold", "link_token": "link-sandbox-scaffold-token"})
+    try:
+        resp = httpx.post(
+            f"https://{PLAID_ENV}.plaid.com/link/token/create",
+            json={
+                "client_id": PLAID_CLIENT_ID,
+                "secret": PLAID_SECRET,
+                "client_name": "GenomeUI",
+                "country_codes": ["US"],
+                "language": "en",
+                "user": {"client_user_id": "genome-user"},
+                "products": ["transactions", "accounts"],
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        return JSONResponse({"ok": True, "source": "live", "link_token": data.get("link_token")})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Plaid link token request failed")
+
+
+@app.post("/api/connectors/plaid/exchange")
+async def plaid_exchange_endpoint(
+    request: Request,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    """Exchange a Plaid Link public_token for a persistent access_token."""
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body_data = await request.json()
+    public_token = str(body_data.get("public_token", "") or "")
+    if _effective_mode("plaid", PLAID_PROVIDER_MODE) != "live":
+        _auth.vault_store("plaid", {"access_token": "access-sandbox-scaffold", "item_id": "item-scaffold"})
+        return JSONResponse({"ok": True, "source": "scaffold"})
+    if not public_token:
+        raise HTTPException(status_code=400, detail="public_token required")
+    try:
+        resp = httpx.post(
+            f"https://{PLAID_ENV}.plaid.com/item/public_token/exchange",
+            json={"client_id": PLAID_CLIENT_ID, "secret": PLAID_SECRET, "public_token": public_token},
+            timeout=15,
+        )
+        data = resp.json()
+        _auth.vault_store("plaid", {"access_token": data["access_token"], "item_id": data["item_id"]})
+        return JSONResponse({"ok": True, "source": "live"})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Plaid exchange failed")
+
+
+@app.get("/api/connectors/mock/spotify")
+async def get_mock_spotify() -> JSONResponse:
+    snap = spotify_now_playing_snapshot()
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/mock/gmail")
+async def get_mock_gmail(limit: int = Query(default=10)) -> JSONResponse:
+    snap = gmail_list_snapshot(max_results=limit)
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/mock/gcal")
+async def get_mock_gcal(days: int = Query(default=7)) -> JSONResponse:
+    snap = gcal_events_snapshot(days=days)
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/mock/gdrive")
+async def get_mock_gdrive(query: str = Query(default="")) -> JSONResponse:
+    snap = gdrive_list_snapshot(query=query)
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/mock/slack")
+async def get_mock_slack() -> JSONResponse:
+    snap = slack_channels_snapshot()
+    return JSONResponse({"ok": True, "item": snap})
+
+
+# ── Content Store REST endpoints ───────────────────────────────────────────────
+
+@app.get("/api/content/{domain}")
+async def api_content_list(
+    domain: str,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    items = content_list(domain)
+    return JSONResponse({"ok": True, "items": items})
+
+
+@app.get("/api/content/{domain}/{name}")
+async def api_content_load(
+    domain: str,
+    name: str,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    item = content_load(domain, name)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Not found: {domain}/{name}")
+    return JSONResponse({"ok": True, "item": item})
+
+
+@app.post("/api/content/{domain}/{name}")
+async def api_content_commit(
+    domain: str,
+    name: str,
+    req: Request,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body = await req.json()
+    data = body.get("data", "")
+    h = content_commit(domain, name, data)
+    return JSONResponse({"ok": True, "hash": h})
+
+
+@app.delete("/api/content/{domain}/{name}")
+async def api_content_delete(
+    domain: str,
+    name: str,
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    ok = content_delete(domain, name)
+    return JSONResponse({"ok": ok})
 
 
 @app.post("/api/session/init")
@@ -7935,6 +10439,62 @@ async def ws_session(websocket: WebSocket):
         session.sockets.discard(websocket)
 
 
+def _build_confirm_summary(op_type: str, payload: dict[str, Any]) -> str:
+    """Return a human-readable confirmation prompt for a high-risk op."""
+    def _p(key: str, default: str = "") -> str:
+        return str(payload.get(key, "") or default).strip()
+
+    summaries: dict[str, str] = {
+        # Finance / payments
+        "payments_send":        f"Send payment{(' of ' + _p('amount')) if _p('amount') else ''}{(' to ' + _p('to')) if _p('to') else ''}. This cannot be undone.",
+        "payments_request":     f"Request payment{(' of ' + _p('amount')) if _p('amount') else ''}{(' from ' + _p('from')) if _p('from') else ''}.",
+        "banking_pay":          f"Pay{(' ' + _p('amount')) if _p('amount') else ''}{(' to ' + _p('to')) if _p('to') else ''}. This cannot be undone.",
+        "banking_transfer":     f"Transfer{(' ' + _p('amount')) if _p('amount') else ''}{(' to ' + _p('to')) if _p('to') else ''}. This cannot be undone.",
+        "grocery_order":        f"Place grocery order{(' from ' + _p('store')) if _p('store') else ''}. This will charge your payment method.",
+        # Travel / rideshare
+        "travel_hotel_book":    f"Book hotel{(' at ' + _p('hotel')) if _p('hotel') else ''}{(' for ' + _p('dates')) if _p('dates') else ''}. This will charge your payment method.",
+        "rideshare_book":       f"Book a{(' ' + _p('type')) if _p('type') else ''} ride{(' to ' + _p('destination')) if _p('destination') else ''}. This will charge your payment method.",
+        "food_delivery_order":  f"Order{(' from ' + _p('restaurant')) if _p('restaurant') else ''}. This will charge your payment method.",
+        "food_delivery_reorder":f"Reorder from your previous order. This will charge your payment method.",
+        # Smart home
+        "smarthome_lock":       f"{'Lock' if str(_p('action')).lower() != 'unlock' else 'Unlock'}{(' ' + _p('device')) if _p('device') else ' the door'} remotely.",
+        # Contacts
+        "contacts_delete":      f"Permanently delete contact{(' ' + _p('name')) if _p('name') else ''}. This cannot be undone.",
+        "contacts_call":        f"Call{(' ' + _p('name') or _p('number')) if (_p('name') or _p('number')) else ' contact'}.",
+        # Phone
+        "phone_call":           f"Call{(' ' + _p('target') or _p('number')) if (_p('target') or _p('number')) else ' contact'}.",
+        "phone_conference":     f"Start conference call{(' with ' + _p('participants')) if _p('participants') else ''}.",
+        # Telephony
+        "telephony_call_start": f"Call{(' ' + _p('target')) if _p('target') else ' contact'}.",
+        # Documents / content
+        "document_delete":      f"Permanently delete{(' "' + _p('name') + '"') if _p('name') else ' document'}. This cannot be undone.",
+        "spreadsheet_delete":   f"Permanently delete{(' "' + _p('name') + '"') if _p('name') else ' spreadsheet'}. This cannot be undone.",
+        "presentation_delete":  f"Permanently delete{(' "' + _p('name') + '"') if _p('name') else ' presentation'}. This cannot be undone.",
+        # Gmail
+        "gmail.send":           f"Send email{(' to ' + _p('to')) if _p('to') else ''}{(' — "' + _p('subject') + '"') if _p('subject') else ''}.",
+        # Password
+        "password_update":      f"Update password{(' for ' + _p('service')) if _p('service') else ''}. Make sure you have a backup.",
+        # Drive / sharing
+        "gdrive.share":         f"Share{(' "' + _p('name') + '"') if _p('name') else ' file'}{(' with ' + _p('email')) if _p('email') else ''}.",
+        "gdrive_share":         f"Share{(' "' + _p('name') + '"') if _p('name') else ' file'}{(' with ' + _p('email')) if _p('email') else ''}.",
+        # Calendar
+        "gcal.delete":          f"Delete calendar event{(' "' + _p('title') + '"') if _p('title') else ''}.",
+        "gcal_delete":          f"Delete calendar event{(' "' + _p('title') + '"') if _p('title') else ''}.",
+        # System
+        "restore_apply":        "Restore session to a prior revision. Unsaved changes will be lost.",
+        "restore_checkpoint_latest": "Restore to the latest checkpoint. Current state will be overwritten.",
+        "compact_journal":      f"Compact the journal, keeping the last {_p('keep', '200')} entries. Older history will be purged.",
+        "reset_memory":         "Reset all session memory. All tasks, notes, and expenses will be deleted.",
+        "policy_drill_confirm": "Execute policy drill. This modifies system posture.",
+    }
+
+    if op_type in summaries:
+        return summaries[op_type]
+    # Generic fallback
+    label = op_type.replace("_", " ")
+    return f'"{label}" is a high-risk action that cannot be undone. Confirm to proceed.'
+
+
 @app.post("/api/turn")
 async def turn(
     request: Request,
@@ -7972,11 +10532,36 @@ async def turn(
             nous_hint = {**body.nousIntent, "op": raw_op}
         # Unknown op from gateway: fall through to local classifier
     else:
-        nous_match = await classify_async(intent)
-        if nous_match:
-            nous_hint = {"op": nous_match.op, "slots": nous_match.payload, "confidence": nous_match.confidence}
+        # Prefer embedded Nous model; fall back to rule-based classifier
+        if _nous.is_loaded():
+            nous_result = await _nous.classify(intent)
+            if nous_result and nous_result.get("ops"):
+                ops = nous_result["ops"]
+                first_op = str(ops[0]["type"]).strip().lower()
+                if first_op in CAPABILITY_REGISTRY:
+                    nous_hint = {
+                        "op": first_op,
+                        "slots": ops[0].get("slots") or {},
+                        "confidence": 0.95,
+                        "_extra_ops": ops[1:],
+                        "_nous_response": nous_result.get("response") or "",
+                    }
+        if nous_hint is None:
+            nous_match = await classify_async(intent)
+            if nous_match:
+                nous_hint = {"op": nous_match.op, "slots": nous_match.payload, "confidence": nous_match.confidence}
 
     envelope = compile_intent_envelope(intent, nous_hint=nous_hint)
+    # If Nous returned compound ops, append extra write operations to the envelope.
+    if nous_hint and nous_hint.get("_extra_ops"):
+        for extra in nous_hint["_extra_ops"]:
+            op_type = str(extra.get("type") or "").strip().lower()
+            if op_type in CAPABILITY_REGISTRY:
+                envelope["stateIntent"]["writeOperations"].append({
+                    "type": op_type,
+                    "domain": _op_to_domain(op_type),
+                    "payload": extra.get("slots") or {},
+                })
     clarification = envelope.get("clarification") or {}
     clarification_required = bool(clarification.get("required", False))
     parse_done_ms = now_ms()
@@ -8033,41 +10618,73 @@ async def turn(
             "needsClarification": True,
         }
     else:
-        execution = await execute_operations(session, sid, envelope["stateIntent"]["writeOperations"])
-        # MCP fallback: if no connector produced results and MCP servers are registered,
-        # try matching the user intent to a registered MCP tool (fires at most once per turn).
-        if MCP_SERVER_REGISTRY and not execution.get("toolResults") and not execution.get("needsClarification"):
-            _mcp_sid, _mcp_tool, _mcp_score = find_best_mcp_tool(intent)
-            if _mcp_sid and _mcp_score >= MCP_TOOL_MATCH_THRESHOLD:
-                _mcp_server = MCP_SERVER_REGISTRY.get(_mcp_sid, {})
-                try:
-                    _mcp_result = await _call_mcp_stdio_tool(_mcp_sid, _mcp_tool or "", {}, timeout=10.0)
-                    execution["toolResults"] = [{
-                        "op": "mcp_tool_call",
-                        "ok": not _mcp_result.get("isError", False),
-                        "serverId": _mcp_sid,
-                        "serverName": str(_mcp_server.get("name", "")),
-                        "toolName": _mcp_tool,
-                        "matchScore": round(_mcp_score, 3),
-                        "data": {"content": _mcp_result.get("content", [])},
-                        "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
-                        "previewLines": [f"mcp: {_mcp_server.get('name', '')} → {_mcp_tool}",
-                                         f"match: {round(_mcp_score * 100)}%"],
-                    }]
-                    execution["ok"] = True
-                    execution["message"] = f"MCP: {_mcp_server.get('name', '')} / {_mcp_tool}"
-                except Exception as _mcp_exc:
-                    execution["toolResults"] = [{
-                        "op": "mcp_tool_call",
-                        "ok": False,
-                        "serverId": _mcp_sid,
-                        "serverName": str(_mcp_server.get("name", "")),
-                        "toolName": _mcp_tool,
-                        "matchScore": round(_mcp_score, 3),
-                        "data": {"content": []},
-                        "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
-                        "previewLines": [f"mcp error: {str(_mcp_exc)[:120]}"],
-                    }]
+        write_ops = envelope["stateIntent"]["writeOperations"]
+        # ── High-risk confirm gate ─────────────────────────────────────────────
+        # Scan write ops for any high-risk capability. If found and body.confirmed
+        # is False, pause execution and return needsConfirm so the frontend can
+        # render the confirm surface. On re-submit with confirmed=True, inject the
+        # flag into op payloads so evaluate_policy passes the high-risk checks.
+        _risky_op = None if body.confirmed else next(
+            (op for op in write_ops
+             if str(CAPABILITY_REGISTRY.get(str(op.get("type", "")), {}).get("risk", "low")) == "high"),
+            None,
+        )
+        if _risky_op is not None:
+            _risky_type = str(_risky_op.get("type", "unknown"))
+            _risky_domain = str(CAPABILITY_REGISTRY.get(_risky_type, {}).get("domain", "system"))
+            _risky_payload = _risky_op.get("payload", {}) if isinstance(_risky_op.get("payload"), dict) else {}
+            _risky_summary = _build_confirm_summary(_risky_type, _risky_payload)
+            execution = {
+                "ok": False,
+                "needsConfirm": True,
+                "op": _risky_type,
+                "domain": _risky_domain,
+                "summary": _risky_summary,
+                "message": f"Confirm required before executing: {_risky_type}",
+                "toolResults": [],
+                "journalTail": session.journal[-20:],
+            }
+        else:
+            if body.confirmed:
+                for op in write_ops:
+                    if not isinstance(op.get("payload"), dict):
+                        op["payload"] = {}
+                    op["payload"]["confirmed"] = True
+            execution = await execute_operations(session, sid, write_ops)
+            # MCP fallback: if no connector produced results and MCP servers are registered,
+            # try matching the user intent to a registered MCP tool (fires at most once per turn).
+            if MCP_SERVER_REGISTRY and not execution.get("toolResults") and not execution.get("needsClarification"):
+                _mcp_sid, _mcp_tool, _mcp_score = find_best_mcp_tool(intent)
+                if _mcp_sid and _mcp_score >= MCP_TOOL_MATCH_THRESHOLD:
+                    _mcp_server = MCP_SERVER_REGISTRY.get(_mcp_sid, {})
+                    try:
+                        _mcp_result = await _call_mcp_stdio_tool(_mcp_sid, _mcp_tool or "", {}, timeout=10.0)
+                        execution["toolResults"] = [{
+                            "op": "mcp_tool_call",
+                            "ok": not _mcp_result.get("isError", False),
+                            "serverId": _mcp_sid,
+                            "serverName": str(_mcp_server.get("name", "")),
+                            "toolName": _mcp_tool,
+                            "matchScore": round(_mcp_score, 3),
+                            "data": {"content": _mcp_result.get("content", [])},
+                            "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
+                            "previewLines": [f"mcp: {_mcp_server.get('name', '')} → {_mcp_tool}",
+                                             f"match: {round(_mcp_score * 100)}%"],
+                        }]
+                        execution["ok"] = True
+                        execution["message"] = f"MCP: {_mcp_server.get('name', '')} / {_mcp_tool}"
+                    except Exception as _mcp_exc:
+                        execution["toolResults"] = [{
+                            "op": "mcp_tool_call",
+                            "ok": False,
+                            "serverId": _mcp_sid,
+                            "serverName": str(_mcp_server.get("name", "")),
+                            "toolName": _mcp_tool,
+                            "matchScore": round(_mcp_score, 3),
+                            "data": {"content": []},
+                            "policy": {"allowed": True, "reason": "mcp_tool_match", "code": "ok"},
+                            "previewLines": [f"mcp error: {str(_mcp_exc)[:120]}"],
+                        }]
     execute_done_ms = now_ms()
     planner_memory_fingerprint = stable_memory_fingerprint(session.memory)
     route = planner_route(envelope, execution, session.graph)
@@ -8171,6 +10788,45 @@ async def broadcast_session(session: SessionState, payload: dict[str, Any]) -> N
     for ws in list(session.sockets):
         try:
             await ws.send_json(payload)
+        except Exception:
+            session.sockets.discard(ws)
+
+    # Propagate session state to all Genome nodes on the Nous mesh
+    session_id = str(payload.get("sessionId") or "")
+    if session_id:
+        await _mesh.broadcast(session_id, payload)
+
+
+async def _apply_mesh_sync(session_id: str, payload: dict[str, Any]) -> None:
+    """Handle a session_sync arriving from another Genome node on the mesh."""
+    norm_id = normalize_session_id(session_id)
+    if not norm_id:
+        return
+
+    incoming_revision = int(payload.get("revision") or 0)
+    session = ensure_session(norm_id)
+
+    # Only apply if the incoming state is newer than what we have
+    if incoming_revision < session.revision:
+        return
+
+    # Merge fields — incoming memory/graph win on equal or higher revision
+    if isinstance(payload.get("memory"), dict):
+        session.memory = payload["memory"]
+    if isinstance(payload.get("graph"), dict):
+        session.graph = payload["graph"]
+    if isinstance(payload.get("lastTurn"), dict):
+        session.last_turn = payload["lastTurn"]
+    if isinstance(payload.get("presence"), dict):
+        session.presence = payload["presence"]
+
+    session.revision = incoming_revision
+
+    # Push the merged state to local WebSocket clients on this device
+    local_payload = session_sync_payload(norm_id, session)
+    for ws in list(session.sockets):
+        try:
+            await ws.send_json(local_payload)
         except Exception:
             session.sockets.discard(ws)
 
@@ -17746,6 +20402,13 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "web_status": {"domain": "web", "risk": "low"},
     "social_feed_read": {"domain": "social", "risk": "low"},
     "social_message_send": {"domain": "social", "risk": "medium"},
+    "social_dm_send": {"domain": "social", "risk": "medium"},
+    "social_profile_read": {"domain": "social", "risk": "low"},
+    "social_react": {"domain": "social", "risk": "medium"},
+    "social_comment": {"domain": "social", "risk": "medium"},
+    "social_follow": {"domain": "social", "risk": "medium"},
+    "social_notifications": {"domain": "social", "risk": "low"},
+    "social_trending": {"domain": "social", "risk": "low"},
     "contacts_lookup": {"domain": "contacts", "risk": "low"},
     "export_trace": {"domain": "system", "risk": "low"},
     "restore_preview": {"domain": "system", "risk": "medium"},
@@ -17791,6 +20454,354 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "email_read":           {"domain": "email", "risk": "low"},
     "email_reply":          {"domain": "email", "risk": "medium"},
     "email_search":         {"domain": "email", "risk": "low"},
+    # ── OAuth connector ops ───────────────────────────────────────────────────
+    # Spotify
+    "spotify.now_playing":  {"domain": "music",    "risk": "low"},
+    "spotify.play":         {"domain": "music",    "risk": "medium"},
+    "spotify.pause":        {"domain": "music",    "risk": "medium"},
+    "spotify.next":         {"domain": "music",    "risk": "medium"},
+    "spotify.prev":         {"domain": "music",    "risk": "medium"},
+    "spotify.volume":       {"domain": "music",    "risk": "medium"},
+    "spotify.queue":        {"domain": "music",    "risk": "low"},
+    # Gmail
+    "gmail.list":           {"domain": "email",    "risk": "low"},
+    "gmail.read":           {"domain": "email",    "risk": "low"},
+    "gmail.send":           {"domain": "email",    "risk": "high"},
+    "gmail.search":         {"domain": "email",    "risk": "low"},
+    "gmail.trash":          {"domain": "email",    "risk": "medium"},
+    # Google Calendar
+    "gcal.list":            {"domain": "calendar", "risk": "low"},
+    "gcal.create":          {"domain": "calendar", "risk": "medium"},
+    "gcal.update":          {"domain": "calendar", "risk": "medium"},
+    "gcal.delete":          {"domain": "calendar", "risk": "high"},
+    "gcal_list":            {"domain": "calendar", "risk": "low"},
+    "gcal_create":          {"domain": "calendar", "risk": "medium"},
+    "gcal_update":          {"domain": "calendar", "risk": "medium"},
+    "gcal_delete":          {"domain": "calendar", "risk": "high"},
+    # Google Drive
+    "gdrive.list":          {"domain": "document", "risk": "low"},
+    "gdrive.open":          {"domain": "document", "risk": "low"},
+    "gdrive.create":        {"domain": "document", "risk": "medium"},
+    "gdrive.share":         {"domain": "document", "risk": "high"},
+    # Slack (dotted connector ops)
+    "slack.list_channels":  {"domain": "messaging","risk": "low"},
+    "slack.read":           {"domain": "messaging","risk": "low"},
+    "slack.send":           {"domain": "messaging","risk": "medium"},
+    # Slack (taxonomy flat ops)
+    "slack_read":           {"domain": "messaging","risk": "low"},
+    "slack_search":         {"domain": "messaging","risk": "low"},
+    "slack_status":         {"domain": "messaging","risk": "low"},
+    "slack_reaction":       {"domain": "messaging","risk": "medium"},
+    # Google Drive (taxonomy flat ops)
+    "gdrive_list":          {"domain": "document", "risk": "low"},
+    "gdrive_open":          {"domain": "document", "risk": "low"},
+    "gdrive_create":        {"domain": "document", "risk": "medium"},
+    "gdrive_share":         {"domain": "document", "risk": "high"},
+    # Banking extended
+    "banking_history":      {"domain": "banking",  "risk": "low"},
+    "banking_pay":          {"domain": "banking",  "risk": "high"},
+    "banking_statement":    {"domain": "banking",  "risk": "low"},
+    "banking_transfer":     {"domain": "banking",  "risk": "high"},
+    # Plaid
+    "plaid.link_token":     {"domain": "banking",  "risk": "low"},
+    "plaid.exchange":       {"domain": "banking",  "risk": "medium"},
+    # Connections management
+    "connections_status":   {"domain": "connectors", "risk": "low"},
+    # Dictionary & Reference
+    "dict_define":          {"domain": "reference",  "risk": "low"},
+    "dict_etymology":       {"domain": "reference",  "risk": "low"},
+    "dict_thesaurus":       {"domain": "reference",  "risk": "low"},
+    "dict_wikipedia":       {"domain": "reference",  "risk": "low"},
+    # Date & Time calc
+    "date_age":             {"domain": "clock",      "risk": "low"},
+    "date_countdown":       {"domain": "clock",      "risk": "low"},
+    "date_day_of":          {"domain": "clock",      "risk": "low"},
+    "date_days_until":      {"domain": "clock",      "risk": "low"},
+    # Currency & Units
+    "currency_rates":       {"domain": "reference",  "risk": "low"},
+    "currency_convert":     {"domain": "reference",  "risk": "low"},
+    "unit_convert":         {"domain": "reference",  "risk": "low"},
+    # Alarm & Clock
+    "alarm_list":           {"domain": "clock",      "risk": "low"},
+    "clock_world":          {"domain": "clock",      "risk": "low"},
+    "clock_stopwatch":      {"domain": "clock",      "risk": "low"},
+    "clock_bedtime":        {"domain": "clock",      "risk": "low"},
+    # Health (full set)
+    "health_steps":         {"domain": "health",     "risk": "low"},
+    "health_heart_rate":    {"domain": "health",     "risk": "low"},
+    "health_sleep":         {"domain": "health",     "risk": "low"},
+    "health_workout_log":   {"domain": "health",     "risk": "low"},
+    "health_workout_start": {"domain": "health",     "risk": "low"},
+    "health_food_log":      {"domain": "health",     "risk": "low"},
+    "health_water":         {"domain": "health",     "risk": "low"},
+    "health_weight":        {"domain": "health",     "risk": "low"},
+    "health_mood":          {"domain": "health",     "risk": "low"},
+    "health_medication":    {"domain": "health",     "risk": "low"},
+    "health_hrv":           {"domain": "health",     "risk": "low"},
+    "health_cycle":         {"domain": "health",     "risk": "low"},
+    "health_streak":        {"domain": "health",     "risk": "low"},
+    "health_goals":         {"domain": "health",     "risk": "low"},
+    # GitHub
+    "github_my_prs":        {"domain": "github",     "risk": "low"},
+    "github_pr_view":       {"domain": "github",     "risk": "low"},
+    "github_repo_search":   {"domain": "github",     "risk": "low"},
+    "github_issue_create":  {"domain": "github",     "risk": "medium"},
+    "github_commit":        {"domain": "github",     "risk": "medium"},
+    # Jira
+    "jira_my_issues":       {"domain": "jira",       "risk": "low"},
+    "jira_sprint":          {"domain": "jira",       "risk": "low"},
+    "jira_view":            {"domain": "jira",       "risk": "low"},
+    "jira_create":          {"domain": "jira",       "risk": "medium"},
+    "jira_update":          {"domain": "jira",       "risk": "medium"},
+    # Notion
+    "notion_find":          {"domain": "notion",     "risk": "low"},
+    "notion_create":        {"domain": "notion",     "risk": "medium"},
+    "notion_database":      {"domain": "notion",     "risk": "low"},
+    "notion_update":        {"domain": "notion",     "risk": "medium"},
+    # Asana
+    "asana_my_tasks":       {"domain": "asana",      "risk": "low"},
+    "asana_create":         {"domain": "asana",      "risk": "medium"},
+    "asana_project":        {"domain": "asana",      "risk": "low"},
+    "asana_update":         {"domain": "asana",      "risk": "medium"},
+    # Location extended
+    "location_directions":  {"domain": "location",   "risk": "low"},
+    "location_distance":    {"domain": "location",   "risk": "low"},
+    "location_nearby":      {"domain": "location",   "risk": "low"},
+    "location_saved":       {"domain": "location",   "risk": "low"},
+    "location_share":       {"domain": "location",   "risk": "medium"},
+    "location_traffic":     {"domain": "location",   "risk": "low"},
+    # Contacts extended
+    "contacts_list":        {"domain": "contacts",   "risk": "low"},
+    "contacts_create":      {"domain": "contacts",   "risk": "medium"},
+    "contacts_edit":        {"domain": "contacts",   "risk": "medium"},
+    "contacts_delete":      {"domain": "contacts",   "risk": "high"},
+    "contacts_favorite":    {"domain": "contacts",   "risk": "low"},
+    "contacts_call":        {"domain": "contacts",   "risk": "high"},
+    "contacts_message":     {"domain": "contacts",   "risk": "medium"},
+    # Notes extended
+    "note_search":          {"domain": "notes",      "risk": "low"},
+    "note_edit":            {"domain": "notes",      "risk": "low"},
+    "note_delete":          {"domain": "notes",      "risk": "medium"},
+    "note_pin":             {"domain": "notes",      "risk": "low"},
+    "note_tag":             {"domain": "notes",      "risk": "low"},
+    # Reminders extended
+    "reminder_delete":      {"domain": "system",     "risk": "medium"},
+    "reminder_snooze":      {"domain": "system",     "risk": "low"},
+    "reminder_recurring":   {"domain": "system",     "risk": "low"},
+    # Email extended
+    "email_archive":        {"domain": "email",      "risk": "medium"},
+    "email_forward":        {"domain": "email",      "risk": "medium"},
+    "email_label":          {"domain": "email",      "risk": "low"},
+    "email_snooze":         {"domain": "email",      "risk": "low"},
+    "email_unsubscribe":    {"domain": "email",      "risk": "medium"},
+    # Travel
+    "travel_flight_search": {"domain": "travel",     "risk": "low"},
+    "travel_flight_status": {"domain": "travel",     "risk": "low"},
+    "travel_hotel_search":  {"domain": "travel",     "risk": "low"},
+    "travel_hotel_book":    {"domain": "travel",     "risk": "high"},
+    "travel_boarding_pass": {"domain": "travel",     "risk": "low"},
+    "travel_checkin":       {"domain": "travel",     "risk": "medium"},
+    "travel_itinerary":     {"domain": "travel",     "risk": "low"},
+    "travel_car_rental":    {"domain": "travel",     "risk": "medium"},
+    # Food delivery
+    "food_delivery_browse": {"domain": "food",       "risk": "low"},
+    "food_delivery_order":  {"domain": "food",       "risk": "high"},
+    "food_delivery_reorder":{"domain": "food",       "risk": "high"},
+    "food_delivery_track":  {"domain": "food",       "risk": "low"},
+    # Rideshare
+    "rideshare_book":       {"domain": "rideshare",  "risk": "high"},
+    "rideshare_cancel":     {"domain": "rideshare",  "risk": "medium"},
+    "rideshare_schedule":   {"domain": "rideshare",  "risk": "medium"},
+    "rideshare_track":      {"domain": "rideshare",  "risk": "low"},
+    # Video streaming
+    "video_play":           {"domain": "video",      "risk": "medium"},
+    "video_search":         {"domain": "video",      "risk": "low"},
+    "video_browse":         {"domain": "video",      "risk": "low"},
+    "video_continue":       {"domain": "video",      "risk": "low"},
+    "video_watchlist":      {"domain": "video",      "risk": "low"},
+    "video_recommend":      {"domain": "video",      "risk": "low"},
+    "video_cast":           {"domain": "video",      "risk": "medium"},
+    "video_rate":           {"domain": "video",      "risk": "low"},
+    # Smart home
+    "smarthome_lights":     {"domain": "smarthome",  "risk": "medium"},
+    "smarthome_thermostat": {"domain": "smarthome",  "risk": "medium"},
+    "smarthome_lock":       {"domain": "smarthome",  "risk": "high"},
+    "smarthome_camera":     {"domain": "smarthome",  "risk": "low"},
+    "smarthome_scene":      {"domain": "smarthome",  "risk": "medium"},
+    "smarthome_energy":     {"domain": "smarthome",  "risk": "low"},
+    "smarthome_appliance":  {"domain": "smarthome",  "risk": "medium"},
+    # Music aliases (delegate to spotify.*)
+    "music_play":           {"domain": "music",      "risk": "medium"},
+    "music_pause":          {"domain": "music",      "risk": "medium"},
+    "music_skip":           {"domain": "music",      "risk": "medium"},
+    "music_volume":         {"domain": "music",      "risk": "medium"},
+    "music_lyrics":         {"domain": "music",      "risk": "low"},
+    "music_like":           {"domain": "music",      "risk": "low"},
+    "music_queue":          {"domain": "music",      "risk": "low"},
+    "music_playlist_create":{"domain": "music",      "risk": "medium"},
+    "music_playlist_add":   {"domain": "music",      "risk": "medium"},
+    "music_discover":       {"domain": "music",      "risk": "low"},
+    "music_radio":          {"domain": "music",      "risk": "medium"},
+    "music_sleep_timer":    {"domain": "music",      "risk": "low"},
+    "music_cast":           {"domain": "music",      "risk": "medium"},
+    # Phone
+    "phone_call":           {"domain": "phone",      "risk": "high"},
+    "phone_recent":         {"domain": "phone",      "risk": "low"},
+    "phone_voicemail":      {"domain": "phone",      "risk": "low"},
+    "phone_block":          {"domain": "phone",      "risk": "medium"},
+    "phone_record":         {"domain": "phone",      "risk": "medium"},
+    "phone_conference":     {"domain": "phone",      "risk": "high"},
+    # Photos
+    "photos_search":        {"domain": "photos",     "risk": "low"},
+    "photos_album":         {"domain": "photos",     "risk": "low"},
+    "photos_edit":          {"domain": "photos",     "risk": "medium"},
+    "photos_share":         {"domain": "photos",     "risk": "medium"},
+    # Messaging extended
+    "messaging_send":       {"domain": "messaging",  "risk": "medium"},
+    "messaging_read":       {"domain": "messaging",  "risk": "low"},
+    "messaging_reply":      {"domain": "messaging",  "risk": "medium"},
+    "messaging_react":      {"domain": "messaging",  "risk": "low"},
+    "messaging_search":     {"domain": "messaging",  "risk": "low"},
+    "messaging_forward":    {"domain": "messaging",  "risk": "medium"},
+    "messaging_delete":     {"domain": "messaging",  "risk": "medium"},
+    "messaging_block":      {"domain": "messaging",  "risk": "medium"},
+    "messaging_schedule":   {"domain": "messaging",  "risk": "medium"},
+    "messaging_group_create":{"domain": "messaging", "risk": "medium"},
+    "messaging_group_add":  {"domain": "messaging",  "risk": "medium"},
+    # Document extended
+    "document_delete":      {"domain": "document",   "risk": "high"},
+    "document_rename":      {"domain": "document",   "risk": "medium"},
+    "document_export":      {"domain": "document",   "risk": "low"},
+    "document_share":       {"domain": "document",   "risk": "medium"},
+    "document_template":    {"domain": "document",   "risk": "low"},
+    # Spreadsheet extended
+    "spreadsheet_delete":   {"domain": "spreadsheet","risk": "high"},
+    "spreadsheet_chart":    {"domain": "spreadsheet","risk": "low"},
+    "spreadsheet_formula":  {"domain": "spreadsheet","risk": "low"},
+    "spreadsheet_export":   {"domain": "spreadsheet","risk": "low"},
+    # Presentation extended
+    "presentation_delete":          {"domain": "presentation", "risk": "high"},
+    "presentation_export":          {"domain": "presentation", "risk": "low"},
+    "presentation_share":           {"domain": "presentation", "risk": "medium"},
+    "presentation_speaker_notes":   {"domain": "presentation", "risk": "low"},
+    "presentation_template":        {"domain": "presentation", "risk": "low"},
+    # Terminal extended
+    "terminal_history":     {"domain": "terminal",   "risk": "low"},
+    "terminal_kill":        {"domain": "terminal",   "risk": "medium"},
+    "terminal_ssh":         {"domain": "terminal",   "risk": "high"},
+    "terminal_env":         {"domain": "terminal",   "risk": "low"},
+    "terminal_output":      {"domain": "terminal",   "risk": "low"},
+    # Shopping extended
+    "shopping_cart":            {"domain": "shopping",   "risk": "low"},
+    "shopping_compare":         {"domain": "shopping",   "risk": "low"},
+    "shopping_orders":          {"domain": "shopping",   "risk": "low"},
+    "shopping_recommendations": {"domain": "shopping",   "risk": "low"},
+    "shopping_track":           {"domain": "shopping",   "risk": "low"},
+    "shopping_wishlist":        {"domain": "shopping",   "risk": "low"},
+    # Files extended
+    "files_recent":         {"domain": "files",      "risk": "low"},
+    "files_search":         {"domain": "files",      "risk": "low"},
+    "files_download":       {"domain": "files",      "risk": "medium"},
+    "files_upload":         {"domain": "files",      "risk": "medium"},
+    "files_share":          {"domain": "files",      "risk": "medium"},
+    # Finance extended
+    "finance_portfolio":    {"domain": "finance",    "risk": "low"},
+    "finance_watchlist":    {"domain": "finance",    "risk": "low"},
+    "finance_news":         {"domain": "finance",    "risk": "low"},
+    "finance_alert":        {"domain": "finance",    "risk": "low"},
+    # Notifications
+    "notifications_view":       {"domain": "notifications", "risk": "low"},
+    "notifications_clear":      {"domain": "notifications", "risk": "medium"},
+    "notifications_clear_app":  {"domain": "notifications", "risk": "medium"},
+    "notifications_mark_read":  {"domain": "notifications", "risk": "low"},
+    "notifications_settings":   {"domain": "notifications", "risk": "low"},
+    # Focus & productivity
+    "focus_session":        {"domain": "focus",      "risk": "low"},
+    "focus_pomodoro":       {"domain": "focus",      "risk": "low"},
+    "focus_block":          {"domain": "focus",      "risk": "medium"},
+    "focus_stats":          {"domain": "focus",      "risk": "low"},
+    # Wallet & passes
+    "wallet_passes":        {"domain": "wallet",     "risk": "low"},
+    "wallet_loyalty":       {"domain": "wallet",     "risk": "low"},
+    "wallet_gift_card":     {"domain": "wallet",     "risk": "low"},
+    "wallet_coupon":        {"domain": "wallet",     "risk": "low"},
+    # VPN
+    "vpn_status":           {"domain": "vpn",        "risk": "low"},
+    "vpn_connect":          {"domain": "vpn",        "risk": "medium"},
+    "vpn_disconnect":       {"domain": "vpn",        "risk": "low"},
+    # Screen capture
+    "screen_screenshot":    {"domain": "screen",     "risk": "low"},
+    "screen_record":        {"domain": "screen",     "risk": "medium"},
+    "screen_mirror":        {"domain": "screen",     "risk": "medium"},
+    "screen_split":         {"domain": "screen",     "risk": "low"},
+    # Handoff & continuity
+    "handoff_clipboard":    {"domain": "handoff",    "risk": "low"},
+    "handoff_continue":     {"domain": "handoff",    "risk": "low"},
+    "handoff_airdrop":      {"domain": "handoff",    "risk": "medium"},
+    "handoff_screen_share": {"domain": "handoff",    "risk": "medium"},
+    # Backup
+    "backup_now":           {"domain": "backup",     "risk": "medium"},
+    "backup_status":        {"domain": "backup",     "risk": "low"},
+    # Password manager
+    "password_find":        {"domain": "password",   "risk": "low"},
+    "password_generate":    {"domain": "password",   "risk": "low"},
+    "password_update":      {"domain": "password",   "risk": "high"},
+    # App store
+    "app_find":             {"domain": "app",        "risk": "low"},
+    "app_install":          {"domain": "app",        "risk": "medium"},
+    "app_update":           {"domain": "app",        "risk": "medium"},
+    # Reading list
+    "reading_save":         {"domain": "reading",    "risk": "low"},
+    "reading_list_view":    {"domain": "reading",    "risk": "low"},
+    "reading_mark_read":    {"domain": "reading",    "risk": "low"},
+    # Accessibility & device settings
+    "access_display":       {"domain": "accessibility", "risk": "low"},
+    "access_font":          {"domain": "accessibility", "risk": "low"},
+    "access_voice":         {"domain": "accessibility", "risk": "low"},
+    "access_zoom":          {"domain": "accessibility", "risk": "low"},
+    "settings_airplane":    {"domain": "accessibility", "risk": "medium"},
+    "settings_bluetooth":   {"domain": "accessibility", "risk": "medium"},
+    "settings_brightness":  {"domain": "accessibility", "risk": "low"},
+    "settings_dnd":         {"domain": "accessibility", "risk": "low"},
+    "settings_wifi":        {"domain": "accessibility", "risk": "medium"},
+    # Shortcuts & automations
+    "shortcut_list":        {"domain": "shortcuts",  "risk": "low"},
+    "shortcut_create":      {"domain": "shortcuts",  "risk": "medium"},
+    "shortcut_run":         {"domain": "shortcuts",  "risk": "medium"},
+    # Podcasts
+    "podcast_find":         {"domain": "podcast",    "risk": "low"},
+    "podcast_queue":        {"domain": "podcast",    "risk": "low"},
+    "podcast_subscribe":    {"domain": "podcast",    "risk": "low"},
+    # Recipes & grocery
+    "recipe_find":          {"domain": "recipe",     "risk": "low"},
+    "recipe_save":          {"domain": "recipe",     "risk": "low"},
+    "recipe_scale":         {"domain": "recipe",     "risk": "low"},
+    "recipe_nutrition":     {"domain": "recipe",     "risk": "low"},
+    "grocery_list":         {"domain": "grocery",    "risk": "low"},
+    "grocery_add":          {"domain": "grocery",    "risk": "low"},
+    "grocery_order":        {"domain": "grocery",    "risk": "high"},
+    # Books
+    "book_library":         {"domain": "books",      "risk": "low"},
+    "book_find":            {"domain": "books",      "risk": "low"},
+    "book_read":            {"domain": "books",      "risk": "low"},
+    "book_highlight":       {"domain": "books",      "risk": "low"},
+    # Translation
+    "translate_text":       {"domain": "translate",  "risk": "low"},
+    "translate_detect":     {"domain": "translate",  "risk": "low"},
+    "translate_conversation":{"domain": "translate", "risk": "low"},
+    # Payments
+    "payments_history":     {"domain": "payments",   "risk": "low"},
+    "payments_balance":     {"domain": "payments",   "risk": "low"},
+    "payments_send":        {"domain": "payments",   "risk": "high"},
+    "payments_request":     {"domain": "payments",   "risk": "medium"},
+    "payments_split":       {"domain": "payments",   "risk": "medium"},
+    # Alarm extended
+    "alarm_set":            {"domain": "clock",      "risk": "low"},
+    "alarm_delete":         {"domain": "clock",      "risk": "medium"},
+    # Network
+    "network_view":         {"domain": "network",    "risk": "low"},
+    # MCP tool execution
+    "mcp_tool_call":        {"domain": "system",     "risk": "medium"},
 }
 COMMUTATIVE_MERGE_OPS = {"add_task", "add_note", "add_expense"}
 
@@ -17955,9 +20966,10 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
             }
 
     if risk == "high" and not bool(payload.get("confirmed")):
+        op_name = str(capability.get("name", "this action")).replace("_", " ")
         return {
             "allowed": False,
-            "reason": "Policy requires confirmation for high-risk action. Try: confirm reset memory",
+            "reason": f"Policy requires confirmation for high-risk action: {op_name}. Add 'confirm' to proceed.",
             "code": "confirmation_required",
         }
     if capability["name"] in {"list_files", "read_file"}:
@@ -18438,6 +21450,13 @@ def should_record_undo(op_type: str) -> bool:
         "social_status",
         "social_feed_read",
         "social_message_send",
+        "social_dm_send",
+        "social_profile_read",
+        "social_react",
+        "social_comment",
+        "social_follow",
+        "social_notifications",
+        "social_trending",
         "export_trace",
         "restore_preview",
         "list_checkpoints",
@@ -18445,6 +21464,24 @@ def should_record_undo(op_type: str) -> bool:
         "list_faults",
         "compact_journal",
         "retry_persist",
+        # Reference
+        "dict_define", "dict_etymology", "dict_thesaurus", "dict_wikipedia",
+        # Date calc
+        "date_age", "date_countdown", "date_day_of", "date_days_until",
+        # Currency & Units
+        "currency_rates", "currency_convert", "unit_convert",
+        # Clock
+        "alarm_list", "clock_world", "clock_stopwatch", "clock_bedtime",
+        # Health
+        "health_steps", "health_heart_rate", "health_sleep",
+        "health_workout_log", "health_workout_start", "health_food_log",
+        "health_water", "health_weight", "health_mood", "health_medication",
+        "health_hrv", "health_cycle", "health_streak", "health_goals",
+        # GitHub / Jira / Notion / Asana reads
+        "github_my_prs", "github_pr_view", "github_repo_search",
+        "jira_my_issues", "jira_sprint", "jira_view",
+        "notion_find", "notion_database",
+        "asana_my_tasks", "asana_project",
     }
 
 
@@ -27292,6 +30329,71 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         graph_add_event(graph, "add_note", {"text": text[:120]})
         return {"ok": True, "message": "Note captured."}
 
+    # ── Notes extended ops (T-B05) ────────────────────────────────────────────
+    if kind in ("note_edit", "note_delete", "note_pin", "note_search", "note_tag"):
+        name   = str(payload.get("name", payload.get("title", "")) or "").strip()
+        query  = str(payload.get("query", name) or "").strip()
+        content = str(payload.get("content", payload.get("text", "")) or "").strip()
+        tag    = str(payload.get("tag", "") or "").strip()
+        entities = [e for e in graph.get("entities", []) if e.get("kind") == "note"]
+
+        if kind == "note_search":
+            matched = [e for e in entities
+                       if query.lower() in str(e.get("text", "")).lower()] if query else entities
+            lines = [f"notes: {len(matched)}"] + [str(e.get("text", ""))[:80] for e in matched[:8]]
+            return {"ok": True, "message": f"Notes: {len(matched)} found",
+                    "previewLines": lines[:10],
+                    "data": {"op": kind, "notes": matched, "query": query}}
+
+        if kind == "note_delete":
+            if not name and not query:
+                return {"ok": False, "message": "Note name required.", "previewLines": ["missing: name"]}
+            target = next((e for e in entities if query.lower() in str(e.get("text", "")).lower()), None)
+            if not target:
+                return {"ok": False, "message": f"Note not found: {query}",
+                        "previewLines": [f"query: {query}"]}
+            graph["entities"] = [e for e in graph.get("entities", []) if e.get("id") != target.get("id")]
+            graph_add_event(graph, kind, {"noteId": target.get("id", ""), "text": str(target.get("text", ""))[:80]})
+            return {"ok": True, "message": f"Note deleted: {str(target.get('text',''))[:60]}",
+                    "previewLines": [f"deleted: {str(target.get('text',''))[:80]}"],
+                    "data": {"op": kind, "noteId": target.get("id", "")}}
+
+        if kind == "note_edit":
+            target = next((e for e in entities if name.lower() in str(e.get("text", "")).lower()), None)
+            if not target:
+                return {"ok": False, "message": f"Note not found: {name}", "previewLines": [f"query: {name}"]}
+            if content:
+                target["text"] = content
+                target["updatedAt"] = now_ms()
+            graph_add_event(graph, kind, {"noteId": target.get("id", ""), "text": content[:80]})
+            return {"ok": True, "message": "Note updated",
+                    "previewLines": [f"updated: {content[:80] or str(target.get('text',''))[:80]}"],
+                    "data": {"op": kind, "noteId": target.get("id", "")}}
+
+        if kind == "note_pin":
+            target = next((e for e in entities if name.lower() in str(e.get("text", "")).lower()), None)
+            if not target:
+                return {"ok": False, "message": f"Note not found: {name}", "previewLines": [f"query: {name}"]}
+            target["pinned"] = not bool(target.get("pinned", False))
+            action = "pinned" if target["pinned"] else "unpinned"
+            graph_add_event(graph, kind, {"noteId": target.get("id", ""), "pinned": target["pinned"]})
+            return {"ok": True, "message": f"Note {action}: {str(target.get('text',''))[:60]}",
+                    "previewLines": [f"{action}: {str(target.get('text',''))[:80]}"],
+                    "data": {"op": kind, "noteId": target.get("id", ""), "pinned": target["pinned"]}}
+
+        if kind == "note_tag":
+            target = next((e for e in entities if name.lower() in str(e.get("text", "")).lower()), None)
+            if not target:
+                return {"ok": False, "message": f"Note not found: {name}", "previewLines": [f"query: {name}"]}
+            tags = list(target.get("tags", []))
+            if tag and tag not in tags:
+                tags.append(tag)
+                target["tags"] = tags
+            graph_add_event(graph, kind, {"noteId": target.get("id", ""), "tag": tag})
+            return {"ok": True, "message": f"Tagged note: #{tag}",
+                    "previewLines": [f"note: {str(target.get('text',''))[:60]}", f"tags: {', '.join(tags)}"],
+                    "data": {"op": kind, "noteId": target.get("id", ""), "tags": tags}}
+
     if kind == "link_entities":
         source = find_entity_by_kind_selector(graph, str(payload.get("sourceKind", "")), str(payload.get("sourceSelector", "")))
         target = find_entity_by_kind_selector(graph, str(payload.get("targetKind", "")), str(payload.get("targetSelector", "")))
@@ -27465,6 +30567,28 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         reminder["nextRunAt"] = now_ms() + (interval_ms if interval_ms > 0 else 1000)
         graph_add_event(graph, "resume_reminder", {"jobId": reminder.get("id"), "kind": reminder.get("kind", "remind_note")})
         return {"ok": True, "message": f"Resumed reminder {str(reminder.get('id', ''))[:8]}"}
+
+    # ── Reminder extended ops (T-B06) ────────────────────────────────────────
+    if kind in ("reminder_delete", "reminder_recurring", "reminder_snooze"):
+        selector = str(payload.get("selector", payload.get("name", payload.get("id", ""))) or "").strip()
+
+        if kind == "reminder_delete":
+            # Delegate to cancel_reminder
+            return run_operation(session, {**op, "type": "cancel_reminder", "payload": {"selector": selector}})
+
+        if kind == "reminder_snooze":
+            # Delegate to pause_reminder
+            return run_operation(session, {**op, "type": "pause_reminder", "payload": {"selector": selector}})
+
+        if kind == "reminder_recurring":
+            text = str(payload.get("text", payload.get("note", "")) or "").strip()
+            minutes = int(payload.get("intervalMinutes", payload.get("minutes", 0)) or 0)
+            if not text:
+                return {"ok": False, "message": "Reminder text required.", "previewLines": ["missing: text"]}
+            if minutes <= 0:
+                return {"ok": False, "message": "Interval minutes required.", "previewLines": ["missing: intervalMinutes"]}
+            return run_operation(session, {**op, "type": "schedule_remind_note",
+                                           "payload": {"text": text, "intervalMinutes": minutes}})
 
     if kind == "schedule_audit_open_tasks":
         minutes = int(payload.get("intervalMinutes", 0) or 0)
@@ -29759,6 +32883,72 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             ],
         }
 
+    if kind in ("location_directions", "location_distance", "location_nearby",
+                "location_saved", "location_share", "location_traffic"):
+        origin = str(payload.get("origin", "") or "").strip()
+        dest   = str(payload.get("destination", payload.get("dest", "")) or "").strip()
+        query  = str(payload.get("query", payload.get("place", "")) or "").strip()
+        location = resolve_user_location_hint()
+
+        if kind == "location_directions":
+            if not dest:
+                return {"ok": False, "message": "Destination required for directions.",
+                        "previewLines": ["missing: destination"]}
+            from_label = origin or location
+            maps_url = f"https://www.google.com/maps/dir/{from_label.replace(' ', '+')}/{dest.replace(' ', '+')}"
+            lines = [f"from: {from_label}", f"to: {dest}", f"maps: {maps_url}"]
+            graph_add_event(graph, kind, {"origin": from_label, "dest": dest})
+            return {"ok": True, "message": f"Directions to {dest}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "origin": from_label, "destination": dest, "mapsUrl": maps_url}}
+
+        if kind == "location_distance":
+            place_a = origin or location
+            place_b = dest or query
+            if not place_b:
+                return {"ok": False, "message": "Two places required for distance.",
+                        "previewLines": ["missing: destination"]}
+            maps_url = f"https://www.google.com/maps/dir/{place_a.replace(' ', '+')}/{place_b.replace(' ', '+')}"
+            lines = [f"from: {place_a}", f"to: {place_b}", f"maps: {maps_url}"]
+            return {"ok": True, "message": f"Distance: {place_a} \u2192 {place_b}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "placeA": place_a, "placeB": place_b, "mapsUrl": maps_url}}
+
+        if kind == "location_nearby":
+            place_type = query or "restaurants"
+            near = origin or location
+            maps_url = f"https://www.google.com/maps/search/{place_type.replace(' ', '+')}/@{near.replace(' ', '+')}"
+            lines = [f"searching: {place_type}", f"near: {near}", f"maps: {maps_url}"]
+            graph_add_event(graph, kind, {"query": place_type, "near": near})
+            return {"ok": True, "message": f"Nearby: {place_type}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "query": place_type, "near": near, "mapsUrl": maps_url}}
+
+        if kind == "location_saved":
+            # Scaffold: return mock saved places
+            saved = [
+                {"name": "Home", "address": "Saved home location", "type": "home"},
+                {"name": "Work", "address": "Saved work location", "type": "work"},
+            ]
+            lines = [f"saved places: {len(saved)}"] + [f"{p['name']}: {p['address']}" for p in saved]
+            return {"ok": True, "message": "Saved places",
+                    "previewLines": lines[:8],
+                    "data": {"op": kind, "places": saved, "source": "scaffold"}}
+
+        if kind == "location_share":
+            loc = origin or location
+            lines = [f"location: {loc}", "sharing via Genome relay (scaffold)"]
+            return {"ok": True, "message": f"Sharing location: {loc}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "location": loc, "source": "scaffold"}}
+
+        if kind == "location_traffic":
+            route = dest or query or location
+            lines = [f"route: {route}", "traffic: normal (scaffold)", "delay: <5 min"]
+            return {"ok": True, "message": f"Traffic for {route}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "route": route, "trafficLevel": "normal", "source": "scaffold"}}
+
     if kind == "shop_catalog_search":
         query = str(payload.get("query", "")).strip()
         category = str(payload.get("category", "")).strip().lower()
@@ -30174,7 +33364,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             "data": {"op": "terminal_run", "command": command},
         }
 
-    if kind in ("calendar_create", "calendar_list", "calendar_cancel"):
+    if kind in ("calendar_create", "calendar_list", "calendar_cancel",
+                "calendar_reschedule", "calendar_rsvp", "calendar_invite",
+                "calendar_availability", "calendar_recurring"):
         action = str(payload.get("action", kind.replace("calendar_", ""))).strip()
         title  = str(payload.get("title", "")).strip()
         date   = str(payload.get("date", "")).strip()
@@ -30184,14 +33376,25 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"event: {title}")
         if date:
             lines.append(f"when: {date}")
+        cal_data: dict[str, Any] = {"op": kind, "action": action, "title": title, "date": date}
+        # Enrich list/view operations with live/scaffold calendar events
+        if kind in ("calendar_list", "calendar_availability"):
+            snap = gcal_events_snapshot(days=int(payload.get("days", 7) or 7))
+            cal_data["events"] = snap.get("events", [])
+            cal_data["connector_source"] = snap.get("source", "scaffold")
+            if snap.get("events"):
+                first = snap["events"][0]
+                lines.append(f"next: {first.get('summary', '')} @ {str(first.get('start',''))[:16]}")
         return {
             "ok": True,
             "message": f"Calendar {action}" + (f": {title}" if title else ""),
             "previewLines": lines,
-            "data": {"op": kind, "action": action, "title": title, "date": date},
+            "data": cal_data,
         }
 
-    if kind in ("email_compose", "email_read", "email_reply", "email_search"):
+    if kind in ("email_compose", "email_read", "email_reply", "email_search",
+                "email_forward", "email_archive", "email_unsubscribe",
+                "email_label", "email_snooze"):
         action  = str(payload.get("action", kind.replace("email_", ""))).strip()
         to      = str(payload.get("to", "")).strip()
         subject = str(payload.get("subject", "")).strip()
@@ -30207,11 +33410,36 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"from: {sender}")
         if query:
             lines.append(f"query: {query}")
+        email_data: dict[str, Any] = {"op": kind, "action": action, "to": to, "subject": subject, "query": query, "from": sender}
+        # Enrich read/search with live/scaffold messages
+        if kind in ("email_read", "email_search"):
+            snap = gmail_list_snapshot(max_results=10)
+            email_data["messages"] = snap.get("messages", [])
+            email_data["unread_count"] = snap.get("unread_count", 0)
+            email_data["connector_source"] = snap.get("source", "scaffold")
+            if snap.get("messages"):
+                first = snap["messages"][0]
+                lines.append(f"inbox: {first.get('subject', '')} from {first.get('from', '')}")
+        # Delegate compose/reply/forward to gmail.send when token present
+        if kind in ("email_compose", "email_reply", "email_forward") and to and subject:
+            gmail_token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+            if gmail_token:
+                return run_operation(session, {**op, "type": "gmail.send",
+                                               "payload": {"to": to, "subject": subject,
+                                                           "body": str(payload.get("body", "") or "")}})
+        # Delegate archive to gmail.trash when token present
+        if kind == "email_archive":
+            msg_id = str(payload.get("messageId", payload.get("id", "")) or "")
+            if msg_id:
+                gmail_token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+                if gmail_token:
+                    return run_operation(session, {**op, "type": "gmail.trash",
+                                                   "payload": {"messageId": msg_id}})
         return {
             "ok": True,
             "message": f"Email {action}" + (f" → {to}" if to else ""),
             "previewLines": lines,
-            "data": {"op": kind, "action": action, "to": to, "subject": subject, "query": query, "from": sender},
+            "data": email_data,
         }
 
     if kind == "mcp_tool_call":
@@ -30266,6 +33494,80 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    if kind in ("contacts_list", "contacts_create", "contacts_edit", "contacts_delete",
+                "contacts_favorite", "contacts_call", "contacts_message"):
+        query  = str(payload.get("query", payload.get("filter", "")) or "").strip()
+        name   = str(payload.get("name", "") or "").strip()
+        phone  = str(payload.get("phone", "") or "").strip()
+        email  = str(payload.get("email", "") or "").strip()
+        target = str(payload.get("target", name or query) or "").strip()
+
+        if kind == "contacts_list":
+            snap = contacts_lookup_snapshot(query=query)
+            items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+            lines = [f"contacts: {len(items)}"] + [f"{c.get('name','?')} | {c.get('phone','')}" for c in items[:8]]
+            return {"ok": True, "message": "Contacts",
+                    "previewLines": lines[:10],
+                    "data": {"op": kind, "items": items, "query": query, "source": snap.get("source", "scaffold")}}
+
+        if kind == "contacts_create":
+            if not name:
+                return {"ok": False, "message": "Name required to create contact.",
+                        "previewLines": ["missing: name"]}
+            graph_add_event(graph, kind, {"name": name, "phone": phone, "email": email})
+            lines = [f"created: {name}"]
+            if phone: lines.append(f"phone: {phone}")
+            if email: lines.append(f"email: {email}")
+            return {"ok": True, "message": f"Contact created: {name}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "name": name, "phone": phone, "email": email, "source": "scaffold"}}
+
+        if kind == "contacts_edit":
+            if not target:
+                return {"ok": False, "message": "Contact name required to edit.",
+                        "previewLines": ["missing: name"]}
+            graph_add_event(graph, kind, {"target": target, "phone": phone, "email": email})
+            lines = [f"editing: {target}"]
+            if phone: lines.append(f"new phone: {phone}")
+            if email: lines.append(f"new email: {email}")
+            return {"ok": True, "message": f"Contact updated: {target}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "target": target, "phone": phone, "email": email, "source": "scaffold"}}
+
+        if kind == "contacts_delete":
+            if not target:
+                return {"ok": False, "message": "Contact name required to delete.",
+                        "previewLines": ["missing: name"]}
+            graph_add_event(graph, kind, {"target": target})
+            return {"ok": True, "message": f"Contact deleted: {target}",
+                    "previewLines": [f"deleted: {target}", "action: removed from contacts"],
+                    "data": {"op": kind, "target": target, "source": "scaffold"}}
+
+        if kind == "contacts_favorite":
+            if not target:
+                return {"ok": False, "message": "Contact name required.",
+                        "previewLines": ["missing: name"]}
+            graph_add_event(graph, kind, {"target": target})
+            return {"ok": True, "message": f"Favorited: {target}",
+                    "previewLines": [f"favorited: {target}"],
+                    "data": {"op": kind, "target": target, "source": "scaffold"}}
+
+        if kind == "contacts_call":
+            if not target:
+                return {"ok": False, "message": "Contact name or number required.",
+                        "previewLines": ["missing: target"]}
+            # Delegate to telephony_call_start
+            return run_operation(session, {**op, "type": "telephony_call_start", "payload": {"target": target}})
+
+        if kind == "contacts_message":
+            if not target:
+                return {"ok": False, "message": "Contact name required.",
+                        "previewLines": ["missing: target"]}
+            text = str(payload.get("text", payload.get("message", "")) or "").strip()
+            # Delegate to messaging_send
+            return run_operation(session, {**op, "type": "messaging_send",
+                                           "payload": {"to": target, "text": text}})
+
     if kind == "telephony_status":
         granted = connector_scope_granted("telephony.call.start")
         contacts_granted = connector_scope_granted("contacts.read")
@@ -30305,35 +33607,86 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "previewLines": [f"try: find contact {input_target}"],
                 }
             resolved_target = str(contact.get("phone", "")).strip() or input_target
-        force_handoff = bool(payload.get("forceHandoff", False))
-        mode = "handoff_to_mobile" if force_handoff else "bridge_prepare"
+        contact_name = str((contact or {}).get("name", "")).strip()
+        display_target = contact_name or resolved_target
+
+        # ── Twilio live path ──────────────────────────────────────────────────
+        twilio_creds = _auth.vault_retrieve("twilio.voice")
+        # Fall back to env vars if vault not yet seeded
+        acct_sid = (twilio_creds or {}).get("account_sid") or TWILIO_ACCOUNT_SID
+        auth_tok = (twilio_creds or {}).get("auth_token") or TWILIO_AUTH_TOKEN
+        from_num = (twilio_creds or {}).get("phone_number") or TWILIO_PHONE_NUMBER
+
+        if not (acct_sid and auth_tok and from_num):
+            return {
+                "ok": False,
+                "message": "Twilio not configured. Enter your Account SID, Auth Token, and phone number to enable calling.",
+                "previewLines": [
+                    "action: configure Twilio",
+                    "set TWILIO_ACCOUNT_SID in .env",
+                    "set TWILIO_AUTH_TOKEN in .env",
+                    "set TWILIO_PHONE_NUMBER in .env (E.164 format: +1...)",
+                ],
+                "data": {"action": "setup_twilio"},
+            }
+
+        webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
+        twiml_url = f"{webhook_base}/api/telephony/twiml/connect" if webhook_base else ""
+        status_cb = f"{webhook_base}/api/telephony/inbound" if webhook_base else ""
+
+        try:
+            resp = httpx.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Calls.json",
+                auth=(acct_sid, auth_tok),
+                data={
+                    "To": resolved_target,
+                    "From": from_num,
+                    "Url": twiml_url or "http://twimlets.com/holdmusic?Bucket=com.twilio.music.classical",
+                    "StatusCallback": status_cb,
+                    "StatusCallbackMethod": "POST",
+                    "StatusCallbackEvent": "initiated ringing answered completed",
+                },
+                timeout=10,
+            )
+            call_data = resp.json()
+        except Exception as exc:
+            return {"ok": False, "message": f"Twilio error: {exc}"}
+
+        if resp.status_code not in (200, 201):
+            err = call_data.get("message", "unknown error")
+            return {"ok": False, "message": f"Twilio rejected call: {err}"}
+
+        call_sid = str(call_data.get("sid", ""))
+        _CALL_STATES[call_sid] = {
+            "state": "ringing",
+            "to": resolved_target,
+            "from_": from_num,
+            "contactName": contact_name,
+            "startedAt": _time.time(),
+            "sessionId": sid,
+        }
         graph_add_event(
             graph,
             "telephony_call_start",
-            {
-                "target": resolved_target[:80],
-                "mode": mode,
-                "contactName": str((contact or {}).get("name", ""))[:80],
-            },
+            {"target": resolved_target[:80], "callSid": call_sid, "contactName": contact_name[:80]},
         )
-        lines = [
-            f"target: {resolved_target}",
-            "connector: telephony.bridge",
-            f"mode: {mode}",
-            "next: start handoff",
-            "next: open this same session on mobile and claim token",
-        ]
-        if isinstance(contact, dict) and str(contact.get("name", "")).strip():
-            lines.insert(1, f"contact: {str(contact.get('name', '')).strip()} ({str(contact.get('label', '')).strip()})")
         return {
             "ok": True,
-            "message": f"Call prepared for {resolved_target}. Continue on mobile.",
-            "previewLines": lines[:10],
+            "message": f"Calling {display_target}…",
+            "previewLines": [
+                f"calling: {display_target}",
+                f"number: {resolved_target}",
+                f"from: {from_num}",
+                f"sid: {call_sid}",
+                "state: ringing",
+            ],
             "data": {
-                "target": resolved_target,
-                "mode": mode,
-                "contactName": str((contact or {}).get("name", "")),
-                "steps": lines[2:],
+                "scene": "phone",
+                "callSid": call_sid,
+                "state": "ringing",
+                "to": resolved_target,
+                "contactName": contact_name,
+                "displayTarget": display_target,
             },
         }
 
@@ -30402,6 +33755,56 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "limit": int(limit),
             },
         }
+
+    # ── Banking extended ops (T-A08) ─────────────────────────────────────────
+    if kind in ("banking_history", "banking_statement"):
+        limit = max(1, min(int(payload.get("limit", 20) or 20), 50))
+        account = str(payload.get("account", "") or "")
+        snap = banking_transactions_snapshot(limit=limit)
+        items = snap.get("items", []) if isinstance(snap.get("items"), list) else []
+        source = str(snap.get("source", "scaffold"))
+        lines = [f"transactions: {len(items)} | source: {source}"]
+        if account:
+            lines.append(f"account: {account}")
+        for tx in items[:8]:
+            amt = float(tx.get("amount", 0) or 0)
+            lines.append(f"{str(tx.get('date', '-'))} | {str(tx.get('merchant', '-'))} | ${amt:,.2f}")
+        graph_add_event(graph, kind, {"limit": limit, "account": account})
+        return {"ok": snap.get("ok", True), "message": "Transaction history",
+                "previewLines": lines[:10],
+                "data": {"op": kind, "items": items, "account": account, "source": source}}
+
+    if kind in ("banking_pay", "banking_transfer"):
+        to    = str(payload.get("to", payload.get("recipient", "")) or "").strip()
+        amount = float(payload.get("amount", 0) or 0)
+        note  = str(payload.get("note", payload.get("memo", "")) or "").strip()
+        if not to or amount <= 0:
+            return {"ok": False, "message": "Recipient and amount required.",
+                    "previewLines": ["missing: to, amount"]}
+        # High-risk — Plaid payment initiation when connected, else scaffold with confirm
+        plaid_creds = _auth.vault_retrieve("plaid")
+        if plaid_creds and _effective_mode("plaid", PLAID_PROVIDER_MODE) == "live":
+            try:
+                access_token = plaid_creds.get("access_token", "") if isinstance(plaid_creds, dict) else ""
+                resp = httpx.post(
+                    f"https://{PLAID_ENV}.plaid.com/payment_initiation/payment/create",
+                    json={"client_id": PLAID_CLIENT_ID, "secret": PLAID_SECRET,
+                          "recipient_id": to, "reference": note or kind,
+                          "amount": {"currency": "USD", "value": amount}},
+                    timeout=15,
+                )
+                data = resp.json()
+                return {"ok": bool(data.get("payment_id")), "message": f"Payment initiated: ${amount:.2f} → {to}",
+                        "previewLines": [f"to: {to}", f"amount: ${amount:.2f}", f"source: live"],
+                        "data": {"op": kind, "to": to, "amount": amount, "source": "live", **data}}
+            except Exception:
+                pass
+        graph_add_event(graph, kind, {"to": to, "amount": amount, "note": note})
+        return {"ok": True, "message": f"Payment ready: ${amount:.2f} → {to} (confirm to send)",
+                "previewLines": [f"to: {to}", f"amount: ${amount:.2f}", f"note: {note or '(none)'}",
+                                 "action: confirm required"],
+                "data": {"op": kind, "to": to, "amount": amount, "note": note, "source": "scaffold",
+                         "requiresConfirm": True}}
 
     if kind == "contacts_status":
         lines = [
@@ -30484,6 +33887,295 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "source": source,
             },
         }
+
+    if kind == "social_dm_send":
+        recipient = str(payload.get("recipient", "")).strip()
+        text = str(payload.get("text", "")).strip()
+        if not recipient or not text:
+            return {"ok": False, "message": "social_dm_send requires recipient and text.", "previewLines": ["missing: recipient or text"]}
+        sent = bluesky_dm_snapshot(recipient, text)
+        if not bool(sent.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "DM send failed.",
+                "previewLines": [f"recipient: {recipient}", f"error: {str(sent.get('error', 'provider unavailable'))}"],
+            }
+        graph_add_event(graph, "social_dm_send", {"recipient": recipient, "chars": len(text)})
+        return {
+            "ok": True,
+            "message": f"DM sent to {recipient}.",
+            "previewLines": [f"recipient: {recipient}", f"convoId: {str(sent.get('convoId', '-'))}", "delivery: sent"],
+            "data": {"recipient": recipient, "convoId": str(sent.get("convoId", "")), "action": "dm_sent"},
+        }
+
+    if kind == "social_profile_read":
+        actor = str(payload.get("actor", "")).strip()
+        if not actor:
+            return {"ok": False, "message": "social_profile_read requires actor.", "previewLines": ["missing: actor"]}
+        prof = bluesky_profile_snapshot(actor)
+        if not bool(prof.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Profile unavailable.",
+                "previewLines": [f"actor: {actor}", f"error: {str(prof.get('error', 'provider unavailable'))}"],
+            }
+        graph_add_event(graph, "social_profile_read", {"actor": actor})
+        lines = [
+            f"handle: {str(prof.get('handle', '-'))}",
+            f"display: {str(prof.get('displayName', '-'))}",
+            f"followers: {prof.get('followersCount', '-')} | following: {prof.get('followsCount', '-')} | posts: {prof.get('postsCount', '-')}",
+            f"bio: {str(prof.get('description', ''))[:120]}",
+        ]
+        return {"ok": True, "message": f"Profile: {actor}.", "previewLines": lines[:10], "data": prof}
+
+    if kind == "social_react":
+        uri = str(payload.get("uri", "")).strip()
+        cid = str(payload.get("cid", "")).strip()
+        if not uri or not cid:
+            return {"ok": False, "message": "social_react requires uri and cid.", "previewLines": ["missing: uri or cid"]}
+        result = bluesky_like_snapshot(uri, cid)
+        if not bool(result.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "React (like) failed.",
+                "previewLines": [f"uri: {uri}", f"error: {str(result.get('error', 'provider unavailable'))}"],
+            }
+        graph_add_event(graph, "social_react", {"uri": uri, "action": "liked"})
+        return {
+            "ok": True,
+            "message": "Post liked.",
+            "previewLines": [f"uri: {uri}", "action: liked"],
+            "data": {"uri": uri, "action": "liked"},
+        }
+
+    if kind == "social_comment":
+        uri = str(payload.get("uri", "")).strip()
+        cid = str(payload.get("cid", "")).strip()
+        text = str(payload.get("text", "")).strip()
+        if not uri or not cid or not text:
+            return {"ok": False, "message": "social_comment requires uri, cid, and text.", "previewLines": ["missing: uri, cid, or text"]}
+        result = bluesky_reply_snapshot(uri, cid, text)
+        if not bool(result.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Comment (reply) failed.",
+                "previewLines": [f"uri: {uri}", f"error: {str(result.get('error', 'provider unavailable'))}"],
+            }
+        graph_add_event(graph, "social_comment", {"uri": uri, "chars": len(text)})
+        return {
+            "ok": True,
+            "message": "Reply posted.",
+            "previewLines": [f"uri: {uri}", f"text: {text[:80]}"],
+            "data": {"uri": uri, "action": "replied"},
+        }
+
+    if kind == "social_follow":
+        actor = str(payload.get("actor", "")).strip()
+        unfollow = bool(payload.get("unfollow", False))
+        if not actor:
+            return {"ok": False, "message": "social_follow requires actor.", "previewLines": ["missing: actor"]}
+        result = bluesky_follow_snapshot(actor, unfollow=unfollow)
+        if not bool(result.get("ok", False)):
+            return {
+                "ok": False,
+                "message": f"{'Unfollow' if unfollow else 'Follow'} failed.",
+                "previewLines": [f"actor: {actor}", f"error: {str(result.get('error', 'provider unavailable'))}"],
+            }
+        action = str(result.get("action", "followed"))
+        graph_add_event(graph, "social_follow", {"actor": actor, "action": action})
+        return {
+            "ok": True,
+            "message": f"{action.capitalize()}: {actor}.",
+            "previewLines": [f"actor: {actor}", f"action: {action}"],
+            "data": {"actor": actor, "action": action},
+        }
+
+    if kind == "social_notifications":
+        notifs = bluesky_notifications_snapshot()
+        if not bool(notifs.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Notifications unavailable.",
+                "previewLines": [f"error: {str(notifs.get('error', 'provider unavailable'))}"],
+            }
+        items = notifs.get("items", []) if isinstance(notifs.get("items"), list) else []
+        unread = int(notifs.get("unread", 0))
+        graph_add_event(graph, "social_notifications", {"count": len(items), "unread": unread})
+        lines = [f"notifications: {len(items)} ({unread} unread)"]
+        for n in items[:5]:
+            lines.append(f"{str(n.get('reason', '-'))} | {str(n.get('author', '-'))} | {str(n.get('age', '-'))}")
+        return {
+            "ok": True,
+            "message": f"Notifications: {len(items)} ({unread} unread).",
+            "previewLines": lines[:10],
+            "data": {"items": items, "unread": unread},
+        }
+
+    if kind == "social_trending":
+        trending = bluesky_trending_snapshot()
+        if not bool(trending.get("ok", False)):
+            return {
+                "ok": False,
+                "message": "Trending unavailable.",
+                "previewLines": [f"error: {str(trending.get('error', 'provider unavailable'))}"],
+            }
+        topics = trending.get("topics", []) if isinstance(trending.get("topics"), list) else []
+        graph_add_event(graph, "social_trending", {"count": len(topics)})
+        lines = [f"trending topics: {len(topics)}"]
+        for t in topics[:8]:
+            lines.append(str(t.get("topic", "-")))
+        return {
+            "ok": True,
+            "message": f"Trending: {len(topics)} topics.",
+            "previewLines": lines[:10],
+            "data": {"topics": topics},
+        }
+
+    # ── GitHub ─────────────────────────────────────────────────────────────────
+    if kind in {"github_my_prs", "github_pr_view", "github_repo_search"}:
+        repo = str(payload.get("repo") or "")
+        item_kind = "issues" if kind == "github_repo_search" else "prs"
+        snap = github_snapshot(repo=repo, kind=item_kind)
+        if not snap.get("ok"):
+            return {"ok": False, "message": snap.get("error", "GitHub unavailable"),
+                    "previewLines": [f"error: {snap.get('error', '')}"], "data": snap}
+        items = snap.get("items", [])
+        graph_add_event(graph, kind, {"count": len(items), "repo": repo})
+        label = "issues" if item_kind == "issues" else "PRs"
+        lines = [f"github {label}: {len(items)}"]
+        for it in items[:8]:
+            lines.append(f"#{it.get('number')} {str(it.get('title',''))[:60]} [{it.get('state','')}]")
+        return {"ok": True, "message": f"{len(items)} open {label}.",
+                "previewLines": lines[:10],
+                "data": {"items": items, "kind": item_kind, "repo": repo,
+                         "source": snap.get("source", "scaffold")}}
+
+    if kind == "github_issue_create":
+        repo = str(payload.get("repo") or "")
+        title = str(payload.get("title") or payload.get("query") or "New Issue")
+        body_text = str(payload.get("body") or "")
+        if not repo:
+            return {"ok": False, "message": "Specify a repo (e.g. org/name).",
+                    "previewLines": ["error: repo required"]}
+        result = github_issue_create_snapshot(repo=repo, title=title, body=body_text)
+        graph_add_event(graph, "github_issue_create", {"repo": repo, "title": title})
+        lines = [f"created: #{result.get('number', '?')} {title}", f"repo: {repo}"]
+        return {"ok": bool(result.get("ok")), "message": f"Issue #{result.get('number', '?')} created in {repo}.",
+                "previewLines": lines, "data": result}
+
+    if kind == "github_commit":
+        repo = str(payload.get("repo") or "")
+        snap = github_snapshot(repo=repo, kind="prs")
+        graph_add_event(graph, "github_commit", {"repo": repo})
+        return {"ok": True, "message": f"Recent activity for {repo or 'your repos'}.",
+                "previewLines": [f"repo: {repo or 'all'}"],
+                "data": {"repo": repo, "items": snap.get("items", []), "kind": "prs",
+                         "source": snap.get("source", "scaffold")}}
+
+    # ── Jira ───────────────────────────────────────────────────────────────────
+    if kind in {"jira_my_issues", "jira_sprint", "jira_view"}:
+        jql_override = str(payload.get("jql") or "")
+        if kind == "jira_sprint":
+            jql_override = jql_override or "sprint in openSprints() ORDER BY updated DESC"
+        elif kind == "jira_view":
+            key = str(payload.get("key") or "")
+            jql_override = f"issue = {key}" if key else jql_override
+        snap = jira_snapshot(jql=jql_override) if jql_override else jira_snapshot()
+        if not snap.get("ok"):
+            return {"ok": False, "message": snap.get("error", "Jira unavailable"),
+                    "previewLines": [f"error: {snap.get('error', '')}"], "data": snap}
+        issues = snap.get("issues", [])
+        graph_add_event(graph, kind, {"count": len(issues)})
+        view = kind.replace("jira_", "").replace("_", " ")
+        lines = [f"jira {view}: {len(issues)}"]
+        for iss in issues[:8]:
+            lines.append(f"[{iss.get('key','')}] {str(iss.get('summary',''))[:55]} · {iss.get('status','')} · {iss.get('priority','')}")
+        return {"ok": True, "message": f"{len(issues)} issues.",
+                "previewLines": lines[:10],
+                "data": {"issues": issues, "view": view, "source": snap.get("source", "scaffold")}}
+
+    if kind == "jira_create":
+        project_key = str(payload.get("project") or "PROJ")
+        summary = str(payload.get("title") or payload.get("query") or "New Task")
+        issue_type = str(payload.get("type") or "Task")
+        result = jira_create_snapshot(project_key=project_key, summary=summary, issue_type=issue_type)
+        graph_add_event(graph, "jira_create", {"project": project_key, "summary": summary})
+        return {"ok": bool(result.get("ok")), "message": f"Jira {result.get('key', '?')} created.",
+                "previewLines": [f"[{result.get('key', '?')}] {summary}"], "data": result}
+
+    if kind == "jira_update":
+        key = str(payload.get("key") or "")
+        status = str(payload.get("status") or "")
+        graph_add_event(graph, "jira_update", {"key": key, "status": status})
+        return {"ok": True, "message": f"{key or 'Issue'} updated to {status or 'new status'}.",
+                "previewLines": [f"key: {key}", f"status: {status}"],
+                "data": {"key": key, "status": status}}
+
+    # ── Notion ─────────────────────────────────────────────────────────────────
+    if kind in {"notion_find", "notion_database"}:
+        query = str(payload.get("query") or "")
+        snap = notion_snapshot(query=query)
+        if not snap.get("ok"):
+            return {"ok": False, "message": snap.get("error", "Notion unavailable"),
+                    "previewLines": [f"error: {snap.get('error', '')}"], "data": snap}
+        pages = snap.get("pages", [])
+        graph_add_event(graph, kind, {"count": len(pages), "query": query})
+        lines = [f"notion pages: {len(pages)}"]
+        for p in pages[:8]:
+            lines.append(f"{p.get('type','page')} · {str(p.get('title',''))[:55]} · {p.get('last_edited','')}")
+        return {"ok": True,
+                "message": f"{len(pages)} pages{(' for «' + query + '»') if query else ''}.",
+                "previewLines": lines[:10],
+                "data": {"pages": pages, "query": query, "source": snap.get("source", "scaffold")}}
+
+    if kind == "notion_create":
+        title = str(payload.get("title") or payload.get("query") or "Untitled")
+        parent_id = str(payload.get("parent_id") or "")
+        result = notion_create_snapshot(title=title, parent_id=parent_id)
+        graph_add_event(graph, "notion_create", {"title": title})
+        return {"ok": bool(result.get("ok")), "message": f"Page «{title}» created.",
+                "previewLines": [f"title: {title}", f"id: {result.get('id', '?')}"], "data": result}
+
+    if kind == "notion_update":
+        page_id = str(payload.get("page_id") or "")
+        title = str(payload.get("title") or "")
+        graph_add_event(graph, "notion_update", {"page_id": page_id, "title": title})
+        return {"ok": True, "message": "Page updated.",
+                "previewLines": [f"page: {page_id}"],
+                "data": {"page_id": page_id, "title": title}}
+
+    # ── Asana ──────────────────────────────────────────────────────────────────
+    if kind in {"asana_my_tasks", "asana_project"}:
+        snap = asana_snapshot()
+        if not snap.get("ok"):
+            return {"ok": False, "message": snap.get("error", "Asana unavailable"),
+                    "previewLines": [f"error: {snap.get('error', '')}"], "data": snap}
+        tasks = snap.get("tasks", [])
+        graph_add_event(graph, kind, {"count": len(tasks)})
+        open_count = sum(1 for t in tasks if not t.get("completed"))
+        lines = [f"asana tasks: {len(tasks)} ({open_count} open)"]
+        for t in tasks[:8]:
+            due = str(t.get("due_on") or "")
+            lines.append(f"{'✓' if t.get('completed') else '○'} {str(t.get('name',''))[:55]}{(' · ' + due) if due else ''}")
+        return {"ok": True, "message": f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}.",
+                "previewLines": lines[:10],
+                "data": {"tasks": tasks, "source": snap.get("source", "scaffold")}}
+
+    if kind == "asana_create":
+        name = str(payload.get("title") or payload.get("query") or "New Task")
+        result = asana_create_snapshot(name=name)
+        graph_add_event(graph, "asana_create", {"name": name})
+        return {"ok": bool(result.get("ok")), "message": f"Task «{name}» created.",
+                "previewLines": [f"task: {name}"], "data": result}
+
+    if kind == "asana_update":
+        gid = str(payload.get("gid") or "")
+        status = str(payload.get("status") or "")
+        completed = bool(payload.get("completed", False))
+        graph_add_event(graph, "asana_update", {"gid": gid, "status": status})
+        return {"ok": True, "message": "Task updated.",
+                "previewLines": [f"task: {gid}"],
+                "data": {"gid": gid, "status": status, "completed": completed}}
 
     if kind == "list_connectors":
         manifests = list_connector_manifests()
@@ -30636,6 +34328,1806 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         graph_reset_domain_entities(graph, {"task", "expense", "note"})
         graph_add_event(graph, "reset_memory", {"scope": "task+expense+note"})
         return {"ok": True, "message": "Memory reset."}
+
+    # ── TAXONOMY music → Spotify bridge ──────────────────────────────────────
+    _MUSIC_OPS = {"music_play", "music_pause", "music_skip", "music_queue",
+                  "music_volume", "music_like", "music_playlist_add",
+                  "music_playlist_create", "music_radio", "music_discover",
+                  "music_lyrics", "music_cast", "music_sleep_timer"}
+    if kind in _MUSIC_OPS:
+        snap = spotify_now_playing_snapshot()
+        track  = str(snap.get("track") or "")
+        artist = str(snap.get("artist") or "")
+        album  = str(snap.get("album") or "")
+        playing = bool(snap.get("is_playing", True))
+        if kind == "music_pause":
+            action_label = "Paused"
+        elif kind == "music_skip":
+            dir_hint = str(payload.get("direction", "next")).strip().lower()
+            action_label = "Previous track" if dir_hint == "previous" else "Next track"
+        elif kind == "music_volume":
+            vol = int(payload.get("volume", 50) or 50)
+            action_label = f"Volume {vol}%"
+        elif kind == "music_lyrics":
+            action_label = f"Lyrics: {track}"
+        else:
+            action_label = "Now playing" if playing else "Paused"
+        msg = action_label + (f": {track}" if track else "")
+        if artist:
+            msg += f" by {artist}"
+        lines = [f"track: {track or '(nothing)'}"]
+        if artist:
+            lines.append(f"artist: {artist}")
+        if album:
+            lines.append(f"album: {album}")
+        lines.append(f"source: {snap.get('source', 'scaffold')}")
+        return {
+            "ok": snap.get("ok", True),
+            "message": msg,
+            "previewLines": lines,
+            "data": {"op": kind, **snap},
+        }
+
+    # ── TAXONOMY slack → Slack connector bridge ───────────────────────────────
+    _SLACK_OPS = {"slack_send", "slack_read", "slack_search", "slack_status", "slack_reaction"}
+    if kind in _SLACK_OPS:
+        if kind == "slack_send":
+            channel = str(payload.get("channel", "") or "general")
+            text    = str(payload.get("text", payload.get("message", "")) or "")
+            ctrl_result = run_operation.__func__(session, {"type": "slack.send", "domain": "messaging", "payload": {"channel": channel, "text": text}}) if False else None  # noqa
+            if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+                return {"ok": True, "message": f"Sent to #{channel} (scaffold)", "previewLines": [f"channel: #{channel}", f"text: {text[:80]}"],
+                        "data": {"op": kind, "channel": channel, "text": text, "source": "scaffold"}}
+            token = _get_live_token("slack", None, None, None)
+            if not token:
+                return {"ok": False, "message": "Slack not connected", "previewLines": ["error: not connected"], "data": {"op": kind}}
+            try:
+                with httpx.Client(timeout=8.0) as _c:
+                    _r = _c.post("https://slack.com/api/chat.postMessage", json={"channel": channel, "text": text},
+                                 headers={"Authorization": f"Bearer {token}"})
+                _d = _r.json()
+                return {"ok": bool(_d.get("ok")), "message": f"Sent to #{channel}", "previewLines": [f"channel: #{channel}"],
+                        "data": {"op": kind, "channel": channel, "source": "live"}}
+            except Exception:
+                return {"ok": False, "message": "Slack send failed", "previewLines": ["error: request failed"], "data": {"op": kind}}
+        # slack_read — read channel history
+        if kind == "slack_read":
+            channel = str(payload.get("channel", "") or "general")
+            return run_operation(session, {**op, "type": "slack.read", "payload": {**payload, "channel": channel}})
+        # slack_search — search messages
+        if kind == "slack_search":
+            query = str(payload.get("query", "") or "")
+            if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+                return {"ok": True, "message": f"Slack search: {query}",
+                        "previewLines": [f"query: {query}", "results: 0 (scaffold)"],
+                        "data": {"op": kind, "query": query, "messages": [], "source": "scaffold"}}
+            token = _get_live_token("slack", None, None, None)
+            if not token:
+                return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
+            try:
+                with httpx.Client(timeout=8.0) as _c:
+                    _r = _c.get(f"https://slack.com/api/search.messages?query={query}&count=20",
+                                headers={"Authorization": f"Bearer {token}"})
+                _d = _r.json()
+                msgs = _d.get("messages", {}).get("matches", [])
+                return {"ok": bool(_d.get("ok")), "message": f"Slack search: {query}",
+                        "previewLines": [f"query: {query}", f"results: {len(msgs)}"],
+                        "data": {"op": kind, "query": query, "messages": msgs, "source": "live"}}
+            except Exception:
+                return {"ok": False, "message": "Slack search failed", "data": {"op": kind}}
+        # slack_status — set user status
+        if kind == "slack_status":
+            status_text = str(payload.get("status", payload.get("text", "")) or "")
+            if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+                return {"ok": True, "message": f"Status set: {status_text} (scaffold)",
+                        "previewLines": [f"status: {status_text}"], "data": {"op": kind, "source": "scaffold"}}
+            token = _get_live_token("slack", None, None, None)
+            if not token:
+                return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
+            try:
+                with httpx.Client(timeout=8.0) as _c:
+                    _r = _c.post("https://slack.com/api/users.profile.set",
+                                 json={"profile": {"status_text": status_text, "status_emoji": ""}},
+                                 headers={"Authorization": f"Bearer {token}"})
+                _d = _r.json()
+                return {"ok": bool(_d.get("ok")), "message": f"Slack status: {status_text}",
+                        "previewLines": [f"status: {status_text}"], "data": {"op": kind, "source": "live"}}
+            except Exception:
+                return {"ok": False, "message": "Slack status update failed", "data": {"op": kind}}
+        # slack_reaction — add emoji reaction
+        if kind == "slack_reaction":
+            emoji = str(payload.get("emoji", payload.get("reaction", "thumbsup")) or "thumbsup").strip(":")
+            channel = str(payload.get("channel", "") or "")
+            ts = str(payload.get("ts", payload.get("timestamp", "")) or "")
+            if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+                return {"ok": True, "message": f"Reacted :{emoji}: (scaffold)",
+                        "previewLines": [f"emoji: :{emoji}:"], "data": {"op": kind, "source": "scaffold"}}
+            token = _get_live_token("slack", None, None, None)
+            if not token:
+                return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
+            if not channel or not ts:
+                return {"ok": False, "message": "channel and ts required for reaction", "data": {"op": kind}}
+            try:
+                with httpx.Client(timeout=8.0) as _c:
+                    _r = _c.post("https://slack.com/api/reactions.add",
+                                 json={"name": emoji, "channel": channel, "timestamp": ts},
+                                 headers={"Authorization": f"Bearer {token}"})
+                _d = _r.json()
+                return {"ok": bool(_d.get("ok")), "message": f"Reacted :{emoji}:",
+                        "previewLines": [f"emoji: :{emoji}:"], "data": {"op": kind, "source": "live"}}
+            except Exception:
+                return {"ok": False, "message": "Slack reaction failed", "data": {"op": kind}}
+        # fallback for any unhandled slack op
+        snap = slack_channels_snapshot()
+        channels = snap.get("channels", [])
+        unread = sum(int(c.get("unread_count", 0)) for c in channels)
+        first_ch = channels[0]["name"] if channels else "general"
+        return {"ok": snap.get("ok", True), "message": f"Slack — #{first_ch}",
+                "previewLines": [f"channels: {len(channels)}", f"unread: {unread}"],
+                "data": {"op": kind, **snap}}
+
+    # ── TAXONOMY messaging → Slack bridge ─────────────────────────────────────
+    _MESSAGING_OPS = {"messaging_send", "messaging_read", "messaging_reply", "messaging_search",
+                      "messaging_group_create", "messaging_group_add", "messaging_react",
+                      "messaging_forward", "messaging_block", "messaging_schedule"}
+    if kind in _MESSAGING_OPS:
+        if kind == "messaging_send":
+            channel = str(payload.get("to", payload.get("channel", "")) or "")
+            text    = str(payload.get("text", payload.get("message", "")) or "")
+            if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+                return {"ok": True, "message": f"Message sent (scaffold)", "previewLines": [f"to: {channel}", f"text: {text[:80]}"],
+                        "data": {"op": kind, "to": channel, "text": text, "source": "scaffold"}}
+        snap = slack_channels_snapshot()
+        channels = snap.get("channels", [])
+        unread = sum(int(c.get("unread_count", 0)) for c in channels)
+        return {"ok": snap.get("ok", True), "message": "Messages",
+                "previewLines": [f"channels: {len(channels)}", f"unread: {unread}"],
+                "data": {"op": kind, **snap}}
+
+    # ── Spotify ops ───────────────────────────────────────────────────────────
+    if kind == "spotify.now_playing":
+        snap = spotify_now_playing_snapshot()
+        track  = str(snap.get("track") or "")
+        artist = str(snap.get("artist") or "")
+        playing = bool(snap.get("is_playing", True))
+        msg = ("Now playing" if playing else "Paused") + (f": {track}" if track else "")
+        if artist:
+            msg += f" by {artist}"
+        return {"ok": snap.get("ok", True), "message": msg,
+                "previewLines": [f"track: {track or '(nothing)'}", f"artist: {artist}", f"source: {snap.get('source','scaffold')}"],
+                "data": {"op": kind, **snap}}
+
+    if kind in ("spotify.play", "spotify.pause", "spotify.next", "spotify.prev"):
+        if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": f"{kind} acknowledged (scaffold)"}
+        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Spotify not connected"}
+        try:
+            action_map = {
+                "spotify.play":  ("PUT",  "https://api.spotify.com/v1/me/player/play"),
+                "spotify.pause": ("PUT",  "https://api.spotify.com/v1/me/player/pause"),
+                "spotify.next":  ("POST", "https://api.spotify.com/v1/me/player/next"),
+                "spotify.prev":  ("POST", "https://api.spotify.com/v1/me/player/previous"),
+            }
+            method, url = action_map[kind]
+            payload_data: dict[str, Any] = {}
+            if kind == "spotify.play" and body.get("uri"):
+                payload_data = {"uris": [str(body["uri"])]}
+            with httpx.Client(timeout=5.0) as client:
+                client.request(method, url, json=payload_data or None,
+                               headers={"Authorization": f"Bearer {token}"})
+            return {"ok": True, "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Spotify control failed"}
+
+    if kind == "spotify.volume":
+        if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Volume set (scaffold)"}
+        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Spotify not connected"}
+        vol = max(0, min(100, int(body.get("volume", 50))))
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                client.put(f"https://api.spotify.com/v1/me/player/volume?volume_percent={vol}",
+                           headers={"Authorization": f"Bearer {token}"})
+            return {"ok": True, "source": "live", "volume": vol}
+        except Exception:
+            return {"ok": False, "message": "Spotify volume failed"}
+
+    if kind == "spotify.queue":
+        uri = str(body.get("uri", "") or "").strip()
+        if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": f"Added to queue (scaffold){': ' + uri if uri else ''}"}
+        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Spotify not connected"}
+        if not uri:
+            return {"ok": False, "message": "uri required (e.g. spotify:track:...)"}
+        try:
+            from urllib.parse import quote as _q
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(
+                    f"https://api.spotify.com/v1/me/player/queue?uri={_q(uri)}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code in (200, 204), "source": "live",
+                    "message": "Added to queue" if resp.status_code in (200, 204) else "Spotify queue failed"}
+        except Exception:
+            return {"ok": False, "message": "Spotify queue request failed"}
+
+    # ── Gmail ops ─────────────────────────────────────────────────────────────
+    if kind == "gmail.list":
+        n = max(1, min(int(body.get("limit", 10) or 10), 50))
+        snap = gmail_list_snapshot(max_results=n)
+        msgs = snap.get("messages", [])
+        unread = snap.get("unread_count", sum(1 for m in msgs if m.get("unread")))
+        first_sub = msgs[0].get("subject", "Inbox") if msgs else "Inbox"
+        return {"ok": snap.get("ok", True),
+                "message": f"Gmail — {unread} unread",
+                "previewLines": [f"unread: {unread}", f"messages: {len(msgs)}", f"latest: {first_sub[:60]}"],
+                "data": {"op": kind, **snap}}
+
+    if kind == "gmail.search":
+        q = str(body.get("query", "") or "").strip()
+        if _effective_mode("gmail", GMAIL_PROVIDER_MODE) != "live":
+            filtered = [m for m in MOCK_GMAIL_MESSAGES if q.lower() in m.get("subject", "").lower() or q.lower() in m.get("snippet", "").lower()] if q else MOCK_GMAIL_MESSAGES
+            return {"ok": True, "message": f"Gmail search: {q}", "previewLines": [f"query: {q}", f"results: {len(filtered)}"],
+                    "data": {"op": kind, "messages": filtered, "source": "scaffold", "query": q}}
+        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Gmail not connected", "previewLines": ["error: not connected"], "data": {"op": kind, "messages": []}}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=20&q={quote_plus(q)}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            msgs = resp.json().get("messages", [])
+            return {"ok": True, "message": f"Gmail search: {q}", "previewLines": [f"query: {q}", f"results: {len(msgs)}"],
+                    "data": {"op": kind, "messages": msgs, "source": "live", "query": q}}
+        except Exception:
+            return {"ok": False, "message": "Gmail search failed", "previewLines": ["error: request failed"], "data": {"op": kind, "messages": []}}
+
+    if kind == "gmail.send":
+        if _effective_mode("gmail", GMAIL_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Email sent (scaffold)"}
+        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Gmail not connected"}
+        to = str(body.get("to", "") or "")
+        subject = str(body.get("subject", "") or "")
+        text = str(body.get("body", "") or "")
+        raw_msg = base64.urlsafe_b64encode(
+            f"To: {to}\r\nSubject: {subject}\r\nContent-Type: text/plain\r\n\r\n{text}".encode()
+        ).decode()
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                    json={"raw": raw_msg},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code == 200, "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Gmail send failed"}
+
+    if kind == "gmail.trash":
+        msg_id = str(body.get("messageId", "") or "")
+        if _effective_mode("gmail", GMAIL_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Message trashed (scaffold)"}
+        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Gmail not connected"}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/trash",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code == 200, "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Gmail trash failed"}
+
+    # ── Google Calendar ops ───────────────────────────────────────────────────
+    if kind == "gcal.list":
+        days = max(1, min(int(body.get("days", 7) or 7), 90))
+        snap = gcal_events_snapshot(days=days)
+        events = snap.get("events", [])
+        next_evt = events[0] if events else None
+        next_label = f"{next_evt.get('summary','')} @ {str(next_evt.get('start',''))[:10]}" if next_evt else "No events"
+        return {"ok": snap.get("ok", True), "message": f"Calendar — {len(events)} events",
+                "previewLines": [f"events: {len(events)}", f"next: {next_label}"],
+                "data": {"op": kind, **snap}}
+
+    if kind == "gcal.create":
+        if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Event created (scaffold)",
+                    "event": {"id": "scaffold-evt", "summary": str(body.get("summary", "New Event"))}}
+        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Google Calendar not connected"}
+        event_body = {
+            "summary": str(body.get("summary", "") or ""),
+            "start": {"dateTime": str(body.get("start", "") or ""), "timeZone": "UTC"},
+            "end":   {"dateTime": str(body.get("end", "") or ""), "timeZone": "UTC"},
+        }
+        if body.get("location"):
+            event_body["location"] = str(body["location"])
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                    json=event_body,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code in (200, 201), "source": "live", "event": resp.json()}
+        except Exception:
+            return {"ok": False, "message": "Google Calendar create failed"}
+
+    if kind == "gcal.update":
+        event_id = str(body.get("eventId", "") or "")
+        if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Event updated (scaffold)",
+                    "event": {"id": event_id or "scaffold-evt", "summary": str(body.get("summary", "Updated Event"))}}
+        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Google Calendar not connected"}
+        patch: dict[str, Any] = {}
+        if body.get("summary"):
+            patch["summary"] = str(body["summary"])
+        if body.get("start"):
+            patch["start"] = {"dateTime": str(body["start"]), "timeZone": "UTC"}
+        if body.get("end"):
+            patch["end"] = {"dateTime": str(body["end"]), "timeZone": "UTC"}
+        if body.get("location"):
+            patch["location"] = str(body["location"])
+        if not event_id or not patch:
+            return {"ok": False, "message": "eventId and at least one field required"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.patch(
+                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                    json=patch,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code == 200, "source": "live", "event": resp.json()}
+        except Exception:
+            return {"ok": False, "message": "Google Calendar update failed"}
+
+    if kind == "gcal.delete":
+        event_id = str(body.get("eventId", "") or "")
+        if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "Event deleted (scaffold)"}
+        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Google Calendar not connected"}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.delete(
+                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code == 204, "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Google Calendar delete failed"}
+
+    # ── Google Calendar taxonomy aliases (gcal_* → gcal.* ) ──────────────────
+    if kind in ("gcal_list", "gcal_create", "gcal_update", "gcal_delete"):
+        dot_kind = kind.replace("gcal_", "gcal.", 1)
+        return run_operation(session, {**op, "type": dot_kind})
+
+    # ── Google Drive ops ──────────────────────────────────────────────────────
+    if kind == "gdrive.list":
+        snap = gdrive_list_snapshot(query=str(body.get("query", "") or ""))
+        files = snap.get("files", [])
+        first_name = files[0]["name"] if files else "Drive"
+        return {"ok": snap.get("ok", True), "message": f"Drive — {len(files)} files",
+                "previewLines": [f"files: {len(files)}", f"recent: {first_name[:60]}"],
+                "data": {"op": kind, **snap}}
+
+    if kind == "gdrive.open":
+        file_id = str(body.get("fileId", "") or "")
+        return {"ok": True, "source": "scaffold", "url": f"https://drive.google.com/file/d/{file_id}/view"}
+
+    if kind == "gdrive.create":
+        if _effective_mode("gdrive", GDRIVE_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": "File created (scaffold)",
+                    "file": {"id": "scaffold-file", "name": str(body.get("name", "New File"))}}
+        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Google Drive not connected"}
+        meta = {"name": str(body.get("name", "Untitled"))}
+        if body.get("mimeType"):
+            meta["mimeType"] = str(body["mimeType"])
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    "https://www.googleapis.com/drive/v3/files",
+                    json=meta,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code in (200, 201), "source": "live", "file": resp.json()}
+        except Exception:
+            return {"ok": False, "message": "Google Drive create failed"}
+
+    if kind == "gdrive.share":
+        file_id = str(body.get("fileId", "") or "")
+        email = str(body.get("email", "") or "")
+        if _effective_mode("gdrive", GDRIVE_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": f"Shared {file_id} with {email} (scaffold)"}
+        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        if not token:
+            return {"ok": False, "message": "Google Drive not connected"}
+        if not file_id:
+            return {"ok": False, "message": "fileId required"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+                    json={"role": "reader", "type": "user", "emailAddress": email} if email else {"role": "reader", "type": "anyone"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return {"ok": resp.status_code in (200, 201), "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Google Drive share failed"}
+
+    # ── Google Drive taxonomy aliases (gdrive_* → gdrive.* ) ─────────────────
+    if kind in ("gdrive_list", "gdrive_open", "gdrive_create", "gdrive_share"):
+        dot_kind = kind.replace("gdrive_", "gdrive.", 1)
+        return run_operation(session, {**op, "type": dot_kind})
+
+    # ── Slack ops ─────────────────────────────────────────────────────────────
+    if kind == "slack.list_channels":
+        snap = slack_channels_snapshot()
+        channels = snap.get("channels", [])
+        unread = sum(int(c.get("unread_count", 0)) for c in channels)
+        first_ch = f"#{channels[0]['name']}" if channels else "Slack"
+        return {"ok": snap.get("ok", True), "message": f"Slack — {first_ch}",
+                "previewLines": [f"channels: {len(channels)}", f"unread: {unread}"],
+                "data": {"op": kind, **snap}}
+
+    if kind == "slack.send":
+        channel = str(body.get("channel", "") or "")
+        text = str(body.get("text", "") or "")
+        if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "message": f"Message sent to #{channel} (scaffold)"}
+        token = _get_live_token("slack", None, None, None)
+        if not token:
+            return {"ok": False, "message": "Slack not connected"}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(
+                    "https://slack.com/api/chat.postMessage",
+                    json={"channel": channel, "text": text},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            data = resp.json()
+            return {"ok": bool(data.get("ok")), "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Slack send failed"}
+
+    if kind == "slack.read":
+        channel = str(body.get("channel", "") or "C001")
+        if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
+            msgs = [{"user": "alice", "text": "Hey team!", "ts": "1234567890.000001"},
+                    {"user": "bob",   "text": "Good morning!", "ts": "1234567891.000002"}]
+            return {"ok": True, "message": f"Slack #{channel}", "previewLines": [f"channel: {channel}", f"messages: {len(msgs)}"],
+                    "data": {"op": kind, "channel": channel, "messages": msgs, "source": "scaffold"}}
+        token = _get_live_token("slack", None, None, None)
+        if not token:
+            return {"ok": False, "message": "Slack not connected", "messages": []}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(
+                    f"https://slack.com/api/conversations.history?channel={channel}&limit=20",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            data = resp.json()
+            msgs = data.get("messages", [])
+            return {"ok": bool(data.get("ok")), "message": f"Slack #{channel}",
+                    "previewLines": [f"channel: {channel}", f"messages: {len(msgs)}"],
+                    "data": {"op": kind, "channel": channel, "messages": msgs, "source": "live"}}
+        except Exception:
+            return {"ok": False, "message": "Slack read failed", "previewLines": ["error: request failed"],
+                    "data": {"op": kind, "channel": channel, "messages": []}}
+
+    # ── Plaid ops ─────────────────────────────────────────────────────────────
+    if kind == "plaid.link_token":
+        if _effective_mode("plaid", PLAID_PROVIDER_MODE) != "live":
+            return {"ok": True, "source": "scaffold", "link_token": "link-sandbox-scaffold-token"}
+        try:
+            resp = httpx.post(
+                f"https://{PLAID_ENV}.plaid.com/link/token/create",
+                json={"client_id": PLAID_CLIENT_ID, "secret": PLAID_SECRET,
+                      "client_name": "GenomeUI", "country_codes": ["US"], "language": "en",
+                      "user": {"client_user_id": "genome-user"},
+                      "products": ["transactions", "accounts"]},
+                timeout=15,
+            )
+            data = resp.json()
+            return {"ok": True, "source": "live", "link_token": data.get("link_token")}
+        except Exception:
+            return {"ok": False, "message": "Plaid link token failed"}
+
+    if kind == "plaid.exchange":
+        public_token = str(body.get("public_token", "") or "")
+        if _effective_mode("plaid", PLAID_PROVIDER_MODE) != "live":
+            _auth.vault_store("plaid", {"access_token": "access-sandbox-scaffold", "item_id": "item-scaffold"})
+            return {"ok": True, "source": "scaffold"}
+        try:
+            resp = httpx.post(
+                f"https://{PLAID_ENV}.plaid.com/item/public_token/exchange",
+                json={"client_id": PLAID_CLIENT_ID, "secret": PLAID_SECRET, "public_token": public_token},
+                timeout=15,
+            )
+            data = resp.json()
+            _auth.vault_store("plaid", {"access_token": data["access_token"], "item_id": data["item_id"]})
+            return {"ok": True, "source": "live"}
+        except Exception:
+            return {"ok": False, "message": "Plaid exchange failed"}
+
+    if kind == "connections_status":
+        _svc_modes = {
+            "spotify": SPOTIFY_PROVIDER_MODE,
+            "gmail":   GMAIL_PROVIDER_MODE,
+            "gcal":    GCAL_PROVIDER_MODE,
+            "gdrive":  GDRIVE_PROVIDER_MODE,
+            "slack":   SLACK_PROVIDER_MODE,
+            "plaid":   PLAID_PROVIDER_MODE,
+        }
+        _svc_labels = {
+            "spotify": "Spotify",
+            "gmail":   "Gmail",
+            "gcal":    "Google Calendar",
+            "gdrive":  "Google Drive",
+            "slack":   "Slack",
+            "plaid":   "Plaid (Banking)",
+        }
+        services = {}
+        for svc, pm in _svc_modes.items():
+            tok = _auth.vault_retrieve(svc)
+            connected = bool(tok)
+            eff_mode = _effective_mode(svc, pm)
+            _env_id, _env_secret = _OAUTH_CLIENT_PAIRS.get(svc, ("", ""))
+            services[svc] = {
+                "label":      _svc_labels[svc],
+                "connected":  connected,
+                "configured": _is_service_configured(svc, _env_id, _env_secret),
+                "mode":       eff_mode,
+                "authUrl":    f"/api/connectors/oauth/{svc}/begin" if svc != "plaid" else "/api/connectors/plaid/link_token",
+            }
+        lines = [
+            f"{v['label']}: {'connected' if v['connected'] else 'not connected'} ({v['mode']})"
+            for v in services.values()
+        ]
+        return {
+            "ok": True,
+            "message": "Connections panel ready.",
+            "previewLines": lines,
+            "data": {"op": kind, "services": services},
+        }
+
+    # ── Dictionary & Reference ────────────────────────────────────────────────
+    if kind in ("dict_define", "dict_etymology", "dict_thesaurus", "dict_wikipedia"):
+        word = str(payload.get("word", "") or payload.get("query", "")).strip()
+        if not word:
+            return {"ok": False, "message": f"{kind} requires a word or query.", "previewLines": ["missing: word"]}
+        if kind == "dict_thesaurus":
+            res = _thesaurus_lookup(word)
+            if not res.get("ok"):
+                return {"ok": False, "message": f"Thesaurus: {res.get('error','unavailable')}", "previewLines": [f"word: {word}"]}
+            syns = res.get("synonyms", [])
+            ants = res.get("antonyms", [])
+            lines = [f"word: {word}", f"synonyms: {', '.join(syns[:8]) or 'none'}", f"antonyms: {', '.join(ants[:5]) or 'none'}"]
+            return {"ok": True, "message": f"Thesaurus: {word}", "previewLines": lines[:10],
+                    "data": {"op": kind, "word": word, "synonyms": syns, "antonyms": ants}}
+        if kind == "dict_wikipedia":
+            res = _wiki_lookup(word)
+            if not res.get("ok"):
+                return {"ok": False, "message": f"Wikipedia: {res.get('error','not found')}", "previewLines": [f"query: {word}"]}
+            lines = [f"title: {res['title']}", f"desc: {res['description']}", f"extract: {res['extract'][:120]}"]
+            return {"ok": True, "message": f"Wikipedia: {res['title']}", "previewLines": lines[:10], "data": {"op": kind, **res}}
+        # dict_define + dict_etymology both use dictionaryapi
+        res = _dict_lookup(word)
+        if not res.get("ok"):
+            return {"ok": False, "message": f"Definition: {res.get('error','not found')}", "previewLines": [f"word: {word}"]}
+        meanings = res.get("meanings", [])
+        first_def = (meanings[0].get("definitions", [""])[0] if meanings else "")
+        origin = res.get("origin", "")
+        phonetic = res.get("phonetic", "")
+        if kind == "dict_etymology":
+            lines = [f"word: {word}", f"phonetic: {phonetic}", f"origin: {origin[:200] or 'no etymology found'}"]
+        else:
+            lines = [f"word: {word}", f"phonetic: {phonetic}"]
+            for m in meanings[:3]:
+                lines.append(f"[{m['pos']}] {m['definitions'][0][:100] if m['definitions'] else ''}")
+        graph_add_event(graph, kind, {"word": word})
+        return {"ok": True, "message": f"{word}", "previewLines": lines[:10],
+                "data": {"op": kind, "word": word, "phonetic": phonetic, "origin": origin, "meanings": meanings, "first_def": first_def}}
+
+    # ── Date & Time calculations ───────────────────────────────────────────────
+    if kind in ("date_age", "date_countdown", "date_day_of", "date_days_until"):
+        import datetime as _dt
+        today = _dt.date.today()
+        date_str = str(payload.get("date", "") or payload.get("target", "")).strip()
+        try:
+            import re as _re
+            # Parse YYYY-MM-DD, MM/DD/YYYY, Month DD YYYY, or relative ("next friday", "jan 1 2027")
+            target: _dt.date | None = None
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y"):
+                try:
+                    target = _dt.datetime.strptime(date_str, fmt).date()
+                    break
+                except ValueError:
+                    pass
+            if target is None and _re.search(r"\d{4}", date_str):
+                # last-ditch: find year + month
+                year_m = _re.search(r"\b(\d{4})\b", date_str)
+                month_m = _re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", date_str, _re.I)
+                day_m = _re.search(r"\b(\d{1,2})\b", date_str)
+                if year_m and month_m:
+                    months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+                    mo = months.get(month_m.group(1).lower()[:3], 1)
+                    day = int(day_m.group(1)) if day_m else 1
+                    target = _dt.date(int(year_m.group(1)), mo, day)
+            if target is None:
+                return {"ok": False, "message": f"Could not parse date: {date_str or '(none)'}", "previewLines": ["provide a date like 2027-01-01"]}
+        except Exception as parse_err:
+            return {"ok": False, "message": f"Date parse error: {parse_err}", "previewLines": [f"input: {date_str}"]}
+        if kind == "date_age":
+            age_years = (today - target).days // 365
+            age_days  = (today - target).days % 365
+            next_bday = target.replace(year=today.year)
+            if next_bday < today:
+                next_bday = next_bday.replace(year=today.year + 1)
+            days_to_bday = (next_bday - today).days
+            lines = [f"born: {target.isoformat()}", f"age: {age_years} years, {age_days} days", f"next birthday: {days_to_bday} days"]
+            return {"ok": True, "message": f"{age_years} years old", "previewLines": lines,
+                    "data": {"op": kind, "date": target.isoformat(), "age_years": age_years, "age_days_extra": age_days, "days_to_birthday": days_to_bday}}
+        if kind in ("date_days_until", "date_countdown"):
+            label = str(payload.get("label", "") or payload.get("event", "")).strip()
+            delta = (target - today).days
+            if delta < 0:
+                lines = [f"target: {target.isoformat()}", f"that date was {abs(delta)} days ago"]
+            else:
+                weeks, days = divmod(delta, 7)
+                lines = [f"target: {target.isoformat()}", f"{delta} days away", f"{weeks}w {days}d" if weeks else f"{delta} days"]
+            if label:
+                lines.insert(0, f"event: {label}")
+            return {"ok": True, "message": f"{abs(delta)} days {'ago' if delta < 0 else 'until'} {label or target.isoformat()}", "previewLines": lines,
+                    "data": {"op": kind, "target": target.isoformat(), "delta_days": delta, "label": label}}
+        if kind == "date_day_of":
+            day_name = target.strftime("%A")
+            week_num = target.isocalendar()[1]
+            lines = [f"date: {target.isoformat()}", f"day: {day_name}", f"week: {week_num} of year"]
+            return {"ok": True, "message": f"{target.isoformat()} is a {day_name}", "previewLines": lines,
+                    "data": {"op": kind, "date": target.isoformat(), "day_name": day_name, "week_number": week_num}}
+
+    # ── Currency & Unit conversion ─────────────────────────────────────────────
+    if kind == "currency_rates":
+        base = str(payload.get("base", "USD")).upper().strip() or "USD"
+        res = _currency_fetch(base)
+        if not res.get("ok"):
+            return {"ok": False, "message": f"Rates unavailable: {res.get('error','')}", "previewLines": [f"base: {base}"]}
+        rates = res.get("rates", {})
+        # Show a curated subset of major currencies
+        major = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "CNY", "INR", "MXN", "BRL", "KRW"]
+        lines = [f"base: {base}", f"updated: {res.get('time_last_update','')[:16]}"]
+        for sym in major:
+            if sym in rates and sym != base:
+                lines.append(f"  {sym}: {rates[sym]:.4f}")
+        return {"ok": True, "message": f"Exchange rates: {base}", "previewLines": lines[:12],
+                "data": {"op": kind, "base": base, "rates": rates, "major": {s: rates[s] for s in major if s in rates}}}
+
+    if kind == "currency_convert":
+        amount = float(payload.get("amount", 1) or 1)
+        from_c = str(payload.get("from", "USD") or "USD").upper().strip()
+        to_c   = str(payload.get("to", "EUR")   or "EUR").upper().strip()
+        res = _currency_fetch(from_c)
+        if not res.get("ok"):
+            return {"ok": False, "message": f"Rates unavailable: {res.get('error','')}", "previewLines": [f"{from_c} → {to_c}"]}
+        rates = res.get("rates", {})
+        if to_c not in rates:
+            return {"ok": False, "message": f"Unknown currency: {to_c}", "previewLines": [f"base: {from_c}"]}
+        result = round(amount * rates[to_c], 4)
+        lines = [f"{amount:g} {from_c} = {result:g} {to_c}", f"rate: 1 {from_c} = {rates[to_c]:.4f} {to_c}", f"updated: {res.get('time_last_update','')[:16]}"]
+        return {"ok": True, "message": f"{amount:g} {from_c} = {result:g} {to_c}", "previewLines": lines,
+                "data": {"op": kind, "amount": amount, "from": from_c, "to": to_c, "result": result, "rate": rates[to_c]}}
+
+    if kind == "unit_convert":
+        try:
+            value = float(payload.get("value", 1) or 1)
+        except (TypeError, ValueError):
+            value = 1.0
+        from_u = str(payload.get("from", "") or payload.get("from_unit", "")).strip()
+        to_u   = str(payload.get("to",   "") or payload.get("to_unit",   "")).strip()
+        if not from_u or not to_u:
+            return {"ok": False, "message": "unit_convert requires from and to units.", "previewLines": ["missing: from, to"]}
+        res = _unit_convert_compute(value, from_u, to_u)
+        if not res.get("ok"):
+            return {"ok": False, "message": res.get("error", "conversion failed"), "previewLines": [f"{from_u} → {to_u}"]}
+        result = res["result"]
+        lines = [f"{value:g} {from_u} = {result:g} {to_u}", f"category: {res.get('category', 'n/a')}"]
+        return {"ok": True, "message": f"{value:g} {from_u} = {result:g} {to_u}", "previewLines": lines,
+                "data": {"op": kind, "value": value, "from": from_u, "to": to_u, "result": result, "category": res.get("category", "")}}
+
+    # ── Alarm / Clock ─────────────────────────────────────────────────────────
+    if kind in ("alarm_set", "alarm_delete", "alarm_list", "alarm_snooze",
+                "clock_timer_start", "clock_timer_stop", "clock_stopwatch"):
+        time_val = str(payload.get("time", "")).strip()
+        label    = str(payload.get("label", "")).strip() or "Alarm"
+        days     = list(payload.get("days", []))
+        action   = "set" if kind == "alarm_set" else "delete" if kind == "alarm_delete" else "list"
+        if kind in ("clock_timer_start",):
+            action = "timer"
+        scaffold_alarms = [
+            {"time": "6:30 AM", "label": "Morning", "days": ["Mon", "Tue", "Wed", "Thu", "Fri"], "active": True},
+            {"time": "8:00 AM", "label": "Weekend", "days": ["Sat", "Sun"], "active": True},
+            {"time": "10:00 PM", "label": "Wind down", "days": [], "active": False},
+        ]
+        alarms = scaffold_alarms if action == "list" else ([{"time": time_val, "label": label, "days": days, "active": True}] + scaffold_alarms)
+        next_alarm = alarms[0] if alarms else {}
+        msg = f"Alarm {action}: {time_val or next_alarm.get('time', '')}"
+        return {"ok": True, "message": msg,
+                "previewLines": [f"time: {time_val or next_alarm.get('time', '')}", f"label: {label}", f"action: {action}"],
+                "data": {"op": kind, "action": action, "time": time_val, "label": label, "days": days, "alarms": alarms}}
+
+    if kind == "clock_world":
+        import datetime as _dt
+        import zoneinfo as _zi
+        zones_raw = payload.get("zones") or []
+        if not isinstance(zones_raw, list):
+            zones_raw = [str(zones_raw)]
+        default_zones = ["America/New_York", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney"]
+        zone_ids = [str(z) for z in zones_raw[:8]] if zones_raw else default_zones
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        clocks = []
+        for tz_id in zone_ids:
+            try:
+                tz = _zi.ZoneInfo(tz_id)
+                local = now_utc.astimezone(tz)
+                city = tz_id.split("/")[-1].replace("_", " ")
+                clocks.append({"zone": tz_id, "city": city, "time": local.strftime("%H:%M"), "date": local.strftime("%a %b %d"), "offset": local.strftime("%z")})
+            except Exception:
+                pass
+        lines = [f"world clocks: {len(clocks)}"] + [f"{c['city']}: {c['time']} ({c['offset']})" for c in clocks[:6]]
+        return {"ok": True, "message": f"World clocks: {len(clocks)} zones", "previewLines": lines[:10],
+                "data": {"op": kind, "clocks": clocks}}
+
+    if kind == "clock_bedtime":
+        import datetime as _dt
+        wake_str = str(payload.get("wake_time", "") or payload.get("time", "")).strip()
+        cycles   = int(payload.get("cycles", 5) or 5)
+        # Recommend bedtimes: 90min sleep cycle × N cycles
+        try:
+            now = _dt.datetime.now()
+            if wake_str:
+                for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+                    try:
+                        wake = _dt.datetime.strptime(wake_str, fmt).replace(year=now.year, month=now.month, day=now.day)
+                        if wake < now:
+                            wake += _dt.timedelta(days=1)
+                        break
+                    except ValueError:
+                        pass
+                else:
+                    wake = now + _dt.timedelta(hours=8)
+            else:
+                wake = now + _dt.timedelta(hours=8)
+            bedtimes = []
+            for c in range(max(cycles, 3), 0, -1):
+                bt = wake - _dt.timedelta(minutes=90 * c + 15)  # +15min to fall asleep
+                bedtimes.append({"time": bt.strftime("%I:%M %p"), "cycles": c, "hours": round(c * 1.5, 1)})
+        except Exception:
+            bedtimes = []
+        lines = [f"wake: {wake_str or 'not set'}"] + [f"{b['time']} — {b['cycles']} cycles ({b['hours']}h)" for b in bedtimes]
+        return {"ok": True, "message": f"Bedtime recommendations", "previewLines": lines[:8],
+                "data": {"op": kind, "wake_time": wake_str, "bedtimes": bedtimes}}
+
+    # ── Health / Fitness ────────────────────────────────────────────────────────
+    _HEALTH_OPS = {
+        "health_activity", "health_log_workout", "health_log_weight",
+        "health_log_water", "health_log_sleep", "health_history",
+        # new taxonomy names
+        "health_steps", "health_heart_rate", "health_sleep",
+        "health_workout_log", "health_workout_start", "health_food_log",
+        "health_water", "health_weight", "health_goals", "health_mood",
+        "health_medication", "health_hrv", "health_cycle", "health_streak",
+    }
+    if kind in _HEALTH_OPS:
+        scaffold_metrics = {
+            "steps": 8241, "steps_goal": 10000,
+            "calories": 1840, "calories_goal": 2200,
+            "active_min": 42, "sleep_hours": 7.2,
+            "heart_rate": 68, "heart_rate_resting": 58, "hrv": 44,
+            "weight_lbs": 175, "weight_goal_lbs": 168,
+            "water_oz": 56, "water_goal_oz": 80,
+            "streak_days": 12, "mood": "good",
+            "cycle_day": 14, "cycle_phase": "ovulation",
+            "medication": payload.get("medication", ""),
+            "food_item": payload.get("food", ""),
+        }
+        # Tailor the headline to the op
+        if kind in ("health_steps",):
+            hero = f"{scaffold_metrics['steps']:,}"
+            summary_line = f"of {scaffold_metrics['steps_goal']:,} goal"
+        elif kind in ("health_heart_rate",):
+            hero = f"{scaffold_metrics['heart_rate']} bpm"
+            summary_line = f"resting: {scaffold_metrics['heart_rate_resting']} bpm"
+        elif kind in ("health_hrv",):
+            hero = f"{scaffold_metrics['hrv']} ms"
+            summary_line = "heart rate variability"
+        elif kind in ("health_sleep", "health_log_sleep"):
+            hero = f"{scaffold_metrics['sleep_hours']}h"
+            summary_line = "sleep duration"
+        elif kind in ("health_water", "health_log_water"):
+            hero = f"{scaffold_metrics['water_oz']} oz"
+            summary_line = f"of {scaffold_metrics['water_goal_oz']} oz goal"
+        elif kind in ("health_weight", "health_log_weight"):
+            hero = f"{scaffold_metrics['weight_lbs']} lbs"
+            summary_line = f"goal: {scaffold_metrics['weight_goal_lbs']} lbs"
+        elif kind in ("health_mood",):
+            hero = str(scaffold_metrics["mood"]).capitalize()
+            summary_line = "mood today"
+        elif kind in ("health_cycle",):
+            hero = f"Day {scaffold_metrics['cycle_day']}"
+            summary_line = scaffold_metrics["cycle_phase"]
+        elif kind in ("health_streak",):
+            hero = f"{scaffold_metrics['streak_days']} days"
+            summary_line = "active streak"
+        elif kind in ("health_goals",):
+            hero = "Goals"
+            summary_line = f"steps {scaffold_metrics['steps']:,}/{scaffold_metrics['steps_goal']:,}"
+        else:
+            hero = "Activity"
+            summary_line = "health tracking"
+        graph_add_event(graph, kind, {"source": "scaffold"})
+        return {"ok": True, "message": f"Health: {hero}", "previewLines": [f"{hero}", summary_line, f"source: scaffold"],
+                "data": {"op": kind, "metrics": scaffold_metrics, "hero": hero, "summary_line": summary_line, "source": "scaffold"}}
+
+    # ── Podcasts ───────────────────────────────────────────────────────────────
+    if kind in ("podcast_play", "podcast_pause", "podcast_next", "podcast_list",
+                "podcast_subscribe", "podcast_search"):
+        scaffold_pod = {"show": "Lex Fridman Podcast", "episode": "#414 — Andrej Karpathy",
+                        "progress_ms": 2700000, "duration_ms": 9000000, "is_playing": kind == "podcast_play",
+                        "source": "scaffold"}
+        msg = "Now playing: " + scaffold_pod["episode"] if kind == "podcast_play" else f"Podcast: {scaffold_pod['show']}"
+        return {"ok": True, "message": msg,
+                "previewLines": [f"show: {scaffold_pod['show']}", f"episode: {scaffold_pod['episode'][:50]}"],
+                "data": {"op": kind, **scaffold_pod}}
+
+    if kind == "network_view":
+        import time as _nv_time
+        networks = list(_joined_networks.values())
+        messages_by_topic: dict[str, list[dict[str, Any]]] = {}
+        for net in networks:
+            t = net.get("topic", "")
+            msgs = _network_messages.get(t, [])
+            messages_by_topic[t] = list(msgs)
+        total_msgs = sum(len(v) for v in messages_by_topic.values())
+        local_topic = next(
+            (n["topic"] for n in networks if n.get("type") == "public_local"), ""
+        )
+        return {
+            "ok": True,
+            "op": "network_view",
+            "message": f"Genome Mesh — {len(networks)} network{'s' if len(networks) != 1 else ''}, {total_msgs} message{'s' if total_msgs != 1 else ''}",
+            "data": {
+                "op": "network_view",
+                "networks": networks,
+                "messagesByTopic": messages_by_topic,
+                "localTopic": local_topic,
+                "did": _genome_identity.did if _genome_identity else None,
+                "peerCount": len(_peer_trust),
+                "relayConnected": _mesh.relay_connected,
+                "relayId": _mesh.relay_id,
+            },
+        }
+
+    # ── Travel ops scaffold (T-C01) ───────────────────────────────────────────
+    _TRAVEL_OPS = {"travel_flight_search", "travel_flight_status", "travel_hotel_search",
+                   "travel_hotel_book", "travel_checkin", "travel_boarding_pass",
+                   "travel_itinerary", "travel_car_rental"}
+    if kind in _TRAVEL_OPS:
+        origin  = str(payload.get("origin", payload.get("from", "")) or "").strip()
+        dest    = str(payload.get("destination", payload.get("to", "")) or "").strip()
+        flight  = str(payload.get("flightNumber", payload.get("flight", "")) or "").strip()
+        dates   = str(payload.get("dates", payload.get("date", "")) or "").strip()
+        graph_add_event(graph, kind, {"origin": origin, "dest": dest, "flight": flight})
+        if kind == "travel_flight_search":
+            lines = [f"from: {origin or '(origin)'}", f"to: {dest or '(dest)'}", f"dates: {dates or 'flexible'}",
+                     "results: 3 flights (scaffold)"]
+            flights = [{"flight": "AA123", "dep": "8:00 AM", "arr": "11:30 AM", "price": "$289"},
+                       {"flight": "UA456", "dep": "12:15 PM", "arr": "3:45 PM", "price": "$319"},
+                       {"flight": "DL789", "dep": "6:30 PM", "arr": "10:00 PM", "price": "$259"}]
+            return {"ok": True, "message": f"Flights: {origin} → {dest}", "previewLines": lines,
+                    "data": {"op": kind, "origin": origin, "destination": dest, "flights": flights, "source": "scaffold"}}
+        if kind == "travel_flight_status":
+            lines = [f"flight: {flight or 'AA123'}", "status: On Time", "gate: B12", "dep: 2:30 PM"]
+            return {"ok": True, "message": f"Flight {flight or 'AA123'}: On Time", "previewLines": lines,
+                    "data": {"op": kind, "flight": flight, "status": "On Time", "gate": "B12", "source": "scaffold"}}
+        if kind == "travel_hotel_search":
+            hotels = [{"name": "Marriott Downtown", "stars": 4, "price": "$189/night"},
+                      {"name": "Hilton Garden Inn", "stars": 3, "price": "$149/night"},
+                      {"name": "The Ritz-Carlton",  "stars": 5, "price": "$450/night"}]
+            lines = [f"location: {dest or '(location)'}", f"dates: {dates or 'flexible'}", f"results: {len(hotels)} hotels"]
+            return {"ok": True, "message": f"Hotels in {dest or 'area'}", "previewLines": lines,
+                    "data": {"op": kind, "destination": dest, "hotels": hotels, "source": "scaffold"}}
+        if kind == "travel_hotel_book":
+            hotel = str(payload.get("hotel", "selected hotel") or "selected hotel")
+            lines = [f"hotel: {hotel}", f"dates: {dates or '(dates)'}", "status: Booked (scaffold)"]
+            return {"ok": True, "message": f"Hotel booked: {hotel}", "previewLines": lines,
+                    "data": {"op": kind, "hotel": hotel, "dates": dates, "source": "scaffold"}}
+        if kind == "travel_boarding_pass":
+            lines = [f"flight: {flight or 'AA123'}", "seat: 14C", "gate: B12", "boarding: 2:00 PM"]
+            return {"ok": True, "message": f"Boarding pass: {flight or 'AA123'}", "previewLines": lines,
+                    "data": {"op": kind, "flight": flight, "seat": "14C", "gate": "B12", "source": "scaffold"}}
+        if kind == "travel_checkin":
+            target = str(payload.get("target", flight or dest or "trip") or "")
+            lines = [f"checked in: {target}", "confirmation: ABC123 (scaffold)"]
+            return {"ok": True, "message": f"Checked in: {target}", "previewLines": lines,
+                    "data": {"op": kind, "target": target, "confirmation": "ABC123", "source": "scaffold"}}
+        if kind == "travel_itinerary":
+            lines = [f"trip: {dest or '(destination)'}", "Day 1: Arrival", "Day 2: Sightseeing", "Day 3: Departure"]
+            return {"ok": True, "message": f"Itinerary: {dest or 'Trip'}", "previewLines": lines,
+                    "data": {"op": kind, "destination": dest, "days": 3, "source": "scaffold"}}
+        if kind == "travel_car_rental":
+            cars = [{"type": "Economy", "price": "$45/day"}, {"type": "SUV", "price": "$89/day"}]
+            lines = [f"location: {dest or '(location)'}", f"dates: {dates or 'flexible'}", f"results: {len(cars)} cars"]
+            return {"ok": True, "message": f"Car rentals in {dest or 'area'}", "previewLines": lines,
+                    "data": {"op": kind, "destination": dest, "cars": cars, "source": "scaffold"}}
+        return {"ok": True, "message": f"{kind} (scaffold)", "previewLines": [f"op: {kind}"],
+                "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Food Delivery ops scaffold (T-C02) ────────────────────────────────────
+    _FOOD_OPS = {"food_delivery_browse", "food_delivery_order", "food_delivery_reorder",
+                 "food_delivery_track"}
+    if kind in _FOOD_OPS:
+        restaurant = str(payload.get("restaurant", payload.get("place", "")) or "").strip()
+        items      = payload.get("items", [])
+        order_id   = str(payload.get("orderId", "ORD-12345") or "ORD-12345")
+        graph_add_event(graph, kind, {"restaurant": restaurant, "orderId": order_id})
+        if kind == "food_delivery_browse":
+            cuisine = str(payload.get("cuisine", payload.get("query", "")) or "").strip()
+            restaurants = [{"name": "Chipotle", "cuisine": "Mexican", "eta": "25 min", "rating": 4.5},
+                           {"name": "Shake Shack", "cuisine": "Burgers", "eta": "30 min", "rating": 4.7},
+                           {"name": "Sweetgreen", "cuisine": "Salads", "eta": "20 min", "rating": 4.4}]
+            lines = [f"cuisine: {cuisine or 'all'}", f"results: {len(restaurants)} restaurants"]
+            return {"ok": True, "message": "Nearby restaurants", "previewLines": lines,
+                    "data": {"op": kind, "restaurants": restaurants, "source": "scaffold"}}
+        if kind == "food_delivery_order":
+            total = float(payload.get("total", 18.50) or 18.50)
+            lines = [f"restaurant: {restaurant}", f"items: {len(items) if isinstance(items, list) else 1}",
+                     f"total: ${total:.2f}", "ETA: 35 min (scaffold)"]
+            return {"ok": True, "message": f"Order placed: {restaurant}", "previewLines": lines,
+                    "data": {"op": kind, "restaurant": restaurant, "orderId": order_id, "eta": "35 min",
+                             "total": total, "source": "scaffold"}}
+        if kind == "food_delivery_reorder":
+            lines = [f"reordering from: {restaurant}", "ETA: 35 min (scaffold)"]
+            return {"ok": True, "message": f"Reorder placed: {restaurant}", "previewLines": lines,
+                    "data": {"op": kind, "restaurant": restaurant, "orderId": order_id, "eta": "35 min",
+                             "source": "scaffold"}}
+        if kind == "food_delivery_track":
+            lines = [f"order: {order_id}", "status: Preparing", "driver: Alex", "ETA: 18 min"]
+            return {"ok": True, "message": f"Order tracking: {order_id}", "previewLines": lines,
+                    "data": {"op": kind, "orderId": order_id, "status": "Preparing",
+                             "driver": "Alex", "eta": "18 min", "source": "scaffold"}}
+
+    # ── Rideshare ops scaffold (T-C03) ────────────────────────────────────────
+    _RIDESHARE_OPS = {"rideshare_book", "rideshare_cancel", "rideshare_schedule", "rideshare_track"}
+    if kind in _RIDESHARE_OPS:
+        dest     = str(payload.get("destination", payload.get("to", "")) or "").strip()
+        platform = str(payload.get("platform", "Uber") or "Uber")
+        ride_id  = str(payload.get("rideId", "RIDE-98765") or "RIDE-98765")
+        ride_type = str(payload.get("rideType", "UberX") or "UberX")
+        graph_add_event(graph, kind, {"dest": dest, "platform": platform})
+        if kind == "rideshare_book":
+            lines = [f"to: {dest or '(destination)'}", f"platform: {platform}", f"type: {ride_type}",
+                     "driver: Marcus (4.9★)", "ETA: 6 min (scaffold)"]
+            return {"ok": True, "message": f"{platform} booked → {dest}", "previewLines": lines,
+                    "data": {"op": kind, "destination": dest, "platform": platform, "rideType": ride_type,
+                             "rideId": ride_id, "driver": "Marcus", "driverRating": 4.9,
+                             "eta": "6 min", "source": "scaffold"}}
+        if kind == "rideshare_cancel":
+            lines = [f"ride: {ride_id}", "status: Cancelled (scaffold)"]
+            return {"ok": True, "message": f"Ride cancelled: {ride_id}", "previewLines": lines,
+                    "data": {"op": kind, "rideId": ride_id, "source": "scaffold"}}
+        if kind == "rideshare_schedule":
+            pickup_time = str(payload.get("pickupTime", payload.get("time", "")) or "")
+            lines = [f"to: {dest}", f"at: {pickup_time or '(scheduled time)'}", f"platform: {platform}",
+                     "status: Scheduled (scaffold)"]
+            return {"ok": True, "message": f"{platform} scheduled → {dest}", "previewLines": lines,
+                    "data": {"op": kind, "destination": dest, "pickupTime": pickup_time,
+                             "platform": platform, "source": "scaffold"}}
+        if kind == "rideshare_track":
+            lines = [f"ride: {ride_id}", "driver: Marcus", "ETA: 4 min", "distance: 0.8 mi away"]
+            return {"ok": True, "message": f"Tracking ride: {ride_id}", "previewLines": lines,
+                    "data": {"op": kind, "rideId": ride_id, "driver": "Marcus",
+                             "eta": "4 min", "source": "scaffold"}}
+
+    # ── Video Streaming ops scaffold (T-C04) ──────────────────────────────────
+    _VIDEO_OPS = {"video_play", "video_search", "video_browse", "video_continue",
+                  "video_watchlist", "video_recommend", "video_cast", "video_rate"}
+    if kind in _VIDEO_OPS:
+        title   = str(payload.get("title", payload.get("query", "")) or "").strip()
+        service = str(payload.get("service", "Netflix") or "Netflix")
+        graph_add_event(graph, kind, {"title": title, "service": service})
+        if kind == "video_play":
+            lines = [f"playing: {title or 'content'}", f"service: {service}"]
+            return {"ok": True, "message": f"Playing: {title or 'content'}", "previewLines": lines,
+                    "data": {"op": kind, "title": title, "service": service, "source": "scaffold"}}
+        if kind == "video_search":
+            results = [{"title": f"{title} (2023)", "type": "Movie", "service": service, "rating": "8.2"},
+                       {"title": f"{title}: Season 1", "type": "Series", "service": service, "rating": "7.9"}] if title else []
+            lines = [f"query: {title}", f"results: {len(results)} | service: {service}"]
+            return {"ok": True, "message": f"Video search: {title}", "previewLines": lines,
+                    "data": {"op": kind, "query": title, "results": results, "source": "scaffold"}}
+        if kind == "video_browse":
+            genre = str(payload.get("genre", "popular") or "popular")
+            catalog = [{"title": "Stranger Things", "genre": "Sci-Fi", "rating": 8.7},
+                       {"title": "The Crown", "genre": "Drama", "rating": 8.3},
+                       {"title": "Squid Game", "genre": "Thriller", "rating": 8.0}]
+            lines = [f"service: {service}", f"genre: {genre}", f"results: {len(catalog)}"]
+            return {"ok": True, "message": f"Browse {service}: {genre}", "previewLines": lines,
+                    "data": {"op": kind, "service": service, "genre": genre, "catalog": catalog,
+                             "source": "scaffold"}}
+        if kind == "video_continue":
+            lines = ["resume: The Crown — S3E4", "position: 42:15", f"service: {service}"]
+            return {"ok": True, "message": "Continue watching: The Crown", "previewLines": lines,
+                    "data": {"op": kind, "title": "The Crown", "service": service, "source": "scaffold"}}
+        if kind == "video_watchlist":
+            watchlist = [{"title": "Oppenheimer", "added": "2 days ago"},
+                         {"title": "Poor Things", "added": "1 week ago"}]
+            lines = [f"watchlist: {len(watchlist)} items"] + [w["title"] for w in watchlist]
+            return {"ok": True, "message": "Watchlist", "previewLines": lines,
+                    "data": {"op": kind, "watchlist": watchlist, "source": "scaffold"}}
+        if kind == "video_recommend":
+            recs = [{"title": "Succession", "reason": "Based on your history"},
+                    {"title": "Severance", "reason": "Trending now"}]
+            lines = [f"recommendations: {len(recs)}"] + [f"{r['title']}: {r['reason']}" for r in recs]
+            return {"ok": True, "message": "Recommendations", "previewLines": lines,
+                    "data": {"op": kind, "recommendations": recs, "source": "scaffold"}}
+        if kind == "video_cast":
+            device = str(payload.get("device", "TV") or "TV")
+            lines = [f"casting: {title or 'content'}", f"to: {device}", f"service: {service}"]
+            return {"ok": True, "message": f"Casting to {device}", "previewLines": lines,
+                    "data": {"op": kind, "title": title, "device": device, "source": "scaffold"}}
+        if kind == "video_rate":
+            rating = int(payload.get("rating", 5) or 5)
+            lines = [f"rated: {title}", f"stars: {rating}/5"]
+            return {"ok": True, "message": f"Rated {title}: {rating}/5", "previewLines": lines,
+                    "data": {"op": kind, "title": title, "rating": rating, "source": "scaffold"}}
+        return {"ok": True, "message": f"{kind} (scaffold)", "previewLines": [f"op: {kind}"],
+                "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Smart Home ops scaffold (T-C05) ───────────────────────────────────────
+    _SMARTHOME_OPS = {"smarthome_lights", "smarthome_thermostat", "smarthome_lock",
+                      "smarthome_camera", "smarthome_scene", "smarthome_energy",
+                      "smarthome_appliance"}
+    if kind in _SMARTHOME_OPS:
+        device     = str(payload.get("device", payload.get("room", "")) or "").strip()
+        brightness = int(payload.get("brightness", 100) or 100)
+        color      = str(payload.get("color", "white") or "white")
+        temp       = float(payload.get("temperature", payload.get("temp", 0)) or 0)
+        graph_add_event(graph, kind, {"device": device})
+        if kind == "smarthome_lights":
+            action = str(payload.get("action", "on") or "on")
+            lines = [f"device: {device or 'all lights'}", f"action: {action}",
+                     f"brightness: {brightness}%", f"color: {color}"]
+            return {"ok": True, "message": f"Lights {action}: {device or 'home'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "device": device, "action": action,
+                             "brightness": brightness, "color": color, "source": "scaffold"}}
+        if kind == "smarthome_thermostat":
+            mode = str(payload.get("mode", "auto") or "auto")
+            lines = [f"temperature: {temp or 72}°F", f"mode: {mode}",
+                     "current: 70°F (scaffold)"]
+            return {"ok": True, "message": f"Thermostat: {temp or 72}°F", "previewLines": lines,
+                    "data": {"op": kind, "temperature": temp or 72, "mode": mode,
+                             "current": 70, "source": "scaffold"}}
+        if kind == "smarthome_lock":
+            action = str(payload.get("action", "status") or "status")
+            lines = [f"device: {device or 'front door'}", f"action: {action}",
+                     "status: Locked (scaffold)", "last locked: 2h ago"]
+            return {"ok": True, "message": f"Lock {action}: {device or 'front door'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "device": device, "action": action,
+                             "locked": True, "source": "scaffold"}}
+        if kind == "smarthome_camera":
+            lines = [f"camera: {device or 'front door'}", "status: Live (scaffold)", "motion: None"]
+            return {"ok": True, "message": f"Camera: {device or 'front door'}", "previewLines": lines,
+                    "data": {"op": kind, "device": device, "status": "live", "source": "scaffold"}}
+        if kind == "smarthome_scene":
+            scene_name = str(payload.get("scene", payload.get("name", "")) or "")
+            lines = [f"scene: {scene_name or '(scene)'}", "activated (scaffold)"]
+            return {"ok": True, "message": f"Scene activated: {scene_name}", "previewLines": lines,
+                    "data": {"op": kind, "scene": scene_name, "source": "scaffold"}}
+        if kind == "smarthome_energy":
+            lines = ["usage: 4.2 kWh today (scaffold)", "peak: 6–9 AM", "solar: 1.8 kWh generated"]
+            return {"ok": True, "message": "Energy usage", "previewLines": lines,
+                    "data": {"op": kind, "usageKwh": 4.2, "solar": 1.8, "source": "scaffold"}}
+        if kind == "smarthome_appliance":
+            action = str(payload.get("action", "status") or "status")
+            lines = [f"appliance: {device}", f"action: {action}", "status: OK (scaffold)"]
+            return {"ok": True, "message": f"Appliance {action}: {device}", "previewLines": lines,
+                    "data": {"op": kind, "device": device, "action": action, "source": "scaffold"}}
+
+    # ── Phone ops scaffold (T-C07) ────────────────────────────────────────────
+    _PHONE_OPS = {"phone_call", "phone_recent", "phone_voicemail", "phone_block",
+                  "phone_record", "phone_conference"}
+    if kind in _PHONE_OPS:
+        target = str(payload.get("target", payload.get("number", payload.get("contact", ""))) or "").strip()
+        if kind == "phone_call":
+            # Delegate to telephony_call_start
+            return run_operation(session, {**op, "type": "telephony_call_start",
+                                           "payload": {"target": target}})
+        if kind == "phone_recent":
+            recent = [{"name": "Mom", "number": "+1-555-0100", "type": "incoming", "duration": "4:32"},
+                      {"name": "John", "number": "+1-555-0101", "type": "outgoing", "duration": "1:15"},
+                      {"name": "Unknown", "number": "+1-555-0199", "type": "missed", "duration": "0"}]
+            lines = [f"recent calls: {len(recent)}"] + [f"{c['type']}: {c['name']} ({c['duration']})" for c in recent]
+            return {"ok": True, "message": "Recent calls", "previewLines": lines[:8],
+                    "data": {"op": kind, "calls": recent, "source": "scaffold"}}
+        if kind == "phone_voicemail":
+            vms = [{"from": "Dr. Smith", "duration": "0:32", "time": "9:15 AM"},
+                   {"from": "+1-555-0150", "duration": "1:02", "time": "Yesterday"}]
+            lines = [f"voicemails: {len(vms)}"] + [f"{v['from']} — {v['duration']} @ {v['time']}" for v in vms]
+            return {"ok": True, "message": "Voicemail", "previewLines": lines[:8],
+                    "data": {"op": kind, "voicemails": vms, "source": "scaffold"}}
+        if kind == "phone_block":
+            lines = [f"blocked: {target or '(number)'}", "added to block list (scaffold)"]
+            return {"ok": True, "message": f"Blocked: {target}", "previewLines": lines,
+                    "data": {"op": kind, "target": target, "source": "scaffold"}}
+        if kind == "phone_record":
+            action = str(payload.get("action", "start") or "start")
+            lines = [f"recording: {action}", "note: call recording laws vary by jurisdiction"]
+            return {"ok": True, "message": f"Call recording {action}", "previewLines": lines,
+                    "data": {"op": kind, "action": action, "source": "scaffold"}}
+        if kind == "phone_conference":
+            participants = payload.get("participants", [])
+            lines = [f"conference: {len(participants)} participants (scaffold)"]
+            return {"ok": True, "message": "Conference call", "previewLines": lines,
+                    "data": {"op": kind, "participants": participants, "source": "scaffold"}}
+
+    # ── Photos ops scaffold (T-C08) ───────────────────────────────────────────
+    _PHOTOS_OPS = {"photos_search", "photos_album", "photos_edit", "photos_share"}
+    if kind in _PHOTOS_OPS:
+        query = str(payload.get("query", payload.get("search", "")) or "").strip()
+        album = str(payload.get("album", payload.get("name", "")) or "").strip()
+        graph_add_event(graph, kind, {"query": query, "album": album})
+        if kind == "photos_search":
+            results = [{"id": "img001", "date": "2024-12-25", "label": "Christmas"},
+                       {"id": "img002", "date": "2024-07-04", "label": "4th of July"},
+                       {"id": "img003", "date": "2024-06-15", "label": "Vacation"}]
+            filtered = [r for r in results if query.lower() in r["label"].lower()] if query else results
+            lines = [f"query: {query or 'all'}", f"results: {len(filtered)} photos"]
+            return {"ok": True, "message": f"Photos: {query or 'recent'}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "photos": filtered, "source": "scaffold"}}
+        if kind == "photos_album":
+            albums = [{"name": "Recents", "count": 1240}, {"name": "Favorites", "count": 87},
+                      {"name": "Screenshots", "count": 342}]
+            if album:
+                albums = [a for a in albums if album.lower() in a["name"].lower()]
+            lines = [f"albums: {len(albums)}"] + [f"{a['name']}: {a['count']} photos" for a in albums]
+            return {"ok": True, "message": f"Albums: {album or 'all'}", "previewLines": lines[:8],
+                    "data": {"op": kind, "albums": albums, "source": "scaffold"}}
+        if kind == "photos_edit":
+            edit_type = str(payload.get("editType", "enhance") or "enhance")
+            lines = [f"edit: {edit_type}", "photo: selected (scaffold)"]
+            return {"ok": True, "message": f"Photo {edit_type}", "previewLines": lines,
+                    "data": {"op": kind, "editType": edit_type, "source": "scaffold"}}
+        if kind == "photos_share":
+            to = str(payload.get("to", "") or "")
+            lines = [f"sharing photo", f"to: {to or '(recipient)'}", "link: generated (scaffold)"]
+            return {"ok": True, "message": f"Photo shared{' with ' + to if to else ''}", "previewLines": lines,
+                    "data": {"op": kind, "to": to, "source": "scaffold"}}
+
+    # ── Messaging extended ops (T-C09) ────────────────────────────────────────
+    _MESSAGING_EXT_OPS = {"messaging_read", "messaging_reply", "messaging_react",
+                          "messaging_forward", "messaging_search", "messaging_delete",
+                          "messaging_block", "messaging_schedule", "messaging_group_create",
+                          "messaging_group_add"}
+    if kind in _MESSAGING_EXT_OPS:
+        snap = slack_channels_snapshot()
+        channels = snap.get("channels", [])
+        thread  = str(payload.get("to", payload.get("from", payload.get("thread", ""))) or "").strip()
+        text    = str(payload.get("text", payload.get("message", "")) or "").strip()
+        query   = str(payload.get("query", "") or "").strip()
+        if kind == "messaging_read":
+            msgs = [{"from": "Alice", "text": "Hey, are you free tomorrow?", "ts": "10:32 AM"},
+                    {"from": "Bob",   "text": "Great work on the project!", "ts": "9:15 AM"}]
+            lines = [f"thread: {thread or 'inbox'}", f"messages: {len(msgs)}"]
+            return {"ok": True, "message": f"Messages: {thread or 'inbox'}", "previewLines": lines,
+                    "data": {"op": kind, "thread": thread, "messages": msgs, "source": "scaffold"}}
+        if kind == "messaging_reply":
+            lines = [f"reply to: {thread}", f"message: {text[:60]}"]
+            return {"ok": True, "message": f"Reply sent to {thread}", "previewLines": lines,
+                    "data": {"op": kind, "to": thread, "text": text, "source": "scaffold"}}
+        if kind == "messaging_react":
+            emoji = str(payload.get("emoji", payload.get("reaction", "👍")) or "👍")
+            lines = [f"reaction: {emoji}", f"to: {thread or 'message'}"]
+            return {"ok": True, "message": f"Reacted {emoji}", "previewLines": lines,
+                    "data": {"op": kind, "emoji": emoji, "source": "scaffold"}}
+        if kind == "messaging_search":
+            lines = [f"query: {query}", "results: 5 messages (scaffold)"]
+            return {"ok": True, "message": f"Message search: {query}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "messages": [], "source": "scaffold"}}
+        if kind in ("messaging_delete", "messaging_block", "messaging_forward",
+                    "messaging_schedule", "messaging_group_create", "messaging_group_add"):
+            action = kind.replace("messaging_", "")
+            lines = [f"action: {action}", f"target: {thread or '(target)'}"]
+            return {"ok": True, "message": f"Message {action}: {thread or '(done)'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "action": action, "target": thread, "source": "scaffold"}}
+
+    # ── Document extended ops scaffold (T-D01) ────────────────────────────────
+    _DOC_OPS = {"document_create", "document_edit", "document_delete", "document_rename",
+                "document_export", "document_share", "document_template"}
+    if kind in _DOC_OPS:
+        name   = str(payload.get("name", payload.get("title", "")) or "").strip()
+        action = kind.replace("document_", "")
+        graph_add_event(graph, kind, {"name": name, "action": action})
+        if kind == "document_create":
+            template = str(payload.get("template", "") or "")
+            lines = [f"created: {name or 'Untitled Document'}", f"template: {template or 'blank'}"]
+            return {"ok": True, "message": f"Document created: {name or 'Untitled'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "name": name or "Untitled Document",
+                             "template": template, "source": "scaffold"}}
+        if kind == "document_export":
+            fmt = str(payload.get("format", "pdf") or "pdf")
+            lines = [f"exporting: {name}", f"format: {fmt}", "file: ready (scaffold)"]
+            return {"ok": True, "message": f"Exported {name} as {fmt}", "previewLines": lines,
+                    "data": {"op": kind, "name": name, "format": fmt, "source": "scaffold"}}
+        lines = [f"action: {action}", f"name: {name or '(document)'}"]
+        return {"ok": True, "message": f"Document {action}: {name or '(done)'}",
+                "previewLines": lines,
+                "data": {"op": kind, "name": name, "action": action, "source": "scaffold"}}
+
+    # ── Spreadsheet extended ops scaffold (T-D02) ─────────────────────────────
+    _SHEET_OPS = {"spreadsheet_create", "spreadsheet_edit", "spreadsheet_delete",
+                  "spreadsheet_chart", "spreadsheet_formula", "spreadsheet_export"}
+    if kind in _SHEET_OPS:
+        name   = str(payload.get("name", payload.get("title", "")) or "").strip()
+        action = kind.replace("spreadsheet_", "")
+        graph_add_event(graph, kind, {"name": name, "action": action})
+        if kind == "spreadsheet_chart":
+            chart_type = str(payload.get("chartType", "bar") or "bar")
+            lines = [f"chart: {chart_type}", f"sheet: {name or '(sheet)'}"]
+            return {"ok": True, "message": f"Chart created: {chart_type}", "previewLines": lines,
+                    "data": {"op": kind, "name": name, "chartType": chart_type, "source": "scaffold"}}
+        lines = [f"action: {action}", f"name: {name or '(spreadsheet)'}"]
+        return {"ok": True, "message": f"Spreadsheet {action}: {name or '(done)'}",
+                "previewLines": lines,
+                "data": {"op": kind, "name": name, "action": action, "source": "scaffold"}}
+
+    # ── Presentation extended ops scaffold (T-D03) ────────────────────────────
+    _PRES_OPS = {"presentation_create", "presentation_edit", "presentation_delete",
+                 "presentation_export", "presentation_share", "presentation_speaker_notes",
+                 "presentation_template"}
+    if kind in _PRES_OPS:
+        name   = str(payload.get("name", payload.get("title", "")) or "").strip()
+        action = kind.replace("presentation_", "")
+        graph_add_event(graph, kind, {"name": name, "action": action})
+        lines = [f"action: {action}", f"name: {name or '(presentation)'}"]
+        return {"ok": True, "message": f"Presentation {action}: {name or '(done)'}",
+                "previewLines": lines,
+                "data": {"op": kind, "name": name, "action": action, "source": "scaffold"}}
+
+    # ── Terminal extended ops scaffold (T-D04) ────────────────────────────────
+    _TERMINAL_EXT_OPS = {"terminal_history", "terminal_kill", "terminal_ssh",
+                         "terminal_env", "terminal_output"}
+    if kind in _TERMINAL_EXT_OPS:
+        if kind == "terminal_history":
+            limit  = int(payload.get("limit", 20) or 20)
+            filt   = str(payload.get("filter", "") or "").strip()
+            hist   = [{"cmd": "git status", "ts": "10:32 AM"}, {"cmd": "npm run dev", "ts": "10:28 AM"},
+                      {"cmd": "cd GenomeUI", "ts": "10:25 AM"}]
+            if filt:
+                hist = [h for h in hist if filt in h["cmd"]]
+            lines = [f"history: {len(hist)} commands"] + [h["cmd"] for h in hist[:8]]
+            return {"ok": True, "message": "Terminal history", "previewLines": lines[:10],
+                    "data": {"op": kind, "history": hist, "source": "scaffold"}}
+        if kind == "terminal_kill":
+            proc = str(payload.get("process", payload.get("pid", "")) or "").strip()
+            lines = [f"killed: {proc or '(process)'}", "signal: SIGTERM (scaffold)"]
+            return {"ok": True, "message": f"Killed: {proc}", "previewLines": lines,
+                    "data": {"op": kind, "process": proc, "source": "scaffold"}}
+        if kind == "terminal_ssh":
+            host = str(payload.get("host", "") or "")
+            user = str(payload.get("user", "") or "")
+            lines = [f"ssh: {user + '@' if user else ''}{host}", "connecting (scaffold)"]
+            return {"ok": True, "message": f"SSH: {host}", "previewLines": lines,
+                    "data": {"op": kind, "host": host, "user": user, "source": "scaffold"}}
+        if kind == "terminal_env":
+            action = str(payload.get("action", "list") or "list")
+            var    = str(payload.get("var", "") or "")
+            value  = str(payload.get("value", "") or "")
+            lines  = [f"action: {action}"]
+            if var:
+                lines.append(f"var: {var}{(' = ' + value) if value else ''}")
+            return {"ok": True, "message": f"Env {action}", "previewLines": lines,
+                    "data": {"op": kind, "action": action, "var": var, "value": value,
+                             "source": "scaffold"}}
+        if kind == "terminal_output":
+            cmd = str(payload.get("command", "") or "")
+            lines = [f"command: {cmd or '(last command)'}", "output: (scaffold — run command first)"]
+            return {"ok": True, "message": f"Terminal output: {cmd or 'last'}", "previewLines": lines,
+                    "data": {"op": kind, "command": cmd, "source": "scaffold"}}
+
+    # ── Shopping extended ops scaffold (T-D05) ────────────────────────────────
+    _SHOPPING_EXT_OPS = {"shopping_cart", "shopping_compare", "shopping_orders",
+                         "shopping_recommendations", "shopping_track", "shopping_wishlist"}
+    if kind in _SHOPPING_EXT_OPS:
+        query = str(payload.get("query", payload.get("product", "")) or "").strip()
+        graph_add_event(graph, kind, {"query": query})
+        if kind == "shopping_cart":
+            cart = [{"item": "Wireless Headphones", "qty": 1, "price": "$89.99"},
+                    {"item": "USB-C Cable", "qty": 2, "price": "$12.99"}]
+            total = 115.97
+            lines = [f"cart: {len(cart)} items", f"total: ${total:.2f}"] + [c["item"] for c in cart]
+            return {"ok": True, "message": "Shopping cart", "previewLines": lines[:8],
+                    "data": {"op": kind, "cart": cart, "total": total, "source": "scaffold"}}
+        if kind == "shopping_compare":
+            products = str(payload.get("products", query) or query)
+            lines = [f"comparing: {products}", "results: side-by-side (scaffold)"]
+            return {"ok": True, "message": f"Compare: {products}", "previewLines": lines,
+                    "data": {"op": kind, "products": products, "source": "scaffold"}}
+        if kind == "shopping_orders":
+            orders = [{"id": "112-3456789", "item": "MacBook Pro", "status": "Delivered", "date": "Mar 1"},
+                      {"id": "112-9876543", "item": "AirPods",    "status": "Shipped",   "date": "Mar 11"}]
+            lines = [f"orders: {len(orders)}"] + [f"{o['id']}: {o['item']} — {o['status']}" for o in orders]
+            return {"ok": True, "message": "Recent orders", "previewLines": lines[:8],
+                    "data": {"op": kind, "orders": orders, "source": "scaffold"}}
+        if kind == "shopping_track":
+            order_id = str(payload.get("orderId", "112-9876543") or "")
+            lines = [f"order: {order_id}", "status: In Transit", "ETA: March 15"]
+            return {"ok": True, "message": f"Tracking: {order_id}", "previewLines": lines,
+                    "data": {"op": kind, "orderId": order_id, "status": "In Transit", "source": "scaffold"}}
+        action = kind.replace("shopping_", "")
+        return {"ok": True, "message": f"Shopping {action}", "previewLines": [f"op: {kind}"],
+                "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Files extended ops scaffold (T-D06) ───────────────────────────────────
+    _FILES_EXT_OPS = {"files_search", "files_recent", "files_download",
+                      "files_upload", "files_share"}
+    if kind in _FILES_EXT_OPS:
+        query = str(payload.get("query", payload.get("name", "")) or "").strip()
+        if kind == "files_recent":
+            limit = int(payload.get("limit", 10) or 10)
+            file_type = str(payload.get("type", "") or "")
+            recent = [{"name": "Q4 Report.pdf", "modified": "2h ago", "size": "2.4 MB"},
+                      {"name": "Budget 2026.xlsx", "modified": "yesterday", "size": "1.1 MB"},
+                      {"name": "Design.figma", "modified": "3 days ago", "size": "8.2 MB"}]
+            if file_type:
+                recent = [f for f in recent if file_type.lower() in f["name"].lower()]
+            lines = [f"recent files: {len(recent)}"] + [f"{f['name']} — {f['modified']}" for f in recent[:8]]
+            return {"ok": True, "message": "Recent files", "previewLines": lines[:10],
+                    "data": {"op": kind, "files": recent, "source": "scaffold"}}
+        if kind == "files_search":
+            results = [{"name": f"file_matching_{query}.pdf", "path": "/Documents", "modified": "1 week ago"}] if query else []
+            lines = [f"query: {query}", f"results: {len(results)}"]
+            return {"ok": True, "message": f"Files: {query}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "files": results, "source": "scaffold"}}
+        action = kind.replace("files_", "")
+        return {"ok": True, "message": f"Files {action}", "previewLines": [f"op: {kind}"],
+                "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Finance extended ops scaffold (T-D07) ─────────────────────────────────
+    _FINANCE_EXT_OPS = {"finance_portfolio", "finance_watchlist", "finance_news",
+                        "finance_alert"}
+    if kind in _FINANCE_EXT_OPS:
+        ticker = str(payload.get("ticker", payload.get("symbol", "")) or "").strip()
+        graph_add_event(graph, kind, {"ticker": ticker})
+        if kind == "finance_portfolio":
+            portfolio = [{"symbol": "AAPL", "shares": 10, "value": "$1,890", "gain": "+2.3%"},
+                         {"symbol": "NVDA", "shares": 5,  "value": "$4,650", "gain": "+8.1%"},
+                         {"symbol": "VOO",  "shares": 20, "value": "$9,400", "gain": "+1.2%"}]
+            total = "$15,940"
+            lines = [f"portfolio: {len(portfolio)} positions", f"total value: {total}"] + \
+                    [f"{p['symbol']}: {p['value']} ({p['gain']})" for p in portfolio]
+            return {"ok": True, "message": "Portfolio overview", "previewLines": lines[:10],
+                    "data": {"op": kind, "portfolio": portfolio, "totalValue": total, "source": "scaffold"}}
+        if kind == "finance_watchlist":
+            watchlist = [{"symbol": "MSFT", "price": "$415", "change": "+1.2%"},
+                         {"symbol": "TSLA", "price": "$184", "change": "-2.4%"},
+                         {"symbol": "META", "price": "$512", "change": "+0.8%"}]
+            lines = [f"watchlist: {len(watchlist)} tickers"] + \
+                    [f"{w['symbol']}: {w['price']} {w['change']}" for w in watchlist]
+            return {"ok": True, "message": "Watchlist", "previewLines": lines[:8],
+                    "data": {"op": kind, "watchlist": watchlist, "source": "scaffold"}}
+        action = kind.replace("finance_", "")
+        return {"ok": True, "message": f"Finance {action}: {ticker or '(market)'}",
+                "previewLines": [f"op: {kind}", f"ticker: {ticker}"],
+                "data": {"op": kind, "ticker": ticker, "source": "scaffold"}}
+
+    # ── Notifications ops scaffold (T-E01) ───────────────────────────────────
+    _NOTIF_OPS = {"notifications_view", "notifications_clear", "notifications_clear_app",
+                  "notifications_mark_read", "notifications_settings"}
+    if kind in _NOTIF_OPS:
+        app = str(payload.get("app", "") or "").strip()
+        if kind == "notifications_view":
+            notifs = [{"app": "Mail", "text": "3 new messages", "time": "2m ago"},
+                      {"app": "Slack", "text": "Alice mentioned you", "time": "5m ago"},
+                      {"app": "Calendar", "text": "Meeting in 15 min", "time": "10m ago"}]
+            lines = [f"notifications: {len(notifs)}"] + [f"{n['app']}: {n['text']}" for n in notifs]
+            return {"ok": True, "message": "Notifications", "previewLines": lines[:8],
+                    "data": {"op": kind, "notifications": notifs, "source": "scaffold"}}
+        if kind == "notifications_clear":
+            return {"ok": True, "message": "All notifications cleared",
+                    "previewLines": ["cleared: all notifications"],
+                    "data": {"op": kind, "source": "scaffold"}}
+        if kind == "notifications_clear_app":
+            return {"ok": True, "message": f"Cleared notifications: {app or '(app)'}",
+                    "previewLines": [f"cleared: {app or '(app)'}"],
+                    "data": {"op": kind, "app": app, "source": "scaffold"}}
+        if kind == "notifications_mark_read":
+            return {"ok": True, "message": "Notifications marked read",
+                    "previewLines": ["marked read: all"],
+                    "data": {"op": kind, "source": "scaffold"}}
+        if kind == "notifications_settings":
+            return {"ok": True, "message": "Notification settings",
+                    "previewLines": ["dnd: off", "banners: on", "badges: on"],
+                    "data": {"op": kind, "dnd": False, "banners": True, "source": "scaffold"}}
+
+    # ── Focus & Productivity ops scaffold (T-E02) ─────────────────────────────
+    _FOCUS_OPS = {"focus_session", "focus_pomodoro", "focus_block", "focus_stats"}
+    if kind in _FOCUS_OPS:
+        duration = int(payload.get("duration", payload.get("minutes", 25)) or 25)
+        graph_add_event(graph, kind, {"duration": duration})
+        if kind == "focus_session":
+            return run_operation(session, {**op, "type": "timer_start",
+                                           "payload": {"minutes": duration, "label": "Focus Session"}})
+        if kind == "focus_pomodoro":
+            return run_operation(session, {**op, "type": "timer_start",
+                                           "payload": {"minutes": 25, "label": "Pomodoro"}})
+        if kind == "focus_block":
+            blocked = payload.get("apps", [])
+            lines = [f"blocking: {', '.join(blocked) if blocked else 'distracting apps'}", f"duration: {duration} min"]
+            return {"ok": True, "message": f"Focus block: {duration} min",
+                    "previewLines": lines, "data": {"op": kind, "duration": duration, "blocked": blocked, "source": "scaffold"}}
+        if kind == "focus_stats":
+            lines = ["focus time today: 2h 15m", "sessions: 4", "pomodoros: 3", "streak: 5 days"]
+            return {"ok": True, "message": "Focus stats", "previewLines": lines,
+                    "data": {"op": kind, "todayMinutes": 135, "sessions": 4, "streak": 5, "source": "scaffold"}}
+
+    # ── Wallet & Passes ops scaffold (T-E03) ──────────────────────────────────
+    _WALLET_OPS = {"wallet_passes", "wallet_loyalty", "wallet_gift_card", "wallet_coupon"}
+    if kind in _WALLET_OPS:
+        store = str(payload.get("store", payload.get("name", "")) or "").strip()
+        if kind == "wallet_passes":
+            passes = [{"type": "Boarding Pass", "label": "AA123 → LAX", "expires": "Mar 15"},
+                      {"type": "Event Ticket", "label": "Concert — Row C", "expires": "Apr 2"},
+                      {"type": "Loyalty Card", "label": "Starbucks Gold", "points": "420 pts"}]
+            lines = [f"passes: {len(passes)}"] + [f"{p['type']}: {p['label']}" for p in passes]
+            return {"ok": True, "message": "Wallet", "previewLines": lines[:8],
+                    "data": {"op": kind, "passes": passes, "source": "scaffold"}}
+        if kind == "wallet_loyalty":
+            lines = [f"store: {store or 'all'}", "points: 420", "tier: Gold"]
+            return {"ok": True, "message": f"Loyalty: {store or 'cards'}", "previewLines": lines,
+                    "data": {"op": kind, "store": store, "points": 420, "source": "scaffold"}}
+        if kind == "wallet_gift_card":
+            balance = float(payload.get("balance", 25.00) or 25.00)
+            lines = [f"store: {store or '(store)'}", f"balance: ${balance:.2f}"]
+            return {"ok": True, "message": f"Gift card: {store or '(store)'}",
+                    "previewLines": lines, "data": {"op": kind, "store": store, "balance": balance, "source": "scaffold"}}
+        if kind == "wallet_coupon":
+            lines = [f"store: {store or 'all'}", "coupons: 3 available (scaffold)"]
+            return {"ok": True, "message": f"Coupons: {store or 'all'}",
+                    "previewLines": lines, "data": {"op": kind, "store": store, "source": "scaffold"}}
+
+    # ── VPN ops scaffold (T-E04) ──────────────────────────────────────────────
+    if kind in ("vpn_connect", "vpn_disconnect", "vpn_status"):
+        server = str(payload.get("server", payload.get("location", "")) or "").strip()
+        if kind == "vpn_status":
+            return {"ok": True, "message": "VPN: Disconnected (scaffold)",
+                    "previewLines": ["status: Disconnected", "server: —"],
+                    "data": {"op": kind, "connected": False, "source": "scaffold"}}
+        if kind == "vpn_connect":
+            return {"ok": True, "message": f"VPN connected: {server or 'auto'}",
+                    "previewLines": [f"server: {server or 'auto-select'}", "status: Connected (scaffold)"],
+                    "data": {"op": kind, "server": server, "connected": True, "source": "scaffold"}}
+        if kind == "vpn_disconnect":
+            return {"ok": True, "message": "VPN disconnected",
+                    "previewLines": ["status: Disconnected"],
+                    "data": {"op": kind, "connected": False, "source": "scaffold"}}
+
+    # ── Screen Capture ops scaffold (T-E05) ───────────────────────────────────
+    _SCREEN_OPS = {"screen_screenshot", "screen_record", "screen_mirror", "screen_split"}
+    if kind in _SCREEN_OPS:
+        graph_add_event(graph, kind, {})
+        if kind == "screen_screenshot":
+            return {"ok": True, "message": "Screenshot captured",
+                    "previewLines": ["saved: ~/Desktop/Screenshot.png (scaffold)"],
+                    "data": {"op": kind, "path": "~/Desktop/Screenshot.png", "source": "scaffold"}}
+        if kind == "screen_record":
+            action = str(payload.get("action", "start") or "start")
+            return {"ok": True, "message": f"Screen record: {action}",
+                    "previewLines": [f"recording: {action} (scaffold)"],
+                    "data": {"op": kind, "action": action, "source": "scaffold"}}
+        action = kind.replace("screen_", "")
+        return {"ok": True, "message": f"Screen {action}",
+                "previewLines": [f"action: {action} (scaffold)"],
+                "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Handoff & Continuity ops scaffold (T-E06) ─────────────────────────────
+    _HANDOFF_OPS = {"handoff_continue", "handoff_clipboard", "handoff_airdrop",
+                    "handoff_screen_share"}
+    if kind in _HANDOFF_OPS:
+        target = str(payload.get("device", payload.get("target", "")) or "").strip()
+        if kind == "handoff_clipboard":
+            content = str(payload.get("content", payload.get("text", "")) or "").strip()
+            lines = [f"clipboard synced to: {target or 'all devices'}", f"content: {content[:60] if content else '(current clipboard)'}"]
+            return {"ok": True, "message": "Clipboard synced",
+                    "previewLines": lines, "data": {"op": kind, "target": target, "source": "scaffold"}}
+        if kind == "handoff_continue":
+            lines = [f"continuing on: {target or 'this device'}", "state: transferred (scaffold)"]
+            return {"ok": True, "message": f"Handoff: {target or 'this device'}",
+                    "previewLines": lines, "data": {"op": kind, "device": target, "source": "scaffold"}}
+        action = kind.replace("handoff_", "")
+        return {"ok": True, "message": f"Handoff {action}: {target or '(done)'}",
+                "previewLines": [f"action: {action}"], "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Backup ops scaffold (T-E07) ───────────────────────────────────────────
+    if kind in ("backup_now", "backup_status"):
+        if kind == "backup_now":
+            graph_add_event(graph, kind, {})
+            return {"ok": True, "message": "Backup started",
+                    "previewLines": ["backup: in progress (scaffold)", "estimated: 2 min"],
+                    "data": {"op": kind, "status": "started", "source": "scaffold"}}
+        if kind == "backup_status":
+            return {"ok": True, "message": "Backup: up to date",
+                    "previewLines": ["last backup: 2h ago", "size: 4.2 GB", "status: Complete"],
+                    "data": {"op": kind, "lastBackup": "2h ago", "status": "Complete", "source": "scaffold"}}
+
+    # ── Password Manager ops scaffold (T-E08) ─────────────────────────────────
+    if kind in ("password_find", "password_generate", "password_update"):
+        service = str(payload.get("service", payload.get("site", "")) or "").strip()
+        if kind == "password_find":
+            creds = _auth.vault_retrieve(service) if service else None
+            if creds:
+                return {"ok": True, "message": f"Password found: {service}",
+                        "previewLines": [f"service: {service}", "password: ••••••••• (in vault)"],
+                        "data": {"op": kind, "service": service, "found": True}}
+            return {"ok": True, "message": f"Password: {service or '(service)'}",
+                    "previewLines": [f"service: {service or '(enter service name)'}",
+                                     "note: not in vault (scaffold)"],
+                    "data": {"op": kind, "service": service, "found": False}}
+        if kind == "password_generate":
+            import secrets as _sec, string as _str
+            length = int(payload.get("length", 16) or 16)
+            charset = _str.ascii_letters + _str.digits + "!@#$%^&*"
+            pw = "".join(_sec.choice(charset) for _ in range(length))
+            return {"ok": True, "message": "Password generated",
+                    "previewLines": [f"password: {pw}", f"length: {length}", "strength: strong"],
+                    "data": {"op": kind, "password": pw, "length": length}}
+        if kind == "password_update":
+            if not service:
+                return {"ok": False, "message": "Service name required.",
+                        "previewLines": ["missing: service"]}
+            return {"ok": True, "message": f"Password updated: {service}",
+                    "previewLines": [f"service: {service}", "status: updated (scaffold)"],
+                    "data": {"op": kind, "service": service, "source": "scaffold"}}
+
+    # ── App Store ops scaffold (T-E09) ────────────────────────────────────────
+    if kind in ("app_find", "app_install", "app_update"):
+        app_name = str(payload.get("app", payload.get("name", "")) or "").strip()
+        if kind == "app_find":
+            results = [{"name": app_name or "GenomeUI", "developer": "Genome Inc.", "rating": 4.9}] if app_name else []
+            lines = [f"search: {app_name or '(query)'}", f"results: {len(results)}"]
+            return {"ok": True, "message": f"App Store: {app_name}", "previewLines": lines,
+                    "data": {"op": kind, "apps": results, "source": "scaffold"}}
+        if kind == "app_install":
+            lines = [f"installing: {app_name}", "progress: queued (scaffold — OS handles install)"]
+            return {"ok": True, "message": f"Installing: {app_name}", "previewLines": lines,
+                    "data": {"op": kind, "app": app_name, "source": "scaffold"}}
+        if kind == "app_update":
+            lines = [f"updating: {app_name or 'all apps'}", "status: scheduled (scaffold)"]
+            return {"ok": True, "message": f"Update: {app_name or 'all'}",
+                    "previewLines": lines, "data": {"op": kind, "app": app_name, "source": "scaffold"}}
+
+    # ── Reading List ops scaffold (T-E10) ─────────────────────────────────────
+    if kind in ("reading_save", "reading_list_view", "reading_mark_read"):
+        url   = str(payload.get("url", payload.get("link", "")) or "").strip()
+        title = str(payload.get("title", "") or "").strip()
+        if kind == "reading_save":
+            graph_add_event(graph, kind, {"url": url, "title": title})
+            return {"ok": True, "message": f"Saved to reading list: {title or url or '(article)'}",
+                    "previewLines": [f"title: {title or url or '(article)'}"],
+                    "data": {"op": kind, "url": url, "title": title, "source": "scaffold"}}
+        if kind == "reading_list_view":
+            reading_list = [{"title": "The Future of AI", "url": "...", "read": False},
+                            {"title": "How Transformers Work", "url": "...", "read": False},
+                            {"title": "GenomeUI Design", "url": "...", "read": True}]
+            lines = [f"reading list: {len(reading_list)} articles",
+                     f"unread: {sum(1 for a in reading_list if not a['read'])}"]
+            return {"ok": True, "message": "Reading list", "previewLines": lines,
+                    "data": {"op": kind, "articles": reading_list, "source": "scaffold"}}
+        if kind == "reading_mark_read":
+            return {"ok": True, "message": f"Marked read: {title or url or '(article)'}",
+                    "previewLines": [f"title: {title or url or '(article)'}"],
+                    "data": {"op": kind, "url": url, "source": "scaffold"}}
+
+    # ── Accessibility & Settings ops scaffold (T-E11) ─────────────────────────
+    _SETTINGS_OPS = {"access_display", "access_font", "access_voice", "access_zoom",
+                     "settings_airplane", "settings_bluetooth", "settings_brightness",
+                     "settings_dnd", "settings_wifi"}
+    if kind in _SETTINGS_OPS:
+        value = payload.get("value", payload.get("level", payload.get("enabled", None)))
+        graph_add_event(graph, kind, {"value": str(value or "")})
+        action = kind.split("_", 1)[1]
+        val_str = f": {value}" if value is not None else ""
+        lines = [f"setting: {action}", f"value: {value if value is not None else '(scaffold)'}",
+                 "note: OS-level setting — scaffold confirmation only"]
+        return {"ok": True, "message": f"Setting {action}{val_str}",
+                "previewLines": lines, "data": {"op": kind, "setting": action, "value": value, "source": "scaffold"}}
+
+    # ── Shortcuts & Automations ops scaffold (T-E12) ──────────────────────────
+    if kind in ("shortcut_list", "shortcut_create", "shortcut_run"):
+        name = str(payload.get("name", payload.get("shortcut", "")) or "").strip()
+        if kind == "shortcut_list":
+            shortcuts = [{"name": "Morning Routine", "trigger": "8 AM daily"},
+                         {"name": "Work Mode", "trigger": "Manual"},
+                         {"name": "Focus Timer", "trigger": "Double tap back"}]
+            lines = [f"shortcuts: {len(shortcuts)}"] + [f"{s['name']} — {s['trigger']}" for s in shortcuts]
+            return {"ok": True, "message": "Shortcuts", "previewLines": lines[:8],
+                    "data": {"op": kind, "shortcuts": shortcuts, "source": "scaffold"}}
+        if kind == "shortcut_create":
+            trigger = str(payload.get("trigger", "") or "").strip()
+            action_desc = str(payload.get("action", "") or "").strip()
+            graph_add_event(graph, kind, {"name": name, "trigger": trigger})
+            lines = [f"created: {name or 'New Shortcut'}", f"trigger: {trigger or '(manual)'}",
+                     f"action: {action_desc or '(set action)'}"]
+            return {"ok": True, "message": f"Shortcut created: {name or 'New Shortcut'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "name": name, "trigger": trigger, "source": "scaffold"}}
+        if kind == "shortcut_run":
+            graph_add_event(graph, kind, {"name": name})
+            return {"ok": True, "message": f"Running shortcut: {name or '(shortcut)'}",
+                    "previewLines": [f"shortcut: {name}", "status: Running (scaffold)"],
+                    "data": {"op": kind, "name": name, "source": "scaffold"}}
+
+    # ── Podcasts ops scaffold (T-E16) ─────────────────────────────────────────
+    if kind in ("podcast_find", "podcast_queue", "podcast_subscribe"):
+        query = str(payload.get("query", payload.get("podcast", "")) or "").strip()
+        if kind == "podcast_find":
+            results = [{"title": query or "Serial", "publisher": "WBEZ", "episodes": 12},
+                       {"title": "99% Invisible", "publisher": "Roman Mars", "episodes": 500}] if query else []
+            lines = [f"search: {query}", f"results: {len(results)}"]
+            return {"ok": True, "message": f"Podcast: {query}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "podcasts": results, "source": "scaffold"}}
+        if kind == "podcast_queue":
+            lines = [f"queued: {query or '(episode)'}", "next up in podcast queue"]
+            return {"ok": True, "message": f"Queued: {query}",
+                    "previewLines": lines, "data": {"op": kind, "podcast": query, "source": "scaffold"}}
+        if kind == "podcast_subscribe":
+            lines = [f"subscribed: {query}", "new episodes will notify you"]
+            return {"ok": True, "message": f"Subscribed: {query}",
+                    "previewLines": lines, "data": {"op": kind, "podcast": query, "source": "scaffold"}}
+
+    # ── Recipes & Grocery ops scaffold (T-E17) ────────────────────────────────
+    _RECIPE_OPS = {"recipe_find", "recipe_save", "recipe_scale", "recipe_nutrition",
+                   "grocery_list", "grocery_add", "grocery_order"}
+    if kind in _RECIPE_OPS:
+        query = str(payload.get("query", payload.get("recipe", "")) or "").strip()
+        item  = str(payload.get("item", "") or "").strip()
+        if kind == "recipe_find":
+            recipes = [{"name": query or "Pasta Carbonara", "time": "30 min", "servings": 4},
+                       {"name": "Quick Stir Fry", "time": "20 min", "servings": 2}]
+            lines = [f"search: {query or 'all'}", f"results: {len(recipes)}"]
+            return {"ok": True, "message": f"Recipe: {query}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "recipes": recipes, "source": "scaffold"}}
+        if kind == "recipe_save":
+            graph_add_event(graph, kind, {"recipe": query})
+            return {"ok": True, "message": f"Recipe saved: {query}",
+                    "previewLines": [f"saved: {query}"],
+                    "data": {"op": kind, "recipe": query, "source": "scaffold"}}
+        if kind == "recipe_scale":
+            servings = int(payload.get("servings", 4) or 4)
+            lines = [f"recipe: {query}", f"scaling to: {servings} servings"]
+            return {"ok": True, "message": f"Recipe scaled: {query}", "previewLines": lines,
+                    "data": {"op": kind, "recipe": query, "servings": servings, "source": "scaffold"}}
+        if kind == "recipe_nutrition":
+            lines = [f"recipe: {query}", "calories: ~420/serving", "protein: 32g", "carbs: 48g"]
+            return {"ok": True, "message": f"Nutrition: {query}", "previewLines": lines,
+                    "data": {"op": kind, "recipe": query, "calories": 420, "source": "scaffold"}}
+        if kind == "grocery_list":
+            grocery_items = [{"item": "Eggs", "qty": "12", "checked": False},
+                             {"item": "Milk", "qty": "1 gal", "checked": False},
+                             {"item": "Bread", "qty": "1 loaf", "checked": True}]
+            lines = [f"grocery list: {len(grocery_items)} items",
+                     f"remaining: {sum(1 for i in grocery_items if not i['checked'])}"]
+            return {"ok": True, "message": "Grocery list", "previewLines": lines,
+                    "data": {"op": kind, "items": grocery_items, "source": "scaffold"}}
+        if kind == "grocery_add":
+            graph_add_event(graph, kind, {"item": item})
+            return {"ok": True, "message": f"Added: {item or '(item)'}",
+                    "previewLines": [f"added: {item}"],
+                    "data": {"op": kind, "item": item, "source": "scaffold"}}
+        if kind == "grocery_order":
+            lines = ["ordering from: Instacart (scaffold)", "ETA: 1 hour"]
+            return {"ok": True, "message": "Grocery order placed",
+                    "previewLines": lines, "data": {"op": kind, "source": "scaffold"}}
+
+    # ── Books ops scaffold (T-E18) ────────────────────────────────────────────
+    if kind in ("book_library", "book_find", "book_read", "book_highlight"):
+        query = str(payload.get("query", payload.get("title", "")) or "").strip()
+        if kind == "book_library":
+            books = [{"title": "The Goal", "author": "Eliyahu Goldratt", "progress": "100%"},
+                     {"title": "Zero to One", "author": "Peter Thiel", "progress": "62%"},
+                     {"title": "Sapiens", "author": "Yuval Harari", "progress": "18%"}]
+            lines = [f"library: {len(books)} books"] + [f"{b['title']} — {b['progress']}" for b in books]
+            return {"ok": True, "message": "Book library", "previewLines": lines[:8],
+                    "data": {"op": kind, "books": books, "source": "scaffold"}}
+        if kind == "book_find":
+            results = [{"title": query or "Atomic Habits", "author": "James Clear", "pages": 320}]
+            lines = [f"search: {query}", f"results: {len(results)}"]
+            return {"ok": True, "message": f"Book: {query}", "previewLines": lines,
+                    "data": {"op": kind, "query": query, "books": results, "source": "scaffold"}}
+        if kind == "book_read":
+            lines = [f"opening: {query or '(book)'}", "chapter: 1", "page: 1"]
+            return {"ok": True, "message": f"Reading: {query}", "previewLines": lines,
+                    "data": {"op": kind, "title": query, "source": "scaffold"}}
+        if kind == "book_highlight":
+            text = str(payload.get("text", "") or "").strip()
+            lines = [f"highlighted: {text[:80] or '(selection)'}"]
+            return {"ok": True, "message": "Highlight saved", "previewLines": lines,
+                    "data": {"op": kind, "text": text, "source": "scaffold"}}
+
+    # ── Translation ops scaffold (T-E19) ──────────────────────────────────────
+    if kind in ("translate_text", "translate_detect", "translate_conversation"):
+        text = str(payload.get("text", payload.get("query", "")) or "").strip()
+        target_lang = str(payload.get("to", payload.get("language", "es")) or "es").strip()
+        if kind == "translate_text":
+            lines = [f"text: {text[:80]}", f"to: {target_lang}", "result: (scaffold — no API)"]
+            return {"ok": True, "message": f"Translate → {target_lang}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "text": text, "to": target_lang,
+                             "result": f"[{target_lang}] {text}", "source": "scaffold"}}
+        if kind == "translate_detect":
+            lines = [f"text: {text[:80]}", "detected: en (scaffold)"]
+            return {"ok": True, "message": "Language: English",
+                    "previewLines": lines,
+                    "data": {"op": kind, "text": text, "detected": "en", "source": "scaffold"}}
+        if kind == "translate_conversation":
+            lang_a = str(payload.get("langA", "en") or "en")
+            lang_b = str(payload.get("langB", target_lang) or target_lang)
+            lines = [f"conversation mode: {lang_a} ↔ {lang_b}", "speak to translate (scaffold)"]
+            return {"ok": True, "message": f"Translate: {lang_a} ↔ {lang_b}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "langA": lang_a, "langB": lang_b, "source": "scaffold"}}
+
+    # ── Payments ops scaffold (T-E21) ─────────────────────────────────────────
+    _PAYMENTS_OPS = {"payments_send", "payments_request", "payments_split",
+                     "payments_history", "payments_balance"}
+    if kind in _PAYMENTS_OPS:
+        to     = str(payload.get("to", payload.get("recipient", "")) or "").strip()
+        amount = float(payload.get("amount", 0) or 0)
+        note   = str(payload.get("note", payload.get("memo", "")) or "").strip()
+        if kind == "payments_history":
+            history = [{"to": "Alice", "amount": 25.00, "note": "Lunch", "date": "Mar 11"},
+                       {"from": "Bob", "amount": 15.00, "note": "Coffee", "date": "Mar 10"}]
+            lines = [f"payments: {len(history)}"] + [f"{list(p.keys())[0]}: {list(p.values())[0]} — ${p['amount']:.2f}" for p in history]
+            return {"ok": True, "message": "Payment history", "previewLines": lines[:8],
+                    "data": {"op": kind, "payments": history, "source": "scaffold"}}
+        if kind == "payments_balance":
+            return {"ok": True, "message": "Payments balance: $142.50",
+                    "previewLines": ["balance: $142.50", "pending: $0.00"],
+                    "data": {"op": kind, "balance": 142.50, "source": "scaffold"}}
+        if kind in ("payments_send", "payments_request", "payments_split"):
+            if not to or amount <= 0:
+                return {"ok": False, "message": "Recipient and amount required.",
+                        "previewLines": ["missing: to, amount"]}
+            action = kind.replace("payments_", "")
+            graph_add_event(graph, kind, {"to": to, "amount": amount, "note": note})
+            lines = [f"{action}: ${amount:.2f}", f"to: {to}", f"note: {note or '(none)'}",
+                     "action: confirm to send"]
+            return {"ok": True, "message": f"Payment {action}: ${amount:.2f} → {to}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "to": to, "amount": amount, "note": note,
+                             "requiresConfirm": True, "source": "scaffold"}}
 
     return {"ok": False, "message": f"Unknown operation: {kind}"}
 

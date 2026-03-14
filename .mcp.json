@@ -1,5 +1,9 @@
 {
   "mcpServers": {
+    "grepai": {
+      "command": "C:\\Users\\steve\\AppData\\Local\\Programs\\grepai\\grepai.exe",
+      "args": ["mcp-serve", "C:\\Users\\steve\\Documents\\GenomeUI"]
+    },
     "synapse-synapse": {
       "command": "py",
       "args": [

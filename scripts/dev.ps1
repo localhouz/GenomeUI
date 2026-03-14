@@ -103,16 +103,16 @@ $lanIp = Get-LanIPv4
 $desktopUrl = "http://localhost:$FrontendPort/?session=$SessionId"
 $phoneUrl = if ($lanIp) { "http://$lanIp`:$FrontendPort/?session=$SessionId" } else { "(LAN IP unavailable)" }
 $nousExe = Join-Path $root "..\Nous\rust\target\debug\nous-server.exe"
-
-# Nous is required — it is the AI gateway layer of the OS.
-if (-not (Test-Path $nousExe)) {
-    throw "Nous gateway not found at $nousExe`nBuild it first:  cd $root\..\Nous\rust && cargo build"
-}
+$nousAvailable = Test-Path $nousExe
 
 Write-Host ""
 Write-Host "GenomeUI OS Launcher" -ForegroundColor Cyan
 Write-Host "venv:     $venvPython"
-Write-Host "Nous:     http://localhost:$NousPort ($NousModel)"
+if ($nousAvailable) {
+    Write-Host "Nous:     http://localhost:$NousPort ($NousModel)"
+} else {
+    Write-Host "Nous:     embedded classifier (gateway not found)" -ForegroundColor DarkYellow
+}
 Write-Host "Backend:  http://localhost:$BackendPort"
 Write-Host "Desktop:  $desktopUrl"
 Write-Host "Phone:    $phoneUrl"
@@ -121,7 +121,7 @@ Write-Host ""
 # -- Boot -----------------------------------------------------------------------
 
 Write-Host "Clearing ports..." -ForegroundColor DarkGray
-Clear-Port $NousPort
+if ($nousAvailable) { Clear-Port $NousPort }
 Clear-Port $BackendPort
 Clear-Port $FrontendPort
 Start-Sleep -Milliseconds 500   # let OS release sockets
@@ -131,21 +131,34 @@ $backend = $null
 $frontend = $null
 
 try {
-    # 1. Nous gateway — must come up before backend and frontend
-    $nous = Start-Process -FilePath $nousExe `
-        -ArgumentList "--port", "$NousPort", "--model", $NousModel, "--genomeui", "http://localhost:$BackendPort" `
-        -WorkingDirectory $root `
-        -PassThru
-    Write-Host "Nous       pid=$($nous.Id)" -ForegroundColor DarkCyan
+    # 1. Nous gateway — optional; backend embedded classifier is the fallback
+    if ($nousAvailable) {
+        $nous = Start-Process -FilePath $nousExe `
+            -ArgumentList "--port", "$NousPort", "--model", $NousModel, "--genomeui", "http://localhost:$BackendPort" `
+            -WorkingDirectory $root `
+            -PassThru
+        Write-Host "Nous       pid=$($nous.Id)" -ForegroundColor DarkCyan
 
-    if (-not (Wait-Http -url "http://127.0.0.1:$NousPort/health" -timeoutSeconds 20)) {
-        throw "Nous gateway failed to start on port $NousPort"
+        if (-not (Wait-Http -url "http://127.0.0.1:$NousPort/health" -timeoutSeconds 20)) {
+            throw "Nous gateway failed to start on port $NousPort"
+        }
+        Write-Host "Nous       ready" -ForegroundColor Green
     }
-    Write-Host "Nous       ready" -ForegroundColor Green
 
-    # 2. Backend — NOUS_URL intentionally empty: Nous is the gateway above the backend,
+    # 2. Backend
     #    not a service the backend calls. Classification arrives via body.nousIntent.
     $env:NOUS_URL = ""
+
+    # ── Load .env (OAuth credentials and other secrets live there, not here) ──
+    $dotEnv = Join-Path $root ".env"
+    if (Test-Path $dotEnv) {
+        Get-Content $dotEnv | Where-Object { $_ -match '^\s*[^#]\S+=\S' } | ForEach-Object {
+            $parts = $_ -split '=', 2
+            [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), "Process")
+        }
+    } else {
+        Write-Host "Warning: .env not found - OAuth connectors will run in scaffold mode." -ForegroundColor Yellow
+    }
     $backendArgs = @("-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "$BackendPort")
     if ($WatchBackend) { $backendArgs += "--reload" }
 

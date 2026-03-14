@@ -51,15 +51,18 @@ const RemoteTurnService = {
         return response.json();
     },
 
-    async process(intent, sessionId, baseRevision, deviceId, onConflict = 'rebase_if_commutative', idempotencyKey = null) {
+    async process(intent, sessionId, baseRevision, deviceId, onConflict = 'rebase_if_commutative', idempotencyKey = null, activeContent = null, confirmed = false) {
         const authToken = sessionStorage.getItem('genome_session') || '';
+        const body = { intent, sessionId, baseRevision, deviceId, onConflict, idempotencyKey };
+        if (activeContent) body.activeContent = activeContent;
+        if (confirmed) body.confirmed = true;
         const response = await fetch(`/api/turn`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'X-Genome-Auth': authToken,
             },
-            body: JSON.stringify({ intent, sessionId, baseRevision, deviceId, onConflict, idempotencyKey })
+            body: JSON.stringify(body)
         });
 
         if (!response.ok) {
@@ -124,6 +127,89 @@ const RemoteTurnService = {
     }
 };
 
+// ─── Semantic Cache ──────────────────────────────────────────────────────────
+const SemanticCache = {
+    _store: new Map(),  // key → { response, domain, expires }
+    _TTL: { weather: 600, sports: 120, banking: 300, shopping: 1800, travel: 900 },
+
+    _key(intent) { return intent.trim().toLowerCase(); },
+
+    _ttl(domain) { return ((this._TTL[domain] ?? 0) * 1000); },
+
+    get(intent) {
+        const entry = this._store.get(this._key(intent));
+        if (!entry) return null;
+        if (Date.now() > entry.expires) { this._store.delete(this._key(intent)); return null; }
+        return entry.response;
+    },
+
+    set(intent, domain, response) {
+        const ttl = this._ttl(domain);
+        if (ttl === 0) return;
+        this._store.set(this._key(intent), { response, domain, expires: Date.now() + ttl });
+    },
+
+    invalidate(domain) {
+        for (const [k, v] of this._store) { if (v.domain === domain) this._store.delete(k); }
+    }
+};
+
+// ─── Sound Engine ─────────────────────────────────────────────────────────────
+const SoundEngine = {
+    _ctx: null,
+    enabled: false,
+
+    _getCtx() {
+        if (!this._ctx) this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+        if (this._ctx.state === 'suspended') this._ctx.resume();
+        return this._ctx;
+    },
+
+    _tone(freq, type, duration, gain, startDelay = 0) {
+        if (!this.enabled) return;
+        try {
+            const ctx = this._getCtx();
+            const osc = ctx.createOscillator();
+            const g   = ctx.createGain();
+            osc.connect(g); g.connect(ctx.destination);
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, ctx.currentTime + startDelay);
+            g.gain.setValueAtTime(0.001, ctx.currentTime + startDelay);
+            g.gain.linearRampToValueAtTime(gain, ctx.currentTime + startDelay + 0.01);
+            g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startDelay + duration);
+            osc.start(ctx.currentTime + startDelay);
+            osc.stop(ctx.currentTime + startDelay + duration + 0.05);
+        } catch (_) {}
+    },
+
+    // Soft ascending triad — scene transition
+    transition() {
+        this._tone(523.25, 'sine', 0.28, 0.07);
+        this._tone(659.25, 'sine', 0.28, 0.055, 0.07);
+        this._tone(783.99, 'sine', 0.32, 0.045, 0.14);
+    },
+
+    // Descending minor 2nd — error
+    error() {
+        this._tone(440,   'sine', 0.15, 0.1);
+        this._tone(415.3, 'sine', 0.22, 0.08, 0.12);
+    },
+
+    // Bright ping — success
+    success() {
+        this._tone(1046.5, 'sine', 0.18, 0.07);
+        this._tone(1318.5, 'sine', 0.14, 0.05, 0.09);
+    },
+
+    // 4 kHz click transient — button press
+    click() { this._tone(4000, 'square', 0.035, 0.04); },
+
+    toggle() {
+        this.enabled = !this.enabled;
+        return this.enabled;
+    }
+};
+
 const UIEngine = {
     container: document.getElementById('ui-container'),
     input: document.getElementById('intent-input'),
@@ -168,7 +254,8 @@ const UIEngine = {
         webdeck: {
             mode: 'surface'
         },
-        runtimeEvents: []
+        runtimeEvents: [],
+        activeSurface: null   // { domain, name, getData, cleanup } — set while a functional surface is mounted
     },
 
     async init() {
@@ -181,6 +268,8 @@ const UIEngine = {
         this.updateShortcutHint();
         await this.ensureAuth();
         await this.runBootSequence();
+        this.handleOAuthCallback();
+        this._initNetworkMesh();
         this.showToast('Surface ready. Press ? for command help.', 'info', 3000);
     },
 
@@ -421,6 +510,17 @@ const UIEngine = {
     },
 
     setupUXChrome() {
+        // Sound toggle
+        const soundBtn = document.getElementById('sound-toggle');
+        if (soundBtn) {
+            soundBtn.addEventListener('click', () => {
+                const on = SoundEngine.toggle();
+                soundBtn.classList.toggle('on', on);
+                soundBtn.title = on ? 'Sound on (Alt+S)' : 'Sound off (Alt+S)';
+                if (on) SoundEngine.click();
+            });
+        }
+
         const toast = document.createElement('div');
         toast.id = 'ux-toast';
         document.body.appendChild(toast);
@@ -609,6 +709,131 @@ const UIEngine = {
             this.showToast('Handoff token rejected or expired.', 'warn', 2800);
         } finally {
             this.clearHandoffTokenInUrl();
+        }
+    },
+
+    // ── OAuth Connector Flow ─────────────────────────────────────────────────
+
+    /** Called once on init — handles ?oauth_success or ?oauth_error redirects from popup. */
+    handleOAuthCallback() {
+        const params = new URLSearchParams(window.location.search);
+        const success = String(params.get('oauth_success') || '').trim();
+        const error   = String(params.get('oauth_error')   || '').trim();
+        if (!success && !error) return;
+        // Strip params from URL immediately
+        const url = new URL(window.location.href);
+        url.searchParams.delete('oauth_success');
+        url.searchParams.delete('oauth_error');
+        window.history.replaceState({}, '', url);
+        if (window.opener && typeof window.opener.postMessage === 'function') {
+            // Running inside OAuth popup — notify parent and close
+            window.opener.postMessage({ type: 'genome_oauth', success, error }, window.location.origin);
+            window.close();
+            return;
+        }
+        // Running in main window (redirect-based flow rather than popup)
+        if (success) {
+            this.showToast(`${success} connected.`, 'ok', 2800);
+            this.handleIntent('show my connections');
+        } else if (error) {
+            this.showToast(`OAuth error: ${error}`, 'warn', 3500);
+        }
+    },
+
+    /** Open OAuth popup for a service. */
+    async _oauthConnectService(svc) {
+        const token = sessionStorage.getItem('genome_session') || '';
+        try {
+            const headers = token ? { 'X-Genome-Auth': token } : {};
+            const res = await fetch(`/api/connectors/oauth/${encodeURIComponent(svc)}/begin`, { headers });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                this.showToast(err.detail || `Cannot start OAuth for ${svc} (${res.status}).`, 'warn', 4000);
+                return;
+            }
+            const { url } = await res.json();
+            if (!url) { this.showToast('No auth URL returned.', 'warn', 2600); return; }
+            const popup = window.open(url, 'genome-oauth', 'width=600,height=700,left=200,top=100');
+            if (!popup) { this.showToast('Popup blocked. Allow popups for this page.', 'warn', 3000); return; }
+            const onMsg = (evt) => {
+                if (evt.origin !== window.location.origin) return;
+                if (!evt.data || evt.data.type !== 'genome_oauth') return;
+                window.removeEventListener('message', onMsg);
+                if (evt.data.success) {
+                    this.showToast(`${evt.data.success} connected.`, 'ok', 2800);
+                    this.handleIntent('show my connections');
+                } else if (evt.data.error) {
+                    this.showToast(`OAuth error: ${evt.data.error}`, 'warn', 3500);
+                }
+            };
+            window.addEventListener('message', onMsg);
+        } catch {
+            this.showToast(`Failed to connect ${svc}.`, 'warn', 2600);
+        }
+    },
+
+    /** Expand a conn-card into an inline credential input form. */
+    _showCredentialForm(btn, svc) {
+        const card = btn.closest('[data-card-svc]');
+        if (!card) return;
+        // Swap button for a mini-form
+        btn.replaceWith((() => {
+            const wrap = document.createElement('div');
+            wrap.className = 'conn-card-form';
+            wrap.innerHTML = `<input class="conn-card-input" type="text" placeholder="Client ID" autocomplete="off" data-cred-field="client_id">
+<input class="conn-card-input" type="password" placeholder="Client Secret" autocomplete="off" data-cred-field="client_secret">
+<button class="conn-card-btn conn-card-btn--save" type="button" data-oauth-save="${escapeAttr(svc)}">save</button>`;
+            return wrap;
+        })());
+        card.querySelector('[data-cred-field="client_id"]')?.focus();
+    },
+
+    /** POST credential form values to vault, then refresh connections panel. */
+    async _saveCredentials(btn, svc) {
+        const card = btn.closest('[data-card-svc]');
+        if (!card) return;
+        const clientId = (card.querySelector('[data-cred-field="client_id"]')?.value || '').trim();
+        const clientSecret = (card.querySelector('[data-cred-field="client_secret"]')?.value || '').trim();
+        if (!clientId || !clientSecret) {
+            this.showToast('Both Client ID and Client Secret are required.', 'warn', 2600);
+            return;
+        }
+        const token = sessionStorage.getItem('genome_session') || '';
+        btn.disabled = true;
+        btn.textContent = 'saving…';
+        try {
+            const res = await fetch(`/api/connectors/oauth/${encodeURIComponent(svc)}/credentials`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Genome-Auth': token } : {}) },
+                body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                this.showToast(err.detail || `Failed to save credentials for ${svc}.`, 'warn', 3000);
+                btn.disabled = false;
+                btn.textContent = 'save';
+                return;
+            }
+            // Credentials stored — go straight to OAuth popup
+            await this._oauthConnectService(svc);
+        } catch {
+            this.showToast(`Failed to save credentials for ${svc}.`, 'warn', 2600);
+            btn.disabled = false;
+            btn.textContent = 'save';
+        }
+    },
+
+    /** Disconnect (remove vault token) for a service. */
+    async _oauthDisconnectService(svc) {
+        const token = sessionStorage.getItem('genome_session') || '';
+        try {
+            const headers = token ? { 'X-Genome-Auth': token } : {};
+            const res = await fetch(`/api/auth/connections/${encodeURIComponent(svc)}`, { method: 'DELETE', headers });
+            if (!res.ok) { this.showToast(`Could not disconnect ${svc}.`, 'warn', 2600); return; }
+            this.showToast(`${svc} disconnected.`, 'ok', 2200);
+            this.handleIntent('show my connections');
+        } catch {
+            this.showToast(`Failed to disconnect ${svc}.`, 'warn', 2600);
         }
     },
 
@@ -902,6 +1127,10 @@ const UIEngine = {
 
     applyRemoteSync(payload) {
         if (!payload || this.state.session.isApplyingLocalTurn) return;
+        if (payload.type === 'phone_state_update') {
+            document.dispatchEvent(new CustomEvent('phoneStateUpdate', { detail: payload }));
+            return;
+        }
         if (payload.type === 'continuity_alert') {
             const msg = String(payload.message || 'Continuity alert').slice(0, 120);
             this.showToast(msg, 'warn', 5000);
@@ -999,6 +1228,12 @@ const UIEngine = {
                     return;
                 }
             }
+            if (event.altKey && String(event.key || '').toLowerCase() === 's') {
+                event.preventDefault();
+                const soundBtn = document.getElementById('sound-toggle');
+                soundBtn?.click();
+                return;
+            }
 
             const active = document.activeElement;
             const isEditable = active && (
@@ -1047,6 +1282,36 @@ const UIEngine = {
                 return;
             }
 
+            // ── OAuth connect button ──────────────────────────────────────────
+            const connectBtn = event.target.closest('[data-oauth-connect]');
+            if (connectBtn) {
+                const svc = String(connectBtn.dataset.oauthConnect || '').trim();
+                if (!svc) return;
+                if (connectBtn.dataset.oauthNeedsCreds === '1') {
+                    // No credentials yet — show inline form instead of going to OAuth
+                    this._showCredentialForm(connectBtn, svc);
+                } else {
+                    this._oauthConnectService(svc);
+                }
+                return;
+            }
+
+            // ── OAuth disconnect button ───────────────────────────────────────
+            const disconnectBtn = event.target.closest('[data-oauth-disconnect]');
+            if (disconnectBtn) {
+                const svc = String(disconnectBtn.dataset.oauthDisconnect || '').trim();
+                if (svc) this._oauthDisconnectService(svc);
+                return;
+            }
+
+            // ── OAuth save-credentials button ─────────────────────────────────
+            const saveBtn = event.target.closest('[data-oauth-save]');
+            if (saveBtn) {
+                const svc = String(saveBtn.dataset.oauthSave || '').trim();
+                if (svc) this._saveCredentials(saveBtn, svc);
+                return;
+            }
+
             const suggestion = event.target.closest('[data-command]');
             if (!suggestion) return;
             const command = suggestion.dataset.command;
@@ -1060,6 +1325,13 @@ const UIEngine = {
             const node = event.target.closest('[data-history-index]');
             if (!node) return;
             this.restoreFromHistory(Number(node.dataset.historyIndex));
+        });
+
+        document.addEventListener('click', (event) => {
+            if (this.historyReel.classList.contains('reel-visible') &&
+                !this.historyReel.contains(event.target)) {
+                this.hideHistoryReel();
+            }
         });
 
         // Touch-first history swipe (mobile/tablet): horizontal swipe restores prior/next surface.
@@ -1310,17 +1582,53 @@ const UIEngine = {
             return;
         }
 
+        // ── History reel local intercept ───────────────────────────────────
+        const lowerText = text.trim().toLowerCase();
+        if (/\b(?:show|open|display)\b.*\bhist(?:ory)?\b|\bhist(?:ory)?\b.*\b(?:reel|log|view)\b/.test(lowerText)) {
+            this.showHistoryReel();
+            return;
+        }
+        if (/\b(?:hide|close|dismiss)\b.*\bhist(?:ory)?\b/.test(lowerText)) {
+            this.hideHistoryReel();
+            return;
+        }
+
         const startTime = performance.now();
         this.state.session.lastIntent = text;
         this.status.innerText = 'INTERPRETING INTENT...';
         this.inputContainer.classList.add('active-intent');
         this.container.classList.add('refracting');
 
+        // ── Semantic cache check ────────────────────────────────────────────
+        const cached = SemanticCache.get(text);
+        if (cached) {
+            // Render immediately from cache, fire background refresh
+            this._applyRemote(text, cached, startTime, 'cache');
+            this.container.classList.remove('refracting');
+            this.inputContainer.classList.remove('active-intent');
+            // Background refresh — update cache silently, no re-render
+            const activeSurface = this.state.activeSurface;
+            const activeContent = activeSurface?.getData
+                ? { domain: activeSurface.domain, name: activeSurface.name, data: activeSurface.getData() }
+                : null;
+            RemoteTurnService.process(
+                text, this.state.session.sessionId, this.state.session.revision,
+                this.state.session.deviceId, 'rebase_if_commutative',
+                `${this.state.session.deviceId}:bg:${Date.now().toString(36)}`, activeContent
+            ).then((r) => {
+                const domain = r?.envelope?.uiIntent?.kind || '';
+                if (domain) SemanticCache.set(text, domain, r);
+            }).catch(() => {});
+            return;
+        }
+
         await this.showReasoning([
             'Parsing layered intent envelope...',
             'Executing state/tool operations...',
             'Generating schema-validated UI plan...'
         ]);
+        // Reasoning overlay has hidden — ghost the existing scene while awaiting backend
+        this.container.classList.add('turn-thinking');
 
         let envelope;
         let execution;
@@ -1331,14 +1639,33 @@ const UIEngine = {
 
         try {
             this.state.session.isApplyingLocalTurn = true;
+            const activeSurface = this.state.activeSurface;
+            const activeContent = activeSurface?.getData
+                ? { domain: activeSurface.domain, name: activeSurface.name, data: activeSurface.getData() }
+                : null;
             const remote = await RemoteTurnService.process(
                 text,
                 this.state.session.sessionId,
                 this.state.session.revision,
                 this.state.session.deviceId,
                 'rebase_if_commutative',
-                `${this.state.session.deviceId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
+                `${this.state.session.deviceId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`,
+                activeContent
             );
+
+            // ── High-risk confirm gate ──────────────────────────────────────
+            if (remote.needsConfirm) {
+                this.container.classList.remove('refracting', 'turn-thinking');
+                this.inputContainer.classList.remove('active-intent');
+                this.state.session.isApplyingLocalTurn = false;
+                this._showConfirm(remote, text);
+                return;
+            }
+
+            // ── Populate cache ──────────────────────────────────────────────
+            const domain = remote.envelope?.uiIntent?.kind || '';
+            if (domain) SemanticCache.set(text, domain, remote);
+
             this.state.memory = remote.memory || this.state.memory;
             envelope = remote.envelope;
             execution = remote.execution;
@@ -1351,6 +1678,10 @@ const UIEngine = {
             this.state.session.presence = remote.presence || this.state.session.presence;
             this.writeSessionIdToUrl(this.state.session.sessionId);
             this.openWebSocketSync();
+            const updatedContent = remote.execution?.data?.updatedContent;
+            if (updatedContent !== undefined && this.state.activeSurface) {
+                this._applyUpdatedContent(updatedContent);
+            }
         } catch (error) {
             if (error?.kind === 'revision_conflict') {
                 const snapshot = await RemoteTurnService.getSession(this.state.session.sessionId);
@@ -1368,16 +1699,22 @@ const UIEngine = {
                 this.updateStatus('CONFLICT');
                 this.showToast('Write blocked: session changed on another device. State refreshed.', 'warn', 3200);
                 this.saveState();
-                this.container.classList.remove('refracting');
+                this.container.classList.remove('refracting', 'turn-thinking');
+                this.container.classList.add('turn-error');
+                setTimeout(() => this.container.classList.remove('turn-error'), 700);
                 this.inputContainer.classList.remove('active-intent');
+                SoundEngine.error();
                 return;
             }
+            this.container.classList.add('turn-error');
+            setTimeout(() => this.container.classList.remove('turn-error'), 700);
             this.handleTransportFailure('turn', error);
             envelope = IntentLayerCompiler.compile(text, this.state.memory);
             execution = ActionExecutor.run(envelope.stateIntent.writeOperations, this.state.memory);
             kernelTrace = this.deriveKernelTrace(execution, { target: 'local-fallback', reason: 'backend unavailable', model: null });
             const uiPlan = UIPlanner.build(envelope, this.state.memory, execution);
             safePlan = UIPlanSchema.normalize(uiPlan);
+            SoundEngine.error();
         } finally {
             this.state.session.isApplyingLocalTurn = false;
         }
@@ -1390,6 +1727,7 @@ const UIEngine = {
             delete this.status.dataset.alert;
         }
         this.render(safePlan, envelope, kernelTrace);
+        SoundEngine.transition();
         this.pushHistory(text, envelope, execution, safePlan, plannerSource, kernelTrace, mergeInfo);
 
         this.container.classList.remove('refracting');
@@ -1402,9 +1740,29 @@ const UIEngine = {
             execution.message || (execution.ok ? 'Intent applied.' : 'Intent needs refinement.'),
             execution.ok ? 'ok' : 'warn'
         );
+        if (execution.ok) SoundEngine.success();
         if (mergeInfo?.rebased) {
             this.showToast('Merged with newer session revision.', 'info', 2200);
         }
+        this.saveState();
+    },
+
+    // Shared helper — apply a remote response object to state + render (used by cache hit path)
+    _applyRemote(text, remote, startTime, plannerSource = 'remote') {
+        this.state.memory = remote.memory || this.state.memory;
+        const envelope = remote.envelope;
+        const execution = remote.execution;
+        const kernelTrace = remote.kernelTrace || this.deriveKernelTrace(execution, remote.route);
+        const safePlan = UIPlanSchema.normalize(remote.plan);
+        this.state.session.lastEnvelope = envelope;
+        this.state.session.lastExecution = execution;
+        this.state.session.lastKernelTrace = kernelTrace;
+        this.render(safePlan, envelope, kernelTrace);
+        SoundEngine.transition();
+        this.pushHistory(text, envelope, execution, safePlan, plannerSource, kernelTrace, null);
+        this.state.metrics.latency = Math.round(performance.now() - startTime);
+        this.state.metrics.entropy = 0.01 + Math.random() * 0.04;
+        this.updateStatus(execution?.ok ? `STABLE:${plannerSource.toUpperCase()}` : 'NEEDS INPUT');
         this.saveState();
     },
 
@@ -1427,6 +1785,7 @@ const UIEngine = {
     },
 
     render(plan, envelope, kernelTrace = this.state.session.lastKernelTrace) {
+        this.container.classList.remove('turn-thinking');
         this.teardownSceneGraphics();
         this.state.session.lastPlan = plan;
         this.applyPlanGraphSnapshot(plan);
@@ -1443,14 +1802,16 @@ const UIEngine = {
         this.state.sceneDock.lastTransition = this.computeSceneTransition(priorDomain, nextDomain);
         this.state.sceneDock.activeDomain = nextDomain;
         const sceneDock = this.renderSceneDock(nextDomain);
-        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow'].includes(core.kind);
+        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow', 'music', 'messaging', 'connections', 'network', 'document', 'spreadsheet', 'code', 'terminal', 'presentation'].includes(core.kind);
         const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
         const railBlocks = this.buildImmersiveRailBlocks(blocks);
+        const darkScenes = new Set(['weather','weather_7day','weather_tomorrow','tasks','expenses','notes','music','banking','sports','sports_manage','messaging','files','connections','network','travel','health','reminders','reminders_list','social','contacts','telephony','domain','graph','location','calendar','email','code','terminal','document','spreadsheet','presentation','content','reference','clock','enterprise','github','jira','notion','asana','finance']);
+        const sceneTone = darkScenes.has(core.kind) ? 'dark' : 'light';
         this.container.innerHTML = `
-            <div class="workspace immersive">
+            <div class="workspace immersive" data-scene-tone="${escapeAttr(sceneTone)}">
+                ${sceneDock}
                 <section class="workspace-main">
                     <div class="surface-core immersive ${escapeAttr(core.kind || 'generic')} ${escapeAttr(core.theme || '')}">
-                        ${sceneDock}
                         ${visual}
                         ${showCoreCopy ? `
                             <div class="surface-label">Workspace</div>
@@ -1469,6 +1830,7 @@ const UIEngine = {
         this.decorateQuickCommandTargets();
         this.applySceneEntryMotion();
         this.activateSceneGraphics();
+        this._initFunctionalSurfaces();
         this._renderPhoneSuggestions(Array.isArray(plan?.suggestions) ? plan.suggestions : []);
         this.maybePrefetchGraphSnapshot(core);
     },
@@ -2244,6 +2606,14 @@ const UIEngine = {
             const headline = latest.message || (latest.op === 'sports_follow_team' ? 'Following team' : 'Unfollowed team');
             return { headline, summary: String(d.sport || '').toUpperCase(), variant: 'result', kind: 'sports_manage', theme: 'theme-sports', info: d };
         }
+        if (latest.op === 'network_view') {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const nets = Array.isArray(d.networks) ? d.networks : [];
+            const totalMsgs = Object.values(d.messagesByTopic || {}).reduce((a, v) => a + (Array.isArray(v) ? v.length : 0), 0);
+            const headline = 'Genome Mesh';
+            const summary = `${nets.length} network${nets.length !== 1 ? 's' : ''} · ${totalMsgs} message${totalMsgs !== 1 ? 's' : ''}`;
+            return { headline, summary, variant: 'result', kind: 'network', theme: 'theme-network', info: d };
+        }
         if (latest.op === 'location_status') {
             const info = this.parsePreviewMap(latest.previewLines);
             const location = String(info.location || '').trim();
@@ -2338,6 +2708,82 @@ const UIEngine = {
                 theme: 'theme-social',
                 info: { source, items, message, delivery, op: latest.op },
             };
+        }
+        if (['social_notifications','social_trending','social_profile_read',
+             'social_dm_send','social_react','social_comment','social_follow'].includes(latest.op)) {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const op = latest.op;
+            if (op === 'social_notifications') {
+                const items = Array.isArray(data.items) ? data.items : [];
+                const unread = Number(data.unread || 0);
+                return {
+                    headline: unread > 0 ? `${unread} unread` : `${items.length} notifications`,
+                    summary: `${items.length} total · bluesky`,
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { items, unread, op },
+                };
+            }
+            if (op === 'social_trending') {
+                const topics = Array.isArray(data.topics) ? data.topics : [];
+                return {
+                    headline: `${topics.length} trending`,
+                    summary: topics.slice(0, 3).map(t => String(t.topic || '')).filter(Boolean).join(' · ') || 'bluesky trending',
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { topics, op },
+                };
+            }
+            if (op === 'social_profile_read') {
+                const handle = String(data.handle || data.actor || '');
+                const displayName = String(data.displayName || handle);
+                const followers = Number(data.followersCount || 0);
+                const following = Number(data.followsCount || 0);
+                const posts = Number(data.postsCount || 0);
+                const bio = String(data.description || '').slice(0, 200);
+                return {
+                    headline: displayName || handle,
+                    summary: `${followers.toLocaleString()} followers · ${posts} posts`,
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { handle, displayName, followers, following, posts, bio, op },
+                };
+            }
+            if (op === 'social_dm_send') {
+                const recipient = String(data.recipient || '');
+                const convoId = String(data.convoId || '');
+                return {
+                    headline: `DM sent`,
+                    summary: `to ${recipient}`,
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { recipient, convoId, action: 'dm_sent', op },
+                };
+            }
+            if (op === 'social_react') {
+                const uri = String(data.uri || '');
+                return {
+                    headline: 'liked',
+                    summary: uri.slice(0, 80) || 'post liked',
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { uri, action: 'liked', op },
+                };
+            }
+            if (op === 'social_comment') {
+                const uri = String(data.uri || '');
+                return {
+                    headline: 'reply posted',
+                    summary: uri.slice(0, 80) || 'reply sent',
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { uri, action: 'replied', op },
+                };
+            }
+            if (op === 'social_follow') {
+                const actor = String(data.actor || '');
+                const action = String(data.action || 'followed');
+                return {
+                    headline: action,
+                    summary: actor,
+                    variant: 'result', kind: 'social', theme: 'theme-social',
+                    info: { actor, action, op },
+                };
+            }
         }
         if (latest.op === 'banking_balance_read' || latest.op === 'banking_transactions_read') {
             const info = this.parsePreviewMap(latest.previewLines);
@@ -2473,6 +2919,567 @@ const UIEngine = {
                 info: { serverName, toolName, content, textItems, imageItems, matchScore: latest.matchScore || 0 },
             };
         }
+        // ── Music / Spotify ────────────────────────────────────────────────────
+        {
+            const _musicOps = new Set(['music_play','music_pause','music_skip','music_queue',
+                'music_volume','music_like','music_playlist_add','music_playlist_create',
+                'music_radio','music_discover','music_lyrics','music_cast','music_sleep_timer',
+                'spotify.now_playing','spotify.play','spotify.pause','spotify.next','spotify.prev',
+                'spotify.queue','spotify.volume']);
+            if (_musicOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const track   = String(d.track  || '').trim();
+                const artist  = String(d.artist || '').trim();
+                const album   = String(d.album  || '').trim();
+                const playing = d.is_playing !== false;
+                const src     = String(d.source || 'scaffold');
+                const headline = track || (playing ? 'Now Playing' : 'Paused');
+                const summary  = artist ? `${artist}${album ? ' · ' + album : ''}` : (src === 'scaffold' ? 'Spotify scaffold' : 'Spotify');
+                return { headline, summary, variant: 'result', kind: 'music', theme: 'theme-music',
+                         info: { track, artist, album, is_playing: playing, album_art: d.album_art || '',
+                                 progress_ms: d.progress_ms || 0, duration_ms: d.duration_ms || 0, source: src, op: latest.op } };
+            }
+        }
+        // ── Gmail / Email with live data ───────────────────────────────────────
+        {
+            const _emailOps = new Set(['gmail.list','gmail.search','gmail.send','gmail.trash']);
+            if (_emailOps.has(latest.op) || (['email_read','email_search'].includes(latest.op) && Array.isArray(latest.data?.messages))) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const messages = Array.isArray(d.messages) ? d.messages : [];
+                const unread   = Number(d.unread_count || messages.filter(m => m.unread).length);
+                const first    = messages[0] || {};
+                const headline = unread > 0 ? `${unread} unread` : 'Inbox';
+                const summary  = first.subject ? first.subject.slice(0, 60) : (d.source === 'scaffold' ? 'Gmail scaffold' : 'Gmail');
+                return { headline, summary, variant: 'result', kind: 'email', theme: 'theme-email',
+                         info: { messages, unread_count: unread, source: d.source || 'scaffold', query: d.query || '', op: latest.op } };
+            }
+        }
+        // ── Google Calendar with live data ─────────────────────────────────────
+        {
+            const _calOps = new Set(['gcal.list','gcal.create','gcal.delete']);
+            const _calEnriched = ['calendar_list','calendar_availability'].includes(latest.op) && Array.isArray(latest.data?.events);
+            if (_calOps.has(latest.op) || _calEnriched) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const events  = Array.isArray(d.events) ? d.events : [];
+                const next    = events[0] || null;
+                const headline = next ? (next.summary || 'Event').slice(0, 50) : (events.length + ' events');
+                const summary  = next ? String(next.start || '').slice(0, 16) : (d.source === 'scaffold' ? 'Calendar scaffold' : 'Google Calendar');
+                return { headline: events.length ? headline : 'No upcoming events', summary,
+                         variant: 'result', kind: 'calendar', theme: 'theme-calendar',
+                         info: { events, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Google Drive with live data ────────────────────────────────────────
+        {
+            const _driveOps = new Set(['gdrive.list','gdrive.create','gdrive.open']);
+            if (_driveOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const files   = Array.isArray(d.files) ? d.files : [];
+                const first   = files[0] || {};
+                const headline = first.name ? first.name.slice(0, 50) : `${files.length} files`;
+                const summary  = files.length > 1 ? `${files.length} files in Drive` : (d.source === 'scaffold' ? 'Drive scaffold' : 'Google Drive');
+                return { headline, summary, variant: 'result', kind: 'document', theme: 'theme-document',
+                         info: { files, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Slack / Messaging with live data ───────────────────────────────────
+        {
+            const _slackOps = new Set(['slack.list_channels','slack.send','slack.read',
+                'slack_send','slack_read','slack_search','slack_status','slack_reaction',
+                'messaging_send','messaging_read','messaging_reply','messaging_search']);
+            if (_slackOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const channels = Array.isArray(d.channels) ? d.channels : [];
+                const messages = Array.isArray(d.messages) ? d.messages : [];
+                const unread   = channels.reduce((s, c) => s + Number(c.unread_count || 0), 0);
+                const first    = channels[0] || messages[0] || {};
+                const headline = channels.length ? `#${first.name || 'general'}` : (messages.length ? 'Messages' : 'Slack');
+                const summary  = unread > 0 ? `${unread} unread` : (d.source === 'scaffold' ? 'Slack scaffold' : 'Up to date');
+                return { headline, summary, variant: 'result', kind: 'messaging', theme: 'theme-messaging',
+                         info: { channels, messages, unread, source: d.source || 'scaffold',
+                                 channel: d.channel || '', op: latest.op } };
+            }
+        }
+        // ── GitHub ops ────────────────────────────────────────────────────────
+        {
+            const _ghOps = new Set(['github_my_prs','github_pr_view','github_repo_search',
+                'github_issue_create','github_commit']);
+            if (_ghOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const items  = Array.isArray(d.items) ? d.items : [];
+                const repo   = String(d.repo || '').trim();
+                const op     = latest.op;
+                if (op === 'github_issue_create') {
+                    return { headline: `#${d.number || '?'} created`,
+                             summary: String(d.title || '').slice(0, 50) || repo,
+                             variant: 'result', kind: 'github', theme: 'theme-enterprise',
+                             info: { ...d, op, items } };
+                }
+                const itemKind = String(d.kind || 'prs');
+                const label    = itemKind === 'issues' ? 'issues' : 'PRs';
+                return { headline: items.length ? `${items.length} open ${label}` : 'GitHub',
+                         summary: repo ? `repo: ${repo}` : (d.source === 'scaffold' ? 'GitHub scaffold' : 'GitHub'),
+                         variant: 'result', kind: 'github', theme: 'theme-enterprise',
+                         info: { items, repo, kind: itemKind, source: d.source || 'scaffold', op } };
+            }
+        }
+        // ── Jira ops ──────────────────────────────────────────────────────────
+        {
+            const _jiraOps = new Set(['jira_my_issues','jira_sprint','jira_view',
+                'jira_create','jira_update']);
+            if (_jiraOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const issues = Array.isArray(d.issues) ? d.issues : [];
+                const op     = latest.op;
+                if (op === 'jira_create') {
+                    return { headline: d.key || 'Created',
+                             summary: String(d.summary || '').slice(0, 50),
+                             variant: 'result', kind: 'jira', theme: 'theme-enterprise',
+                             info: { ...d, op, issues: [] } };
+                }
+                if (op === 'jira_update') {
+                    return { headline: d.key || 'Updated',
+                             summary: String(d.status || 'status updated'),
+                             variant: 'result', kind: 'jira', theme: 'theme-enterprise',
+                             info: { ...d, op, issues: [] } };
+                }
+                const view = String(d.view || op).replace('jira_', '').replace(/_/g, ' ');
+                return { headline: `${issues.length} issues`, summary: view,
+                         variant: 'result', kind: 'jira', theme: 'theme-enterprise',
+                         info: { issues, view, source: d.source || 'scaffold', op } };
+            }
+        }
+        // ── Notion ops ────────────────────────────────────────────────────────
+        {
+            const _notionOps = new Set(['notion_find','notion_create','notion_database','notion_update']);
+            if (_notionOps.has(latest.op)) {
+                const d     = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const pages = Array.isArray(d.pages) ? d.pages : [];
+                const op    = latest.op;
+                if (op === 'notion_create' || op === 'notion_update') {
+                    const title = String(d.title || '').slice(0, 50) || 'page';
+                    return { headline: op === 'notion_create' ? 'Page created' : 'Page updated',
+                             summary: title,
+                             variant: 'result', kind: 'notion', theme: 'theme-enterprise',
+                             info: { ...d, op, pages: [] } };
+                }
+                const query = String(d.query || '');
+                return { headline: `${pages.length} pages`,
+                         summary: query || 'notion workspace',
+                         variant: 'result', kind: 'notion', theme: 'theme-enterprise',
+                         info: { pages, query, source: d.source || 'scaffold', op } };
+            }
+        }
+        // ── Asana ops ─────────────────────────────────────────────────────────
+        {
+            const _asanaOps = new Set(['asana_my_tasks','asana_create','asana_project','asana_update']);
+            if (_asanaOps.has(latest.op)) {
+                const d     = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const tasks = Array.isArray(d.tasks) ? d.tasks : [];
+                const op    = latest.op;
+                if (op === 'asana_create' || op === 'asana_update') {
+                    const name = String(d.name || '').slice(0, 50) || 'task';
+                    return { headline: op === 'asana_create' ? 'Task created' : 'Task updated',
+                             summary: name,
+                             variant: 'result', kind: 'asana', theme: 'theme-enterprise',
+                             info: { ...d, op, tasks: [] } };
+                }
+                const open = tasks.filter(t => !t.completed).length;
+                return { headline: `${tasks.length} tasks`, summary: `${open} open`,
+                         variant: 'result', kind: 'asana', theme: 'theme-enterprise',
+                         info: { tasks, source: d.source || 'scaffold', op } };
+            }
+        }
+        // ── Alarm / Clock ops ─────────────────────────────────────────────────
+        {
+            const _alarmOps = new Set(['alarm_set','alarm_delete','alarm_list','alarm_snooze',
+                'clock_timer_start','clock_timer_stop','clock_stopwatch']);
+            if (_alarmOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const alarms = Array.isArray(d.alarms) ? d.alarms : [];
+                const time   = String(d.time || (alarms[0] && alarms[0].time) || '').trim();
+                const label  = String(d.label || (alarms[0] && alarms[0].label) || 'Alarm').trim();
+                const action = String(d.action || '').trim();
+                const headline = time ? `${time}` : (action === 'list' ? `${alarms.length} alarms` : 'Alarm');
+                return { headline, summary: label || action, variant: 'result', kind: 'alarm', theme: 'theme-alarm',
+                         info: { alarms, time, label, action, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Health / Fitness ops ───────────────────────────────────────────────
+        {
+            const _healthOps = new Set(['health_activity','health_log_workout','health_log_weight',
+                'health_log_water','health_log_sleep','health_history',
+                'health_steps','health_heart_rate','health_sleep','health_workout_log','health_workout_start',
+                'health_food_log','health_water','health_weight','health_goals','health_mood',
+                'health_medication','health_hrv','health_cycle','health_streak']);
+            if (_healthOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const metrics = (d.metrics && typeof d.metrics === 'object') ? d.metrics : {};
+                const hero    = String(d.hero || '');
+                const sumLine = String(d.summary_line || '');
+                const steps   = Number(metrics.steps || 0);
+                const goal    = Number(metrics.steps_goal || 10000);
+                const headline = hero || (steps ? `${steps.toLocaleString()}` : 'Activity');
+                const summary  = sumLine || (goal ? `of ${goal.toLocaleString()} steps` : 'health tracking');
+                return { headline, summary, variant: 'result', kind: 'health', theme: 'theme-health',
+                         info: { metrics, hero, summary_line: sumLine, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Podcast ops ────────────────────────────────────────────────────────
+        {
+            const _podcastOps = new Set(['podcast_play','podcast_pause','podcast_next',
+                'podcast_list','podcast_subscribe','podcast_search']);
+            if (_podcastOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const show    = String(d.show    || '').trim();
+                const episode = String(d.episode || '').trim();
+                return { headline: episode || show || 'Podcast', summary: show || 'Now listening', variant: 'result',
+                         kind: 'podcast', theme: 'theme-podcast',
+                         info: { ...d, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Video streaming ops ────────────────────────────────────────────────
+        {
+            const _vidOps = new Set(['video.play','video.search','video.watchlist','video.browse',
+                'video.recommend','video.cast','video.continue','video.rate']);
+            if (_vidOps.has(latest.op)) {
+                const d       = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const title   = String(d.title   || '').trim();
+                const show    = String(d.show    || '').trim();
+                const service = String(d.service || '').trim();
+                const action  = String(d.action  || latest.op.replace('video.', '')).trim();
+                const results = Array.isArray(d.results) ? d.results : [];
+                const headline = title || show || (results[0]?.title) || 'Video';
+                const summary  = service ? `${service} · ${action}` : action;
+                return { headline, summary, variant: 'result', kind: 'video', theme: 'theme-video',
+                         info: { title, show, service, action, results,
+                                 progress_ms: d.progress_ms || 0, duration_ms: d.duration_ms || 0,
+                                 thumbnail: d.thumbnail || '', source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Food delivery ops ──────────────────────────────────────────────────
+        {
+            const _foodOps = new Set(['food_delivery.order','food_delivery.track',
+                'food_delivery.reorder','food_delivery.browse']);
+            if (_foodOps.has(latest.op)) {
+                const d          = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const restaurant = String(d.restaurant || '').trim();
+                const eta        = String(d.eta        || '').trim();
+                const status     = String(d.status     || d.action || 'order').trim();
+                const items      = Array.isArray(d.items) ? d.items : [];
+                const headline   = restaurant || 'Food Delivery';
+                const summary    = eta ? `ETA ${eta}` : status;
+                return { headline, summary, variant: 'result', kind: 'food_delivery', theme: 'theme-food',
+                         info: { restaurant, eta, status, items, total: d.total || 0,
+                                 source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Rideshare ops ──────────────────────────────────────────────────────
+        {
+            const _rideOps = new Set(['rideshare.book','rideshare.track','rideshare.cancel',
+                'rideshare.estimate','rideshare.history']);
+            if (_rideOps.has(latest.op)) {
+                const d       = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const dest    = String(d.destination || d.to || '').trim();
+                const driver  = String(d.driver      || '').trim();
+                const eta     = String(d.eta         || '').trim();
+                const status  = String(d.status      || d.action || 'booking').trim();
+                const price   = d.price ? `$${Number(d.price).toFixed(2)}` : '';
+                const headline = dest || 'Ride';
+                const summary  = driver ? `${driver}${eta ? ' · ' + eta : ''}` : (eta ? `ETA ${eta}` : status);
+                return { headline, summary, variant: 'result', kind: 'rideshare', theme: 'theme-rideshare',
+                         info: { dest, driver, eta, status, price,
+                                 vehicle: d.vehicle || '', source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Camera ops ────────────────────────────────────────────────────────
+        {
+            const _camOps = new Set(['camera.photo','camera.video','camera.scan',
+                'camera.selfie','camera.settings','camera_open','camera_capture']);
+            if (_camOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const mode   = String(d.mode   || latest.op.replace('camera.', '')).trim() || 'photo';
+                const action = String(d.action || '').trim();
+                return { headline: mode === 'scan' ? 'Scanner' : mode === 'video' ? 'Video' : 'Camera',
+                         summary: action || mode, variant: 'result', kind: 'camera', theme: 'theme-camera',
+                         info: { mode, action, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Photos ops ────────────────────────────────────────────────────────
+        {
+            const _photoOps = new Set(['photos.browse','photos.search','photos.album',
+                'photos.share','photos.edit','photos.delete','photos_open','photos_search']);
+            if (_photoOps.has(latest.op)) {
+                const d       = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const count   = Number(d.count  || (Array.isArray(d.photos) ? d.photos.length : 0));
+                const album   = String(d.album  || '').trim();
+                const query   = String(d.query  || '').trim();
+                const headline = album || query || (count ? `${count} photos` : 'Photos');
+                const summary  = count ? `${count} photos` : 'photo library';
+                return { headline, summary, variant: 'result', kind: 'photos', theme: 'theme-photos',
+                         info: { count, album, query, photos: d.photos || [],
+                                 source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Clock / Timer ops ──────────────────────────────────────────────────
+        {
+            const _clockOps = new Set(['clock.timer','clock.stopwatch','clock.world_time',
+                'clock_timer_start','clock_timer_stop','clock_stopwatch',
+                'clock_world_time','clock_countdown',
+                'clock_world','clock_bedtime','alarm_list',
+                'date_age','date_countdown','date_day_of','date_days_until']);
+            if (_clockOps.has(latest.op)) {
+                const d   = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const op  = latest.op;
+                // world clocks
+                if (op === 'clock_world') {
+                    const clocks = Array.isArray(d.clocks) ? d.clocks : [];
+                    return { headline: `${clocks.length} zones`, summary: clocks.slice(0,3).map(c => c.city).join(' · ') || 'world time',
+                             variant: 'result', kind: 'clock', theme: 'theme-clock',
+                             info: { clocks, op } };
+                }
+                // bedtime
+                if (op === 'clock_bedtime') {
+                    const bedtimes = Array.isArray(d.bedtimes) ? d.bedtimes : [];
+                    const best = bedtimes[1] || bedtimes[0] || {};
+                    return { headline: best.time || 'Bedtime', summary: `${best.cycles || 5} cycles · ${best.hours || 7.5}h`,
+                             variant: 'result', kind: 'clock', theme: 'theme-clock',
+                             info: { bedtimes, wake_time: d.wake_time || '', op } };
+                }
+                // alarm list
+                if (op === 'alarm_list') {
+                    const alarms = Array.isArray(d.alarms) ? d.alarms : [];
+                    const next = alarms[0] || {};
+                    return { headline: next.time || `${alarms.length} alarms`, summary: next.label || 'alarms',
+                             variant: 'result', kind: 'alarm', theme: 'theme-alarm',
+                             info: { alarms, time: next.time || '', label: next.label || '', action: 'list', op } };
+                }
+                // date calc
+                if (['date_age','date_countdown','date_day_of','date_days_until'].includes(op)) {
+                    const delta  = d.delta_days != null ? Number(d.delta_days) : null;
+                    const dayName = String(d.day_name || '');
+                    const ageYears = d.age_years != null ? Number(d.age_years) : null;
+                    const headline = ageYears != null ? `${ageYears} years old`
+                                   : dayName   ? dayName
+                                   : delta != null ? `${Math.abs(delta)} days`
+                                   : latest.message || 'Date';
+                    const summary  = d.date || d.target || '';
+                    return { headline, summary, variant: 'result', kind: 'clock', theme: 'theme-clock',
+                             info: { ...d, op } };
+                }
+                const dur      = Number(d.duration_ms || d.remaining_ms || 0);
+                const elapsed  = Number(d.elapsed_ms  || 0);
+                const mode     = String(d.mode || (op.includes('stopwatch') ? 'stopwatch' : 'timer')).trim();
+                const label    = String(d.label || '').trim();
+                const fmtMs    = (ms) => { const s = Math.floor(ms/1000); const m = Math.floor(s/60); const h = Math.floor(m/60); return h > 0 ? `${h}:${String(m%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}` : `${m}:${String(s%60).padStart(2,'0')}`; };
+                const headline = dur ? fmtMs(dur) : (elapsed ? fmtMs(elapsed) : (mode === 'stopwatch' ? '0:00' : 'Timer'));
+                const summary  = label || mode;
+                return { headline, summary, variant: 'result', kind: 'clock', theme: 'theme-clock',
+                         info: { mode, label, duration_ms: dur, elapsed_ms: elapsed,
+                                 running: Boolean(d.running), source: d.source || 'scaffold', op } };
+            }
+        }
+        // ── Reference / Dictionary / Currency ops ─────────────────────────────
+        {
+            const _refOps = new Set(['dict_define','dict_etymology','dict_thesaurus','dict_wikipedia',
+                'currency_rates','currency_convert','unit_convert']);
+            if (_refOps.has(latest.op)) {
+                const d  = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const op = latest.op;
+                if (op === 'dict_define' || op === 'dict_etymology') {
+                    const word     = String(d.word || '');
+                    const phonetic = String(d.phonetic || '');
+                    const meanings = Array.isArray(d.meanings) ? d.meanings : [];
+                    const origin   = String(d.origin || '');
+                    const firstDef = String(d.first_def || (meanings[0]?.definitions?.[0]) || '');
+                    return { headline: word, summary: phonetic || firstDef.slice(0,60) || op,
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { word, phonetic, meanings, origin, op } };
+                }
+                if (op === 'dict_thesaurus') {
+                    const word     = String(d.word || '');
+                    const synonyms = Array.isArray(d.synonyms) ? d.synonyms : [];
+                    return { headline: word, summary: synonyms.slice(0,4).join(', ') || 'thesaurus',
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { word, synonyms, antonyms: d.antonyms || [], op } };
+                }
+                if (op === 'dict_wikipedia') {
+                    const title   = String(d.title || '');
+                    const desc    = String(d.description || '');
+                    const extract = String(d.extract || '');
+                    return { headline: title, summary: desc || extract.slice(0,80),
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { title, desc, extract, thumbnail: d.thumbnail || '', url: d.url || '', op } };
+                }
+                if (op === 'currency_rates') {
+                    const base  = String(d.base || 'USD');
+                    const major = (d.major && typeof d.major === 'object') ? d.major : {};
+                    const pairs = Object.entries(major).slice(0, 4).map(([k,v]) => `${k} ${Number(v).toFixed(3)}`).join(' · ');
+                    return { headline: `${base} rates`, summary: pairs || 'exchange rates',
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { base, rates: d.rates || {}, major, op } };
+                }
+                if (op === 'currency_convert') {
+                    const result = Number(d.result || 0);
+                    const from_c = String(d.from || '');
+                    const to_c   = String(d.to   || '');
+                    const amount = Number(d.amount || 1);
+                    return { headline: `${result.toLocaleString(undefined,{maximumFractionDigits:2})} ${to_c}`,
+                             summary: `${amount} ${from_c} → ${to_c}`,
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { amount, from: from_c, to: to_c, result, rate: d.rate || 0, op } };
+                }
+                if (op === 'unit_convert') {
+                    const result = Number(d.result || 0);
+                    const from_u = String(d.from || '');
+                    const to_u   = String(d.to   || '');
+                    const value  = Number(d.value || 1);
+                    return { headline: `${result} ${to_u}`, summary: `${value} ${from_u} → ${to_u}`,
+                             variant: 'result', kind: 'reference', theme: 'theme-reference',
+                             info: { value, from: from_u, to: to_u, result, category: d.category || '', op } };
+                }
+            }
+        }
+        // ── Recipe ops ────────────────────────────────────────────────────────
+        {
+            const _recipeOps = new Set(['recipe.search','recipe.view','recipe.save','recipe.cook',
+                'recipe_search','recipe_view','recipe_save']);
+            if (_recipeOps.has(latest.op)) {
+                const d        = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const name     = String(d.name     || d.title || '').trim();
+                const cuisine  = String(d.cuisine  || '').trim();
+                const time_min = Number(d.time_min || d.cook_time_min || 0);
+                const results  = Array.isArray(d.results) ? d.results : [];
+                const headline = name || (results[0]?.name) || 'Recipe';
+                const summary  = [cuisine, time_min ? `${time_min} min` : ''].filter(Boolean).join(' · ') || 'cooking';
+                return { headline, summary, variant: 'result', kind: 'recipe', theme: 'theme-recipe',
+                         info: { name, cuisine, time_min, servings: d.servings || 0,
+                                 ingredients: d.ingredients || [], results,
+                                 source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Grocery ops ───────────────────────────────────────────────────────
+        {
+            const _grocOps = new Set(['grocery.add','grocery.list','grocery.remove',
+                'grocery.check','grocery_add','grocery_list','grocery_check']);
+            if (_grocOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const items  = Array.isArray(d.items) ? d.items : [];
+                const done   = items.filter(it => it.checked || it.done).length;
+                const action = String(d.action || '').trim();
+                const headline = `${items.length} item${items.length !== 1 ? 's' : ''}`;
+                const summary  = done > 0 ? `${done} checked` : (action || 'grocery list');
+                return { headline, summary, variant: 'result', kind: 'grocery', theme: 'theme-grocery',
+                         info: { items, done, action, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Translate ops ──────────────────────────────────────────────────────
+        {
+            const _transOps = new Set(['translate.text','translate.phrase','translate.detect',
+                'translate_text','translate_phrase','translate_detect']);
+            if (_transOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const src    = String(d.source_text   || d.text   || '').trim();
+                const result = String(d.translated    || d.result || '').trim();
+                const from   = String(d.from_language || d.from   || '').trim();
+                const to     = String(d.to_language   || d.to     || '').trim();
+                const headline = result || src || 'Translation';
+                const summary  = from && to ? `${from} → ${to}` : (from || to || 'translate');
+                return { headline, summary, variant: 'result', kind: 'translate', theme: 'theme-translate',
+                         info: { src, result, from, to, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Books ops ─────────────────────────────────────────────────────────
+        {
+            const _bookOps = new Set(['book.search','book.read','book.library',
+                'book.recommend','book_search','book_read','book_library']);
+            if (_bookOps.has(latest.op)) {
+                const d        = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const title    = String(d.title   || '').trim();
+                const author   = String(d.author  || '').trim();
+                const progress = Number(d.progress_pct || 0);
+                const results  = Array.isArray(d.results) ? d.results : [];
+                const headline = title || (results[0]?.title) || 'Books';
+                const summary  = author || (progress ? `${progress}% complete` : 'reading');
+                return { headline, summary, variant: 'result', kind: 'book', theme: 'theme-book',
+                         info: { title, author, progress, results,
+                                 source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Smarthome ops ─────────────────────────────────────────────────────
+        {
+            const _shOps = new Set(['smarthome.lights','smarthome.thermostat','smarthome.lock',
+                'smarthome.appliance','smarthome.scene','smarthome.camera','smarthome.energy']);
+            if (_shOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const devices = Array.isArray(d.devices) ? d.devices : [];
+                const action  = String(d.action || '').trim();
+                const active  = devices.filter(dv => dv.state === 'on' || dv.state === 'locked').length;
+                const temp    = Number(d.temp || (devices.find(dv => dv.type === 'thermostat')?.temp) || 72);
+                const headline = action === 'thermostat' ? `${temp}°` : (active > 0 ? `${active} on` : 'Home');
+                const summary  = devices.length ? `${devices.length} devices` : 'smart home';
+                return { headline, summary, variant: 'result', kind: 'smarthome', theme: 'theme-smarthome',
+                         info: { devices, action, temp, unit: d.unit || 'F', source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Travel ops ────────────────────────────────────────────────────────
+        {
+            const _tvOps = new Set(['travel.flight_search','travel.flight_status','travel.itinerary',
+                'travel.hotel_search','travel.hotel_book','travel.checkin','travel.car_rental','travel.boarding_pass']);
+            if (_tvOps.has(latest.op)) {
+                const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const flights = Array.isArray(d.flights) ? d.flights : [];
+                const hotels  = Array.isArray(d.hotels)  ? d.hotels  : [];
+                const first   = flights[0] || {};
+                const headline = first.dest || first.origin
+                    ? `${first.origin || '?'} → ${first.dest || '?'}`
+                    : (hotels[0]?.name || 'Travel');
+                const summary  = first.airline
+                    ? `${first.airline}${first.depart ? ' · ' + first.depart : ''}`
+                    : (first.status || (hotels.length ? `${hotels.length} hotels` : 'upcoming trip'));
+                return { headline, summary, variant: 'result', kind: 'travel', theme: 'theme-travel',
+                         info: { flights, hotels, action: d.action || latest.op, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Payments ops ──────────────────────────────────────────────────────
+        {
+            const _pmOps = new Set(['payments.send','payments.request','payments.split',
+                'payments.history','payments.balance']);
+            if (_pmOps.has(latest.op)) {
+                const d      = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const amount = Number(d.amount || 0);
+                const heroAmt = amount ? `$${amount.toFixed(2)}` : (d.balance ? `$${Number(d.balance).toFixed(2)}` : '—');
+                const headline = heroAmt;
+                const summary  = d.recipient ? `→ ${d.recipient}` : String(d.action || 'payment').replace(/_/g, ' ');
+                return { headline, summary, variant: 'result', kind: 'payments', theme: 'theme-payments',
+                         info: { ...d, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Focus ops ─────────────────────────────────────────────────────────
+        {
+            const _focusOps = new Set(['focus.pomodoro','focus.session',
+                'focus_start','focus_end','focus_schedule','focus_status','focus_apps']);
+            if (_focusOps.has(latest.op)) {
+                const d   = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const dur = Number(d.duration_min || 25);
+                const mode = String(d.mode || latest.op.replace('focus.', '')).trim();
+                const headline = dur ? `${dur}m` : 'Focus';
+                const summary  = mode || 'deep work';
+                return { headline, summary, variant: 'result', kind: 'focus', theme: 'theme-focus',
+                         info: { ...d, source: d.source || 'scaffold', op: latest.op } };
+            }
+        }
+        // ── Connections management ─────────────────────────────────────────────
+        if (latest.op === 'connections_status') {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const services = (d.services && typeof d.services === 'object') ? d.services : {};
+            const connectedCount = Object.values(services).filter(s => s && s.connected).length;
+            const total = Object.keys(services).length || 6;
+            const headline = 'Connections';
+            const summary = connectedCount > 0 ? `${connectedCount} of ${total} connected` : 'No services connected';
+            return { headline, summary, variant: 'result', kind: 'connections', theme: 'theme-connections',
+                     info: { services, op: 'connections_status' } };
+        }
         // ── Computer layer ops ─────────────────────────────────────────────────
         {
             const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
@@ -2563,6 +3570,7 @@ const UIEngine = {
         if (domain === 'accessibility') return { headline: 'Accessibility', summary: 'Accessibility settings', variant: 'result', kind: 'accessibility', theme: 'theme-accessibility' };
         if (domain === 'shortcuts')     return { headline: 'Shortcuts',     summary: 'Automations',            variant: 'result', kind: 'shortcuts',     theme: 'theme-shortcuts'     };
         if (domain === 'currency')      return { headline: 'Currency',      summary: 'Exchange rates',         variant: 'result', kind: 'currency',      theme: 'theme-currency'      };
+        if (domain === 'connectors')    return { headline: 'Connections',   summary: 'Manage connected services', variant: 'result', kind: 'connections',   theme: 'theme-connections'   };
         return { headline: summary, summary: fallbackSummary, variant: 'result', kind: 'generic', theme: 'theme-neutral' };
     },
 
@@ -2710,6 +3718,120 @@ const UIEngine = {
         }
         if (core.kind === 'social') {
             const info = core.info || {};
+            const op = String(info.op || '');
+
+            // ── notifications ──────────────────────────────────────────────
+            if (op === 'social_notifications') {
+                const items = Array.isArray(info.items) ? info.items.slice(0, 20) : [];
+                const unread = Number(info.unread || 0);
+                const reasonIcon = { like: '♥', repost: '↺', follow: '+', mention: '@', reply: '↩', quote: '❝' };
+                const rows = items.map((n, i) => {
+                    const reason = String(n?.reason || 'activity');
+                    const author = String(n?.author || n?.handle || '—');
+                    const age = String(n?.age || n?.indexedAt || '');
+                    const isNew = i < unread;
+                    const icon = reasonIcon[reason] || '·';
+                    return `<div class="sn-row${isNew ? ' sn-new' : ''}">
+                        <div class="sn-icon">${escapeHtml(icon)}</div>
+                        <div class="sn-author">${escapeHtml(author)}</div>
+                        <div class="sn-reason">${escapeHtml(reason)}</div>
+                        <div class="sn-age">${escapeHtml(age)}</div>
+                    </div>`;
+                }).join('');
+                return `
+                    <div class="scene scene-social interactive">
+                        <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                        <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                        <div class="scene-grid"></div>
+                        <div class="social-head">
+                            <div class="social-title">notifications</div>
+                            <div class="social-source">${unread > 0 ? `<span class="sn-badge">${unread}</span> unread` : 'all read'}</div>
+                        </div>
+                        <div class="sn-stream">
+                            ${rows || '<div class="sn-row"><div class="sn-reason">no notifications</div></div>'}
+                        </div>
+                    </div>`;
+            }
+
+            // ── trending ───────────────────────────────────────────────────
+            if (op === 'social_trending') {
+                const topics = Array.isArray(info.topics) ? info.topics.slice(0, 24) : [];
+                const pills = topics.map((t, i) => {
+                    const label = String(t?.topic || t?.displayName || '—');
+                    const rank = i + 1;
+                    const hot = i < 3 ? ' st-hot' : '';
+                    return `<div class="st-pill${hot}"><span class="st-rank">${rank}</span>${escapeHtml(label)}</div>`;
+                }).join('');
+                return `
+                    <div class="scene scene-social interactive">
+                        <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                        <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                        <div class="scene-grid"></div>
+                        <div class="social-head">
+                            <div class="social-title">trending</div>
+                            <div class="social-source">bluesky · ${topics.length} topics</div>
+                        </div>
+                        <div class="st-grid">
+                            ${pills || '<div class="st-pill">no trending topics</div>'}
+                        </div>
+                    </div>`;
+            }
+
+            // ── profile ────────────────────────────────────────────────────
+            if (op === 'social_profile_read') {
+                const handle = String(info.handle || '');
+                const displayName = String(info.displayName || handle);
+                const bio = String(info.bio || '').slice(0, 180);
+                const followers = Number(info.followers || 0);
+                const following = Number(info.following || 0);
+                const posts = Number(info.posts || 0);
+                const initial = (displayName || handle || '?')[0].toUpperCase();
+                return `
+                    <div class="scene scene-social interactive">
+                        <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                        <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                        <div class="scene-grid"></div>
+                        <div class="sp-shell">
+                            <div class="sp-avatar-wrap">
+                                <div class="sp-avatar">${escapeHtml(initial)}</div>
+                            </div>
+                            <div class="sp-name">${escapeHtml(displayName)}</div>
+                            <div class="sp-handle">@${escapeHtml(handle)}</div>
+                            ${bio ? `<div class="sp-bio">${escapeHtml(bio)}</div>` : ''}
+                            <div class="sp-stats">
+                                <div class="sp-stat"><span>${followers.toLocaleString()}</span><em>followers</em></div>
+                                <div class="sp-stat"><span>${following.toLocaleString()}</span><em>following</em></div>
+                                <div class="sp-stat"><span>${posts.toLocaleString()}</span><em>posts</em></div>
+                            </div>
+                        </div>
+                    </div>`;
+            }
+
+            // ── action receipts: dm / react / comment / follow ─────────────
+            if (['social_dm_send','social_react','social_comment','social_follow'].includes(op)) {
+                const actionMeta = {
+                    social_dm_send:  { icon: '✉', label: 'direct message sent', color: 'rgba(122,192,255,0.9)' },
+                    social_react:    { icon: '♥', label: 'post liked',           color: 'rgba(255,110,130,0.9)' },
+                    social_comment:  { icon: '↩', label: 'reply posted',         color: 'rgba(130,220,160,0.9)' },
+                    social_follow:   { icon: '+', label: String(info.action || 'followed'), color: 'rgba(190,150,255,0.9)' },
+                };
+                const meta = actionMeta[op];
+                const target = String(info.recipient || info.actor || info.uri || '').slice(0, 80);
+                return `
+                    <div class="scene scene-social interactive">
+                        <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                        <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                        <div class="scene-grid"></div>
+                        <div class="sa-shell">
+                            <div class="sa-icon" style="color:${meta.color}">${escapeHtml(meta.icon)}</div>
+                            <div class="sa-label">${escapeHtml(meta.label)}</div>
+                            ${target ? `<div class="sa-target">${escapeHtml(target)}</div>` : ''}
+                            <div class="sa-check">✓ delivered</div>
+                        </div>
+                    </div>`;
+            }
+
+            // ── feed (default) ─────────────────────────────────────────────
             const items = Array.isArray(info.items) ? info.items.slice(0, 12) : [];
             const source = String(info.source || 'scaffold').trim();
             const message = String(info.message || '').trim();
@@ -2750,93 +3872,124 @@ const UIEngine = {
         }
         if (core.kind === 'banking') {
             const info = core.info || {};
-            const items = Array.isArray(info.items) ? info.items.slice(0, 10) : [];
+            const items = Array.isArray(info.items) ? info.items.slice(0, 8) : [];
             const available = Number(info.available || 0);
-            const ledger = Number(info.ledger || 0);
-            const source = String(info.source || 'scaffold').trim();
             const currency = String(info.currency || 'USD').trim();
             const asOf = String(info.asOf || '').trim();
-            const txRows = items.map((item) => {
-                const date = String(item?.date || '-').trim();
+            const txRows = items.map((item, i) => {
                 const merchant = String(item?.merchant || item?.name || '-').trim();
                 const amount = Number(item?.amount || 0);
                 const direction = amount < 0 ? 'debit' : 'credit';
-                return `<div class="bank-row ${direction}">
-                    <div class="bank-row-merchant">${escapeHtml(merchant)}</div>
-                    <div class="bank-row-date">${escapeHtml(date)}</div>
-                    <div class="bank-row-amount">${escapeHtml(formatCurrency(amount))}</div>
+                const opacity = Math.max(0.12, 0.55 - i * 0.07);
+                return `<div class="bank-stream-item" style="opacity:${opacity}">
+                    <div class="bank-stream-merchant">${escapeHtml(merchant)}</div>
+                    <div class="bank-stream-amount ${direction}">${escapeHtml(formatCurrency(Math.abs(amount)))}</div>
                 </div>`;
             }).join('');
-            return `
-                <div class="scene scene-banking interactive">
-                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
-                    <div class="scene-orb orb-b"></div>
-                    <div class="scene-orb orb-c"></div>
-                    <div class="scene-grid"></div>
-                    <div class="bank-head">
-                        <div class="bank-balance">${escapeHtml(formatCurrency(available))}</div>
-                        <div class="bank-meta">${escapeHtml(currency)} | ledger ${escapeHtml(formatCurrency(ledger))}${asOf ? ` | ${escapeHtml(asOf)}` : ''}</div>
-                    </div>
-                    <div class="bank-source">source ${escapeHtml(source)}</div>
-                    <div class="bank-transactions">
-                        ${txRows || '<div class="bank-row"><div class="bank-row-merchant">No transactions loaded</div><div class="bank-row-date">-</div><div class="bank-row-amount">$0.00</div></div>'}
-                    </div>
+            return `<div class="scene scene-banking interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="bank-shell">
+                    <div class="bank-eyebrow">${escapeHtml(currency)}${asOf ? ` · ${escapeHtml(asOf)}` : ''}</div>
+                    <div class="bank-hero">${escapeHtml(formatCurrency(available))}</div>
+                    <div class="bank-hero-label">available balance</div>
+                    ${txRows ? `<div class="bank-stream">${txRows}</div>` : ''}
                 </div>
-            `;
+            </div>`;
         }
         if (core.kind === 'contacts') {
             const info = core.info || {};
-            const items = Array.isArray(info.items) ? info.items.slice(0, 16) : [];
-            const source = String(info.source || 'scaffold').trim();
-            const cards = items.map((item) => {
-                const name = String(item?.name || 'Unknown').trim();
-                const phone = String(item?.phone || '').trim();
-                const label = String(item?.label || '').trim();
-                return `<article class="contacts-card">
-                    <div class="contacts-name">${escapeHtml(name)}</div>
-                    <div class="contacts-meta">${escapeHtml([label, phone].filter(Boolean).join(' | '))}</div>
-                    ${phone ? `<button class="contacts-call-btn" data-command="${escapeAttr(`confirm call ${phone}`)}" type="button">prepare call</button>` : ''}
-                </article>`;
+            const items = Array.isArray(info.items) ? info.items.slice(0, 12) : [];
+            const focused = items[0] || null;
+            const focusName = String(focused?.name || '').trim();
+            const focusPhone = String(focused?.phone || '').trim();
+            const focusLabel = String(focused?.label || '').trim();
+            const streamHtml = items.slice(1).map((item, i) => {
+                const name = String(item?.name || '').trim();
+                const meta = String(item?.phone || item?.label || '').trim();
+                const opacity = Math.max(0.1, 0.5 - i * 0.06);
+                return `<div class="contact-stream-item" style="opacity:${opacity}">
+                    <span class="contact-stream-name">${escapeHtml(name)}</span>
+                    ${meta ? `<span class="contact-stream-meta">${escapeHtml(meta)}</span>` : ''}
+                </div>`;
             }).join('');
-            return `
-                <div class="scene scene-contacts interactive">
-                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
-                    <div class="scene-orb orb-a"></div>
-                    <div class="scene-grid"></div>
-                    <div class="contacts-head">
-                        <div class="contacts-title">contacts stream</div>
-                        <div class="contacts-source">source ${escapeHtml(source)}</div>
-                    </div>
-                    <div class="contacts-grid">
-                        ${cards || '<article class="contacts-card"><div class="contacts-name">No contacts</div><div class="contacts-meta">Try: show contacts</div></article>'}
-                    </div>
+            return `<div class="scene scene-contacts interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="contact-shell">
+                    <div class="contact-eyebrow">contacts · ${items.length}</div>
+                    <div class="contact-hero">${escapeHtml(focusName || 'No contact found')}</div>
+                    ${(focusPhone || focusLabel) ? `<div class="contact-hero-meta">${escapeHtml([focusLabel, focusPhone].filter(Boolean).join(' · '))}</div>` : ''}
+                    ${focusPhone ? `<button class="contact-call-btn" data-command="${escapeAttr(`confirm call ${focusPhone}`)}" type="button">prepare call</button>` : ''}
+                    ${streamHtml ? `<div class="contact-stream">${streamHtml}</div>` : ''}
                 </div>
-            `;
+            </div>`;
         }
         if (core.kind === 'telephony') {
             const info = core.info || {};
-            const target = String(info.target || '').trim();
-            const mode = String(info.mode || 'bridge_prepare').trim();
+            const callSid = String(info.callSid || '').trim();
+            const target = String(info.target || info.to || '').trim();
             const contactName = String(info.contactName || '').trim();
-            const lines = Array.isArray(info.steps) ? info.steps : [];
-            const safeLines = lines.length ? lines.slice(0, 6) : [
-                'grant connector scope telephony.call.start',
-                'confirm call <target>',
-                'open mobile and claim handoff token',
-            ];
-            const items = safeLines.map((line) => `<li>${escapeHtml(String(line))}</li>`).join('');
-            return `
-                <div class="scene scene-telephony interactive">
-                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
-                    <div class="scene-orb orb-b"></div>
-                    <div class="scene-grid"></div>
-                    <div class="telephony-head">
-                        <div class="telephony-title">${escapeHtml(target || 'telephony control')}</div>
-                        <div class="telephony-meta">${escapeHtml([mode, contactName].filter(Boolean).join(' | ') || 'handoff mode')}</div>
+            const initState = String(info.state || info.mode || 'ringing').trim();
+            const showSetup = !callSid || initState === 'setup_twilio';
+            if (showSetup) {
+                // No active call — show onboarding steps
+                const lines = Array.isArray(info.steps) ? info.steps : [
+                    'grant connector scope telephony.call.start',
+                    'confirm call <target>',
+                    'open mobile and claim handoff token',
+                ];
+                const items = lines.slice(0, 6).map((l) => `<li>${escapeHtml(String(l))}</li>`).join('');
+                return `
+                    <div class="scene scene-telephony interactive">
+                        <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                        <div class="scene-orb orb-b"></div>
+                        <div class="scene-grid"></div>
+                        <div class="telephony-head">
+                            <div class="telephony-title">telephony</div>
+                            <div class="telephony-meta">setup required</div>
+                        </div>
+                        <div class="telephony-panel">
+                            <div class="telephony-label">next actions</div>
+                            <ol class="telephony-steps">${items}</ol>
+                        </div>
                     </div>
-                    <div class="telephony-panel">
-                        <div class="telephony-label">next actions</div>
-                        <ol class="telephony-steps">${items}</ol>
+                `;
+            }
+            return `
+                <div class="scene scene-telephony interactive" data-func-domain="telephony"
+                     data-call-sid="${escapeAttr(callSid)}"
+                     data-call-state="${escapeAttr(initState)}">
+                    <canvas class="scene-canvas phone-canvas" data-scene="phone"></canvas>
+                    <div class="scene-orb orb-b"></div>
+                    <div class="phone-avatar" aria-hidden="true">
+                        <div class="phone-avatar-ring"></div>
+                        <div class="phone-avatar-initials">${escapeHtml((contactName || target).slice(0, 2).toUpperCase())}</div>
+                    </div>
+                    <div class="telephony-head">
+                        <div class="telephony-title">${escapeHtml(contactName || target || 'unknown')}</div>
+                        <div class="telephony-meta">${escapeHtml(contactName ? target : '')}</div>
+                    </div>
+                    <div class="phone-state-row">
+                        <span class="phone-state-badge" data-state="${escapeAttr(initState)}">${escapeHtml(initState)}</span>
+                        <span class="phone-timer" data-start="" data-active="${initState === 'active' ? '1' : '0'}">--:--</span>
+                    </div>
+                    <div class="phone-controls">
+                        <button class="phone-btn phone-btn-mute" data-muted="0" title="Mute">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/><path d="M19 10a7 7 0 0 1-14 0"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                        </button>
+                        <button class="phone-btn phone-btn-hold" data-held="0" title="Hold">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+                        </button>
+                        <button class="phone-btn phone-btn-hangup" title="End call">
+                            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.6 21 3 13.4 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z"/></svg>
+                        </button>
+                        <button class="phone-btn phone-btn-dtmf" title="Keypad">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="4" height="4" rx="1"/><rect x="10" y="3" width="4" height="4" rx="1"/><rect x="17" y="3" width="4" height="4" rx="1"/><rect x="3" y="10" width="4" height="4" rx="1"/><rect x="10" y="10" width="4" height="4" rx="1"/><rect x="17" y="10" width="4" height="4" rx="1"/><rect x="3" y="17" width="4" height="4" rx="1"/><rect x="10" y="17" width="4" height="4" rx="1"/><rect x="17" y="17" width="4" height="4" rx="1"/></svg>
+                        </button>
+                    </div>
+                    <div class="phone-dtmf-pad" hidden>
+                        ${['1','2','3','4','5','6','7','8','9','*','0','#'].map((d) =>
+                            `<button class="phone-dtmf-key" data-digit="${escapeAttr(d)}">${escapeHtml(d)}</button>`
+                        ).join('')}
                     </div>
                 </div>
             `;
@@ -3320,44 +4473,39 @@ const UIEngine = {
             `;
         }
         if (core.kind === 'tasks') {
-            const tasks = (this.state.memory?.tasks || []).slice(0, 6);
+            const tasks = (this.state.memory?.tasks || []).slice(0, 8);
             const openCount = tasks.filter((t) => !t.done).length;
             const doneCount = tasks.filter((t) => t.done).length;
             const progress = tasks.length ? Math.round((doneCount / Math.max(1, tasks.length)) * 100) : 0;
-            const topOpen = tasks.filter((t) => !t.done).slice(0, 5);
-            const topDone = tasks.filter((t) => t.done).slice(0, 3);
-            const relationItems = (() => {
-                const snapshot = this.state.session.graphSnapshot || {};
-                const relations = Array.isArray(snapshot.relations) ? snapshot.relations : [];
-                return relations
-                    .filter((r) => String(r?.relation || r?.kind || '').toLowerCase() === 'depends_on')
-                    .slice(-5)
-                    .map((r) => `${String(r?.sourceId || '').slice(0, 8)} -> ${String(r?.targetId || '').slice(0, 8)}`);
-            })();
-            const openHtml = (topOpen.length ? topOpen : [{ title: 'No open tasks' }]).map((item, idx) => `
-                <div class="tasks-row">
-                    <span class="tasks-row-index">${escapeHtml(String(idx + 1))}</span>
-                    <span class="tasks-row-title">${escapeHtml(String(item.title || 'Task'))}</span>
-                    ${topOpen.length ? `<button class="tasks-row-action" type="button" data-command="${escapeAttr(`complete task ${idx + 1}`)}">complete</button>` : ''}
+            const topOpen = tasks.filter((t) => !t.done).slice(0, 6);
+            const topDone = tasks.filter((t) => t.done).slice(0, 4);
+            const focusTask = topOpen[0] || null;
+            const restOpen = topOpen.slice(1);
+            const itemsHtml = restOpen.map((item, idx) => `
+                <div class="tasks-item">
+                    <span class="tasks-item-num">${escapeHtml(String(idx + 2))}</span>
+                    <span class="tasks-item-title">${escapeHtml(String(item.title || 'Task'))}</span>
+                    <button class="tasks-item-done" type="button" data-command="${escapeAttr(`complete task ${idx + 2}`)}">done</button>
                 </div>
             `).join('');
-            const doneHtml = (topDone.length ? topDone : [{ title: 'No completed tasks' }]).map((item) => `
-                <div class="tasks-done-pill">${escapeHtml(String(item.title || 'Task'))}</div>
-            `).join('');
-            const relHtml = (relationItems.length ? relationItems : ['No dependencies yet']).map((line) => `
-                <div class="tasks-rel-row">${escapeHtml(line)}</div>
-            `).join('');
+            const doneChips = topDone.map((item) =>
+                `<span class="tasks-done-chip">${escapeHtml(String(item.title || 'Task').slice(0, 32))}</span>`
+            ).join('');
             return `<div class="scene scene-domain scene-tasks interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="tasks" data-open="${escapeAttr(String(openCount))}" data-done="${escapeAttr(String(doneCount))}"></canvas>
                 <div class="tasks-shell">
-                    <div class="tasks-kpi">
-                        <div class="tasks-kpi-label">completion</div>
-                        <div class="tasks-kpi-value">${escapeHtml(String(progress))}%</div>
-                        <div class="tasks-kpi-sub">${escapeHtml(String(doneCount))} done / ${escapeHtml(String(openCount))} open</div>
+                    <div class="tasks-progress-wrap">
+                        <div class="tasks-progress-label">completion</div>
+                        <div class="tasks-progress-value">${escapeHtml(String(progress))}%</div>
+                        <div class="tasks-progress-sub">${escapeHtml(String(doneCount))} done · ${escapeHtml(String(openCount))} open</div>
                     </div>
-                    <div class="tasks-open-list">${openHtml}</div>
-                    <div class="tasks-done-list">${doneHtml}</div>
-                    <div class="tasks-rel-list">${relHtml}</div>
+                    ${focusTask ? `<div class="tasks-focus">
+                        <div class="tasks-focus-eyebrow">up next</div>
+                        <div class="tasks-focus-title">${escapeHtml(String(focusTask.title || 'Task'))}</div>
+                        <button class="tasks-focus-done" type="button" data-command="${escapeAttr('complete task 1')}">mark complete</button>
+                    </div>` : ''}
+                    <div class="tasks-list">${itemsHtml}</div>
+                    ${topDone.length ? `<div class="tasks-done-strip">${doneChips}</div>` : ''}
                 </div>
             </div>`;
         }
@@ -3398,64 +4546,59 @@ const UIEngine = {
                 const k = String(e?.category || 'misc').trim().toLowerCase() || 'misc';
                 byCategory.set(k, (byCategory.get(k) || 0) + Number(e?.amount || 0));
             }
-            const topCats = Array.from(byCategory.entries())
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 5);
-            const bars = topCats.map(([category, amount]) => {
-                const pct = Math.max(6, Math.min(100, (Number(amount || 0) / Math.max(1, total)) * 100));
-                return `<div class="expenses-cat-row">
-                    <div class="expenses-cat-label">${escapeHtml(category)}</div>
-                    <div class="expenses-cat-bar"><span style="width:${pct}%"></span></div>
-                    <div class="expenses-cat-amt">${escapeHtml(formatCurrency(Number(amount || 0)))}</div>
-                </div>`;
-            }).join('');
-            const ledger = expenses.slice(0, 8).map((e) => {
-                const category = String(e?.category || 'misc').trim();
-                const note = String(e?.note || '').trim();
-                const amount = Number(e?.amount || 0);
-                return `<div class="expenses-ledger-row">
-                    <div class="expenses-ledger-main">${escapeHtml(category)}</div>
-                    <div class="expenses-ledger-note">${escapeHtml(note || '-')}</div>
-                    <div class="expenses-ledger-amt">${escapeHtml(formatCurrency(amount))}</div>
-                </div>`;
-            }).join('');
+            const topCats = Array.from(byCategory.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
             const avg = expenses.length ? total / expenses.length : 0;
+            const recentHtml = expenses.slice(0, 5).map((e) => {
+                const cat = String(e?.category || 'misc').trim();
+                const note = String(e?.note || '').trim();
+                const amt = Number(e?.amount || 0);
+                return `<div class="expenses-entry">
+                    <span class="expenses-entry-cat">${escapeHtml(cat)}</span>
+                    ${note ? `<span class="expenses-entry-note">${escapeHtml(note)}</span>` : ''}
+                    <span class="expenses-entry-amt">${escapeHtml(formatCurrency(amt))}</span>
+                </div>`;
+            }).join('');
+            const catsHtml = topCats.map(([cat, amt]) => {
+                const pct = Math.round((amt / Math.max(1, total)) * 100);
+                return `<div class="expenses-cat-label-row">
+                    <span class="expenses-cat-name">${escapeHtml(cat)}</span>
+                    <span class="expenses-cat-pct">${pct}%</span>
+                </div>`;
+            }).join('');
             return `<div class="scene scene-domain scene-expenses interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="expenses" data-total="${escapeAttr(String(total.toFixed(2)))}" data-items="${escapeAttr(String(expenses.length))}"></canvas>
                 <div class="expenses-shell">
-                    <div class="expenses-kpi-card">
-                        <div class="expenses-kpi-label">total spend</div>
-                        <div class="expenses-kpi-value">${escapeHtml(formatCurrency(total))}</div>
-                        <div class="expenses-kpi-sub">${escapeHtml(String(expenses.length))} entries | avg ${escapeHtml(formatCurrency(avg))}</div>
+                    <div class="expenses-hero">
+                        <div class="expenses-hero-label">total spend</div>
+                        <div class="expenses-hero-value">${escapeHtml(formatCurrency(total))}</div>
+                        <div class="expenses-hero-sub">${escapeHtml(String(expenses.length))} entries &middot; avg ${escapeHtml(formatCurrency(avg))}</div>
                     </div>
-                    <div class="expenses-cats-card">${bars || '<div class="expenses-cat-row"><div class="expenses-cat-label">no spend</div><div class="expenses-cat-bar"><span style="width:12%"></span></div><div class="expenses-cat-amt">$0.00</div></div>'}</div>
-                    <div class="expenses-ledger-card">${ledger || '<div class="expenses-ledger-row"><div class="expenses-ledger-main">No expenses yet</div><div class="expenses-ledger-note">-</div><div class="expenses-ledger-amt">$0.00</div></div>'}</div>
+                    <div class="expenses-breakdown">${catsHtml || '<div class="expenses-cat-label-row"><span class="expenses-cat-name">no spend yet</span></div>'}</div>
+                    <div class="expenses-recent">${recentHtml || '<div class="expenses-entry"><span class="expenses-entry-cat">No expenses yet</span></div>'}</div>
                 </div>
             </div>`;
         }
         if (core.kind === 'notes') {
-            const notes = (this.state.memory?.notes || []).slice(0, 16);
-            const tiles = notes.map((n, idx) => {
+            const notes = (this.state.memory?.notes || []).slice(0, 12);
+            // Position fragments across the canvas in a loose grid with offsets
+            const cols = 3, rows = 4;
+            const fragmentsHtml = notes.map((n, idx) => {
                 const text = String(n.text || '').trim();
-                const stamp = Number(n.createdAt || 0);
-                const shortDate = stamp ? new Date(stamp).toLocaleDateString() : 'recent';
-                const lines = text.split(/\s+/).slice(0, 20).join(' ');
-                return `<article class="notes-card ${idx % 5 === 0 ? 'feature' : ''}">
-                    <div class="notes-card-meta">${escapeHtml(shortDate)}</div>
-                    <div class="notes-card-text">${escapeHtml(lines || 'note')}</div>
-                </article>`;
+                const words = text.split(/\s+/).slice(0, 14).join(' ');
+                const col = idx % cols;
+                const row = Math.floor(idx / cols) % rows;
+                const leftPct = 6 + col * 30 + (idx % 2 === 0 ? 2 : -2);
+                const topPct  = 14 + row * 20 + (idx % 3 === 0 ? 3 : 0);
+                const opacity = Math.max(0.45, 1 - idx * 0.07);
+                const size    = idx === 0 ? 18 : idx < 3 ? 14 : 12;
+                return `<div class="notes-fragment" style="left:${leftPct}%;top:${topPct}%;opacity:${opacity};font-size:${size}px;">${escapeHtml(words || 'note')}</div>`;
             }).join('');
-            const summary = notes.length
-                ? `${notes.length} notes active`
-                : 'No notes yet';
+            const countLabel = notes.length ? `${notes.length} notes` : 'no notes yet';
             return `<div class="scene scene-domain scene-notes interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="notes" data-count="${escapeAttr(String(notes.length))}"></canvas>
                 <div class="notes-shell">
-                    <div class="notes-headline">
-                        <div class="notes-title">knowledge stream</div>
-                        <div class="notes-sub">${escapeHtml(summary)}</div>
-                    </div>
-                    <div class="notes-wall">${tiles || '<article class="notes-card"><div class="notes-card-text">No notes yet.</div></article>'}</div>
+                    <div class="notes-count-label">${escapeHtml(countLabel)}</div>
+                    <div class="notes-field">${fragmentsHtml || '<div class="notes-fragment" style="left:8%;top:20%;opacity:0.5;font-size:16px;">No notes yet.</div>'}</div>
                 </div>
             </div>`;
         }
@@ -3754,133 +4897,127 @@ const UIEngine = {
             const name   = String(info.name  || '').trim();
             const topic  = String(info.topic || '').trim();
             const title  = name || topic || (action === 'edit' ? 'Existing Document' : 'New Document');
-            const lineSizes = [0.85, 0.62, 0.78, 0, 0.70, 0.88, 0.45, 0, 0.75, 0.60];
-            const docLines  = lineSizes.map((w) => w === 0
-                ? '<div class="doc-line gap"></div>'
-                : `<div class="doc-line"><span style="width:${(w * 100).toFixed(0)}%"></span></div>`).join('');
             return `<div class="scene scene-computer scene-document interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="document"></canvas>
-                <div class="doc-shell">
-                    <div class="doc-header">
-                        <div class="doc-action-badge">${escapeHtml(action)}</div>
-                        <div class="doc-title">${escapeHtml(title)}</div>
-                        ${topic && name ? `<div class="doc-topic">${escapeHtml(topic)}</div>` : ''}
+                <div class="functional-surface">
+                    <div class="func-toolbar" data-func-toolbar="document">
+                        <button data-cmd="bold" title="Bold"><b>B</b></button>
+                        <button data-cmd="italic" title="Italic"><i>I</i></button>
+                        <button data-cmd="underline" title="Underline"><u>U</u></button>
+                        <div class="func-toolbar-sep"></div>
+                        <button data-cmd="formatBlock:h1" title="Heading 1">H1</button>
+                        <button data-cmd="formatBlock:h2" title="Heading 2">H2</button>
+                        <button data-cmd="insertHorizontalRule" title="Divider">—</button>
+                        <button data-cmd="insertUnorderedList" title="Bullet list">•</button>
+                        <button data-cmd="insertOrderedList" title="Numbered list">1.</button>
+                        <span class="func-doc-name">${escapeHtml(title)}</span>
+                        <span class="func-save-status" data-save-status>Saved</span>
                     </div>
-                    <div class="doc-page">
-                        <div class="doc-page-title">${escapeHtml(title)}</div>
-                        <div class="doc-page-lines">${docLines}</div>
+                    <div class="func-doc-body" contenteditable="true"
+                         data-func-domain="document" data-func-name="${escapeAttr(name || title)}">
                     </div>
                 </div>
             </div>`;
         }
         if (core.kind === 'spreadsheet') {
-            const info   = core.info || {};
-            const action = String(info.action || 'create').trim();
-            const name   = String(info.name   || 'New Spreadsheet').trim();
-            const cols   = ['A', 'B', 'C', 'D', 'E'];
-            const rows   = [['Category','Q1','Q2','Q3','Q4'],['Revenue','—','—','—','—'],['Expenses','—','—','—','—'],['Profit','—','—','—','—']];
-            const hdrHtml = ['', ...cols].map((c) => `<div class="ss-cell ss-head">${escapeHtml(c)}</div>`).join('');
-            const rowsHtml = rows.map((row, ri) => `<div class="ss-row"><div class="ss-cell ss-rownum">${ri + 1}</div>${row.map((cell, ci) => `<div class="ss-cell ${ri === 0 || ci === 0 ? 'ss-label' : ''}">${escapeHtml(cell)}</div>`).join('')}</div>`).join('');
+            const info = core.info || {};
+            const name = String(info.name || 'New Spreadsheet').trim();
+            const COLS = ['A','B','C','D','E','F','G','H'];
+            const ROWS = 20;
+            const thHtml = `<th class="row-num-head"></th>` + COLS.map((c) => `<th>${c}</th>`).join('');
+            const tdHtml = Array.from({length: ROWS}, (_, ri) =>
+                `<tr><td class="row-num">${ri + 1}</td>` +
+                COLS.map((c) => `<td contenteditable="true" data-cell="${c}${ri + 1}"></td>`).join('') +
+                `</tr>`).join('');
             return `<div class="scene scene-computer scene-spreadsheet interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="spreadsheet"></canvas>
-                <div class="ss-shell">
-                    <div class="ss-header">
-                        <div class="ss-action-badge">${escapeHtml(action)}</div>
-                        <div class="ss-title">${escapeHtml(name)}</div>
+                <div class="functional-surface">
+                    <div class="func-toolbar" data-func-toolbar="spreadsheet">
+                        <span class="func-cell-ref" data-cell-ref>A1</span>
+                        <input class="func-formula-bar" data-formula-bar placeholder="Value or formula…" />
+                        <span class="func-doc-name">${escapeHtml(name)}</span>
+                        <span class="func-save-status" data-save-status>Saved</span>
                     </div>
-                    <div class="ss-table">
-                        <div class="ss-col-headers">${hdrHtml}</div>
-                        ${rowsHtml}
+                    <div class="func-sheet-wrap">
+                        <table class="func-sheet-grid" data-func-domain="spreadsheet" data-func-name="${escapeAttr(name)}">
+                            <thead><tr>${thHtml}</tr></thead>
+                            <tbody>${tdHtml}</tbody>
+                        </table>
                     </div>
                 </div>
             </div>`;
         }
         if (core.kind === 'presentation') {
-            const info   = core.info || {};
-            const action = String(info.action || 'create').trim();
-            const name   = String(info.name   || '').trim();
-            const topic  = String(info.topic  || '').trim();
-            const slides = Number(info.slides || 8);
-            const title  = name || topic || 'New Presentation';
-            const thumbs = Array.from({ length: Math.min(slides, 6) }, (_, i) => `
-                <div class="pres-thumb ${i === 0 ? 'active' : ''}">
-                    <div class="pres-thumb-inner"><div class="pres-thumb-line l1"></div><div class="pres-thumb-line l2"></div><div class="pres-thumb-line l3"></div></div>
-                    <div class="pres-thumb-num">${i + 1}</div>
-                </div>`).join('');
+            const info  = core.info || {};
+            const name  = String(info.name  || '').trim();
+            const topic = String(info.topic || '').trim();
+            const title = name || topic || 'New Presentation';
+            // One starter slide
+            const thumbHtml = `<div class="func-pres-thumb-wrap">
+                <div class="func-pres-thumb active" data-slide-index="0"></div>
+                <div class="func-pres-thumb-num">1</div>
+            </div>`;
             return `<div class="scene scene-computer scene-presentation interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="presentation"></canvas>
-                <div class="pres-shell">
-                    <div class="pres-filmstrip">${thumbs}</div>
-                    <div class="pres-stage">
-                        <div class="pres-slide">
-                            <div class="pres-slide-eyebrow">${escapeHtml(action)} · ${escapeHtml(String(slides))} slides</div>
-                            <div class="pres-slide-title">${escapeHtml(title)}</div>
-                            <div class="pres-slide-sub">${escapeHtml(topic || 'Generated presentation')}</div>
-                            <div class="pres-slide-lines"><div class="pres-slide-line"></div><div class="pres-slide-line short"></div><div class="pres-slide-line"></div></div>
-                        </div>
+                <div class="functional-surface">
+                    <div class="func-toolbar" data-func-toolbar="presentation">
+                        <button data-slide-cmd="add" title="Add slide">+ Slide</button>
+                        <button data-slide-cmd="delete" title="Delete slide">Delete</button>
+                        <span class="func-doc-name">${escapeHtml(title)}</span>
+                        <span class="func-save-status" data-save-status>Saved</span>
                     </div>
-                    <div class="pres-controls">
-                        <div class="pres-action-badge">${escapeHtml(action)}</div>
-                        <div class="pres-count">${escapeHtml(String(slides))} slides</div>
+                    <div class="func-pres-wrap">
+                        <div class="func-pres-panel" data-pres-panel data-func-name="${escapeAttr(name || title)}">
+                            ${thumbHtml}
+                        </div>
+                        <div class="func-pres-stage">
+                            <div class="func-pres-slide" contenteditable="true"
+                                 data-func-domain="presentation" data-func-name="${escapeAttr(name || title)}"
+                                 data-slide-index="0">
+                                <h1>${escapeHtml(title)}</h1>
+                                <p>${escapeHtml(topic || 'Click to start editing')}</p>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>`;
         }
         if (core.kind === 'code') {
             const info     = core.info || {};
-            const action   = String(info.action   || 'create').trim();
-            const language = String(info.language || '').trim();
-            const topic    = String(info.topic    || '').trim();
-            const name     = String(info.name     || '').trim();
-            const fname    = name || topic || 'untitled';
-            const fakeCode = [
-                `<span class="ck">function</span> <span class="cf">${escapeHtml(name || 'main')}</span>() {`,
-                `  <span class="ck">const</span> result = <span class="cf">initialize</span>()`,
-                `  <span class="ck">if</span> (result.<span class="cp">ok</span>) {`,
-                `    <span class="cf">process</span>(result.<span class="cp">data</span>)`,
-                `    <span class="ck">return</span> <span class="cs">'success'</span>`,
-                `  }`,
-                `  <span class="ck">return</span> <span class="cs">'error'</span>`,
-                `}`,
-            ].map((src, i) => `<div class="code-line"><span class="code-lnum">${i + 1}</span><span class="code-src">${src}</span></div>`).join('');
-            const actionLabel = action === 'explain' ? '// explaining' : action === 'debug' ? '// debugging' : action === 'run' ? '// running' : `// ${action}`;
+            const language = String(info.language || 'text').trim();
+            const name     = String(info.name     || info.topic || 'untitled').trim();
             return `<div class="scene scene-computer scene-code interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="code"></canvas>
-                <div class="code-shell">
-                    <div class="code-header">
-                        <div class="code-dots"><span></span><span></span><span></span></div>
-                        ${language ? `<div class="code-lang-badge">${escapeHtml(language)}</div>` : ''}
-                        <div class="code-action-badge">${escapeHtml(action)}</div>
-                        <div class="code-filename">${escapeHtml(fname.slice(0, 40))}</div>
+                <div class="functional-surface">
+                    <div class="func-toolbar" data-func-toolbar="code">
+                        <span class="func-lang-badge">${escapeHtml(language)}</span>
+                        <span class="func-doc-name">${escapeHtml(name)}</span>
+                        <span class="func-save-status" data-save-status>Saved</span>
                     </div>
-                    <div class="code-editor">
-                        ${fakeCode}
-                        <div class="code-status-line">
-                            <span class="code-status-action">${escapeHtml(actionLabel)}</span>
-                            ${topic ? `<span class="code-status-topic">${escapeHtml(topic.slice(0, 60))}</span>` : ''}
-                        </div>
+                    <div class="func-code-wrap" data-func-domain="code"
+                         data-func-name="${escapeAttr(name)}" data-func-lang="${escapeAttr(language)}">
+                        <textarea class="func-code-textarea" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
                     </div>
                 </div>
             </div>`;
         }
         if (core.kind === 'terminal') {
-            const info    = core.info || {};
-            const command = String(info.command || '').trim();
-            const outLines = ['Initializing session...', 'Environment ready'].map((l) => `<div class="term-output-line">${escapeHtml(l)}</div>`).join('');
             return `<div class="scene scene-computer scene-terminal interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="terminal"></canvas>
-                <div class="term-shell">
-                    <div class="term-bar">
-                        <div class="term-dots"><span class="term-dot red"></span><span class="term-dot yellow"></span><span class="term-dot green"></span></div>
-                        <div class="term-title">terminal</div>
-                    </div>
-                    <div class="term-body">
-                        ${outLines}
-                        <div class="term-prompt-line">
-                            <span class="term-prompt">$ </span>
-                            <span class="term-cmd">${escapeHtml(command)}</span>
-                            <span class="term-cursor"></span>
+                <div class="functional-surface">
+                    <div class="func-terminal-bar">
+                        <div class="func-terminal-dots">
+                            <div class="func-terminal-dot red"></div>
+                            <div class="func-terminal-dot yellow"></div>
+                            <div class="func-terminal-dot green"></div>
                         </div>
+                        <div class="func-terminal-title">terminal</div>
+                    </div>
+                    <div class="func-terminal-output" data-terminal-output></div>
+                    <div class="func-terminal-input-row">
+                        <span class="func-terminal-prompt">$</span>
+                        <input class="func-terminal-input" data-terminal-input
+                               autocomplete="off" spellcheck="false" autocorrect="off" />
                     </div>
                 </div>
             </div>`;
@@ -3891,32 +5028,37 @@ const UIEngine = {
             const title  = String(info.title  || '').trim();
             const date   = String(info.date   || 'today').trim();
             const isCreate = action === 'create';
-            const isCancel = action === 'cancel';
-            const agendaItems = [
-                { time: '9:00 AM',  label: 'Team standup',  dot: 'blue'   },
-                { time: '11:00 AM', label: 'Design review',  dot: 'purple' },
-                { time: '2:00 PM',  label: title || 'New event', dot: 'green'  },
-                { time: '4:30 PM',  label: 'Wrap-up sync',  dot: 'blue'   },
+            const connectorEvents = Array.isArray(info.events) ? info.events : [];
+            const events = connectorEvents.length ? connectorEvents : [
+                { time: '9:00',  label: 'Team standup'         },
+                { time: '11:00', label: 'Design review'        },
+                { time: '14:00', label: title || 'Focus block' },
+                { time: '16:30', label: 'Wrap-up sync'         },
             ];
-            const agendaHtml = agendaItems.map((item, i) => `
-                <div class="cal-item ${i === 2 ? 'cal-item-focus' : ''}">
-                    <div class="cal-item-time">${escapeHtml(item.time)}</div>
-                    <div class="cal-item-dot ${escapeAttr(item.dot)}"></div>
-                    <div class="cal-item-title">${escapeHtml(item.label)}</div>
-                </div>`).join('');
+            const focused = isCreate
+                ? { time: date, label: title || 'New Event' }
+                : (() => {
+                    const e = events[0] || {};
+                    const startRaw = String(e.start || e.startTime || e.time || '').replace('T', ' ');
+                    return { time: startRaw.slice(11, 16) || startRaw.slice(0, 10) || '—', label: String(e.summary || e.title || e.label || 'Event') };
+                })();
+            const restHtml = (isCreate ? events : events.slice(1)).slice(0, 4).map((e, i) => {
+                const startRaw = String(e.start || e.startTime || e.time || '').replace('T', ' ');
+                const t = startRaw.slice(11, 16) || startRaw.slice(0, 10) || '';
+                const lbl = String(e.summary || e.title || e.label || 'Event').slice(0, 48);
+                return `<div class="cal-stream-item" style="opacity:${0.5 - i * 0.08}">
+                    <span class="cal-stream-time">${escapeHtml(t)}</span>
+                    <span class="cal-stream-title">${escapeHtml(lbl)}</span>
+                </div>`;
+            }).join('');
             return `<div class="scene scene-computer scene-calendar interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="calendar"></canvas>
                 <div class="cal-shell">
-                    <div class="cal-header">
-                        <div class="cal-action-badge ${isCancel ? 'cancel' : ''}">${escapeHtml(action)}</div>
-                        <div class="cal-date">${escapeHtml(date)}</div>
-                    </div>
-                    ${isCreate ? `<div class="cal-event-card">
-                        <div class="cal-event-title">${escapeHtml(title || 'New Event')}</div>
-                        <div class="cal-event-meta">${escapeHtml(date)}</div>
-                        <div class="cal-event-status">generating event...</div>
-                    </div>` : ''}
-                    <div class="cal-agenda">${agendaHtml}</div>
+                    <div class="cal-eyebrow">${escapeHtml(date)}</div>
+                    <div class="cal-focus-time">${escapeHtml(focused.time)}</div>
+                    <div class="cal-focus-title">${escapeHtml(focused.label)}</div>
+                    ${isCreate ? '<div class="cal-creating">scheduling···</div>' : ''}
+                    <div class="cal-stream">${restHtml}</div>
                 </div>
             </div>`;
         }
@@ -3928,41 +5070,43 @@ const UIEngine = {
             const from    = String(info['from'] || '').trim();
             const query   = String(info.query   || '').trim();
             const isCompose = action === 'compose' || action === 'reply';
-            const fakeInbox = [
-                { from: 'Sarah M.',          subject: 'Re: Project update', preview: "Looks great, let's sync...", time: '10:42 AM', unread: true  },
-                { from: 'Team Alerts',       subject: 'Daily digest',        preview: 'Here is your summary...',  time: '8:01 AM',  unread: false },
-                { from: from || 'Mike T.',   subject: subject || query || 'Meeting notes', preview: 'Attached are the notes...', time: 'Yesterday', unread: action === 'reply' },
+            const connectorMessages = Array.isArray(info.messages) ? info.messages : [];
+            const msgs = connectorMessages.length ? connectorMessages : [
+                { from: 'Sarah Mitchell',    subject: 'Re: Project update',  snippet: "Looks great, let's sync tomorrow morning to go over the details.", date: '10:42 AM', unread: true  },
+                { from: 'Team Alerts',       subject: 'Daily digest',        snippet: 'Here is your summary for today.',   date: '8:01 AM',  unread: false },
+                { from: from || 'Mike T.',   subject: subject || query || 'Meeting notes', snippet: 'Attached are the notes from our call.', date: 'Yesterday', unread: action === 'reply' },
+                { from: 'Design Weekly',     subject: 'Issue #142',          snippet: 'This week in design systems...', date: 'Mon', unread: false },
+                { from: 'GitHub',            subject: 'New pull request',    snippet: 'A pull request was opened on your repo.', date: 'Mon', unread: false },
             ];
-            const inboxHtml = fakeInbox.map((msg, i) => `
-                <div class="email-msg ${msg.unread ? 'unread' : ''} ${i === 2 ? 'focused' : ''}">
-                    <div class="email-msg-from">${escapeHtml(msg.from)}</div>
-                    <div class="email-msg-subject">${escapeHtml(msg.subject)}</div>
-                    <div class="email-msg-preview">${escapeHtml(msg.preview)}</div>
-                    <div class="email-msg-time">${escapeHtml(msg.time)}</div>
+            const unread = msgs.filter(m => m.unread).length;
+            const focused = msgs[0] || {};
+            const streamHtml = msgs.slice(1, 5).map((m, i) => `
+                <div class="email-stream-item" style="opacity:${0.45 - i * 0.08}">
+                    <span class="email-stream-from">${escapeHtml(String(m.from || '').slice(0, 28))}</span>
+                    <span class="email-stream-dot">·</span>
+                    <span class="email-stream-subject">${escapeHtml(String(m.subject || '').slice(0, 48))}</span>
                 </div>`).join('');
-            const composeHtml = `<div class="email-compose">
-                <div class="email-field"><span class="email-field-label">To</span><span class="email-field-value">${escapeHtml(to || '...')}</span></div>
-                <div class="email-field"><span class="email-field-label">Subject</span><span class="email-field-value">${escapeHtml(subject || '...')}</span></div>
-                <div class="email-divider"></div>
-                <div class="email-body-lines">
-                    <div class="email-body-line long"></div><div class="email-body-line mid"></div>
-                    <div class="email-body-line long"></div><div class="email-body-line short"></div>
-                </div></div>`;
+            const inboxHtml = `
+                <div class="email-unread-wrap">
+                    <div class="email-unread-value">${unread || msgs.length}</div>
+                    <div class="email-unread-label">${unread ? 'unread' : 'messages'}</div>
+                </div>
+                <div class="email-focus">
+                    <div class="email-focus-eyebrow">${escapeHtml(String(focused.date || '').slice(0, 16))}</div>
+                    <div class="email-focus-from">${escapeHtml(String(focused.from || '').slice(0, 40))}</div>
+                    <div class="email-focus-subject">${escapeHtml(String(focused.subject || '').slice(0, 60))}</div>
+                    <div class="email-focus-snippet">${escapeHtml(String(focused.snippet || '').slice(0, 100))}</div>
+                </div>
+                <div class="email-stream">${streamHtml}</div>`;
+            const composeHtml = `
+                <div class="email-compose-eyebrow">${escapeHtml(action)}</div>
+                <div class="email-compose-to">${escapeHtml(to || '···')}</div>
+                <div class="email-compose-subject">${escapeHtml(subject || 'New message')}</div>
+                <div class="email-compose-cursor"></div>`;
             return `<div class="scene scene-computer scene-email interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="email"></canvas>
-                <div class="email-shell">
-                    <div class="email-sidebar">
-                        <div class="email-folder ${!isCompose ? 'active' : ''}">Inbox</div>
-                        <div class="email-folder">Sent</div>
-                        <div class="email-folder ${isCompose ? 'active' : ''}">Drafts</div>
-                    </div>
-                    <div class="email-main">
-                        <div class="email-header">
-                            <div class="email-action-badge">${escapeHtml(action)}</div>
-                            ${query ? `<div class="email-query">"${escapeHtml(query)}"</div>` : ''}
-                        </div>
-                        ${isCompose ? composeHtml : `<div class="email-inbox">${inboxHtml}</div>`}
-                    </div>
+                <div class="email-shell ${isCompose ? 'email-shell--compose' : ''}">
+                    ${isCompose ? composeHtml : inboxHtml}
                 </div>
             </div>`;
         }
@@ -4006,6 +5150,1022 @@ const UIEngine = {
                         ${name ? `<div class="cnt-name">${escapeHtml(name)}</div>` : ''}
                     </div>
                     ${isHistory ? `<div class="cnt-history">${histHtml}</div>` : `<div class="cnt-list">${listHtml}</div>`}
+                </div>
+            </div>`;
+        }
+        // ── Music / Spotify scene ──────────────────────────────────────────────
+        if (core.kind === 'music') {
+            const info     = core.info || {};
+            const track    = String(info.track    || '').trim();
+            const artist   = String(info.artist   || '').trim();
+            const albumArt = String(info.album_art || '').trim();
+            const playing  = info.is_playing !== false;
+            const prog     = Number(info.progress_ms || 0);
+            const dur      = Number(info.duration_ms  || 0);
+            const pct      = dur > 0 ? Math.min(100, Math.round((prog / dur) * 100)) : (playing ? 38 : 0);
+            const artBg    = albumArt ? `<div class="music-art-bg" style="background-image:url('${escapeAttr(albumArt)}')"></div>` : '';
+            return `<div class="scene scene-music interactive">
+                <canvas class="scene-canvas music-canvas" data-scene="music"
+                        data-track="${escapeAttr(track)}" data-artist="${escapeAttr(artist)}"
+                        data-playing="${playing}"></canvas>
+                ${artBg}
+                <div class="music-shell">
+                    <div class="music-track">${escapeHtml(track || 'Nothing playing')}</div>
+                    <div class="music-artist">${escapeHtml(artist || '')}</div>
+                    <div class="music-controls">
+                        <span class="music-btn music-prev" data-command="previous track">&#9664;&#9664;</span>
+                        <span class="music-btn music-playpause" data-command="${playing ? 'pause' : 'play'}">${playing ? '&#9646;&#9646;' : '&#9654;'}</span>
+                        <span class="music-btn music-next" data-command="next track">&#9654;&#9654;</span>
+                    </div>
+                    <div class="music-progress-bar">
+                        <div class="music-progress-fill" style="width:${pct}%"></div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        // ── Messaging / Slack scene ────────────────────────────────────────────
+        if (core.kind === 'messaging') {
+            const info     = core.info || {};
+            const channels = Array.isArray(info.channels) ? info.channels : [];
+            const messages = Array.isArray(info.messages) ? info.messages : [];
+            const unread   = Number(info.unread || channels.reduce((s, c) => s + Number(c.unread_count || 0), 0));
+            const src      = String(info.source || 'scaffold');
+            // Channel stream (by unread desc)
+            const sorted = [...channels].sort((a, b) => Number(b.unread_count || 0) - Number(a.unread_count || 0));
+            const focused = sorted[0] || messages[0] || null;
+            const focusName = focused ? String(focused.name || focused.user || focused.from || '').slice(0, 32) : '';
+            const streamItems = sorted.slice(1, 8).map((ch, i) => {
+                const u = Number(ch.unread_count || 0);
+                const opacity = Math.max(0.1, 0.5 - i * 0.07);
+                return `<div class="msg-stream-item" style="opacity:${opacity}">
+                    <span class="msg-stream-hash">#</span>
+                    <span class="msg-stream-name">${escapeHtml(String(ch.name || '').slice(0, 28))}</span>
+                    ${u > 0 ? `<span class="msg-stream-badge">${u}</span>` : ''}
+                </div>`;
+            }).join('');
+            const focusedUnread = focused ? Number(focused.unread_count || 0) : 0;
+            return `<div class="scene scene-messaging interactive">
+                <canvas class="scene-canvas messaging-canvas" data-scene="messaging"></canvas>
+                <div class="msg-shell">
+                    <div class="msg-eyebrow">${escapeHtml(src)} · messages</div>
+                    <div class="msg-hero">${unread || 0}</div>
+                    <div class="msg-hero-label">unread${channels.length > 0 ? ` across ${channels.length} channels` : ''}</div>
+                    ${focusName ? `<div class="msg-focus"><span class="msg-focus-hash">#</span><span class="msg-focus-name">${escapeHtml(focusName)}</span>${focusedUnread > 0 ? `<span class="msg-focus-count">${focusedUnread}</span>` : ''}</div>` : ''}
+                    ${streamItems ? `<div class="msg-stream">${streamItems}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Connections management panel ─────────────────────────────────────
+        if (core.kind === 'network') {
+            const info = core.info || {};
+            const nets = Array.isArray(info.networks) ? info.networks : [];
+            const msgsByTopic = (info.messagesByTopic && typeof info.messagesByTopic === 'object') ? info.messagesByTopic : {};
+            const did = String(info.did || '').trim();
+            const typeLabel = { personal: 'My Devices', p2p: 'Direct', private_group: 'Private Group', public_local: 'Local', public_topic: 'Topic', public_global: 'Global' };
+            const netCardsHtml = nets.map(net => {
+                const nType = String(net.type || '');
+                const label = String(net.label || net.networkId || nType);
+                const topic = String(net.topic || '');
+                const msgs = Array.isArray(msgsByTopic[topic]) ? msgsByTopic[topic] : [];
+                const badge = msgs.length ? `<span class="net-msg-count">${msgs.length}</span>` : '';
+                const msgsHtml = msgs.slice(-5).reverse().map(m => {
+                    const from = String(m.from || '').slice(0, 20);
+                    const payload = (m.payload && typeof m.payload === 'object') ? m.payload : {};
+                    const text = String(payload.text || payload.message || payload.content || JSON.stringify(payload)).slice(0, 120);
+                    const ago = m.receivedAt ? Math.round((Date.now() - m.receivedAt) / 60000) : 0;
+                    const agoStr = ago < 1 ? 'just now' : ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+                    return `<div class="net-msg-row">
+                        <span class="net-msg-from">${escapeHtml(from)}…</span>
+                        <span class="net-msg-text">${escapeHtml(text)}</span>
+                        <span class="net-msg-time">${escapeHtml(agoStr)}</span>
+                    </div>`;
+                }).join('');
+                return `<div class="net-card net-card--${escapeAttr(nType)}">
+                    <div class="net-card-head">
+                        <span class="net-card-type">${escapeHtml(typeLabel[nType] || nType)}</span>
+                        <span class="net-card-label">${escapeHtml(label)}</span>
+                        ${badge}
+                    </div>
+                    <div class="net-card-body">${msgsHtml || '<span class="net-empty">No messages yet</span>'}</div>
+                </div>`;
+            }).join('');
+            const didLine = did ? `<div class="net-did">Your DID: <span class="net-did-val">${escapeHtml(did.slice(0, 40))}…</span></div>` : '';
+            const relayConnected = !!info.relayConnected;
+            const relayId = String(info.relayId || '').slice(0, 12);
+            const relayDot = `<span class="net-relay-dot net-relay-dot--${relayConnected ? 'on' : 'off'}" title="Relay ${relayConnected ? 'connected' : 'disconnected'}${relayId ? ' · ' + relayId : ''}"></span>`;
+            const relayLine = `<div class="net-relay-status">${relayDot}<span class="net-relay-label">Relay ${relayConnected ? `connected${relayId ? ' · ' + escapeHtml(relayId) : ''}` : 'offline'}</span></div>`;
+            const peerCount = typeof info.peerCount === 'number' ? info.peerCount : 0;
+            const statsLine = `<div class="net-stats"><span>${nets.length} network${nets.length !== 1 ? 's' : ''}</span><span class="net-stats-sep">·</span><span>${peerCount} peer${peerCount !== 1 ? 's' : ''}</span></div>`;
+            return `<div class="network-scene">
+                <canvas class="scene-canvas" data-scene="network"></canvas>
+                <div class="network-scene-body">
+                    ${statsLine}
+                    ${relayLine}
+                    ${didLine}
+                    <div class="net-cards">${netCardsHtml || '<div class="net-empty">Not joined to any networks yet.</div>'}</div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'connections') {
+            const info     = core.info || {};
+            const services = (info.services && typeof info.services === 'object') ? info.services : {};
+            const _mkLogoUri = svg => `data:image/svg+xml,${encodeURIComponent(svg)}`;
+            const _svcMeta = {
+                spotify: { logo: 'https://cdn.simpleicons.org/spotify/ffffff',        label: 'Spotify',         desc: 'Music streaming' },
+                gmail:   { logo: 'https://cdn.simpleicons.org/gmail/ffffff',          label: 'Gmail',           desc: 'Email' },
+                gcal:    { logo: 'https://cdn.simpleicons.org/googlecalendar/ffffff', label: 'Google Calendar', desc: 'Events & scheduling' },
+                gdrive:  { logo: 'https://cdn.simpleicons.org/googledrive/ffffff',    label: 'Google Drive',    desc: 'Files & documents' },
+                slack:   { logo: _mkLogoUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white"><path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z"/></svg>`), label: 'Slack', desc: 'Team messaging' },
+                plaid:   { logo: _mkLogoUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="17" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/><rect x="17" y="9" width="6" height="6" rx="1"/><rect x="1" y="17" width="6" height="6" rx="1"/><rect x="9" y="17" width="6" height="6" rx="1"/><rect x="17" y="17" width="6" height="6" rx="1"/></svg>`), label: 'Plaid', desc: 'Bank accounts' },
+            };
+            const token = sessionStorage.getItem('genome_session') || '';
+            const cardsHtml = Object.entries(_svcMeta).map(([svcId, meta]) => {
+                const svc = services[svcId] || {};
+                const connected = Boolean(svc.connected);
+                const configured = svc.configured !== false;
+                const mode = String(svc.mode || 'scaffold');
+                const statusLabel = connected ? `connected · ${mode}` : 'not connected';
+                const cardFooter = connected
+                    ? `<button class="conn-card-btn" type="button" data-oauth-disconnect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}">disconnect</button>`
+                    : `<button class="conn-card-btn" type="button" data-oauth-connect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}"${!configured ? ' data-oauth-needs-creds="1"' : ''}>connect</button>`;
+                return `<div class="conn-card ${connected ? 'conn-card--live' : ''}" data-card-svc="${escapeAttr(svcId)}">
+                    <img class="conn-card-logo" src="${meta.logo}" alt="${escapeHtml(meta.label)}" width="36" height="36">
+                    <div class="conn-card-name">${escapeHtml(meta.label)}</div>
+                    <div class="conn-card-desc">${escapeHtml(meta.desc)}</div>
+                    <div class="conn-card-status">${escapeHtml(statusLabel)}</div>
+                    ${cardFooter}
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-connections interactive">
+                <canvas class="scene-canvas domain-canvas" data-scene="connections"></canvas>
+                <div class="connections-shell">
+                    <div class="connections-grid">${cardsHtml}</div>
+                </div>
+            </div>`;
+        }
+        // ── Drive files scene (when gdrive.list data is present) ───────────────
+        if (core.kind === 'document' && Array.isArray(core.info?.files) && core.info.files.length) {
+            const info  = core.info || {};
+            const files = info.files.slice(0, 8);
+            const mimeLabel = (mime) => {
+                if (!mime) return 'document';
+                if (mime.includes('sheet'))        return 'spreadsheet';
+                if (mime.includes('presentation')) return 'presentation';
+                if (mime.includes('word') || mime.includes('document')) return 'document';
+                if (mime.includes('pdf'))          return 'pdf';
+                if (mime.includes('image'))        return 'image';
+                if (mime.includes('video'))        return 'video';
+                return 'file';
+            };
+            const hero = files[0];
+            const heroName = String(hero?.name || 'File').trim();
+            const heroType = mimeLabel(hero?.mimeType);
+            const streamHtml = files.slice(1).map((f, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.07);
+                const date = String(f.modifiedTime || '').slice(0, 10);
+                return `<div class="drive-stream-item" style="opacity:${opacity}">
+                    <span class="drive-stream-name">${escapeHtml(String(f.name || 'File').slice(0, 40))}</span>
+                    ${date ? `<span class="drive-stream-date">${escapeHtml(date)}</span>` : ''}
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-computer scene-document interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="document"></canvas>
+                <div class="drive-shell">
+                    <div class="drive-eyebrow">google drive · ${files.length} files</div>
+                    <div class="drive-hero">${escapeHtml(heroName)}</div>
+                    <div class="drive-hero-type">${escapeHtml(heroType)}</div>
+                    ${streamHtml ? `<div class="drive-stream">${streamHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Alarm scene ───────────────────────────────────────────────────────
+        if (core.kind === 'alarm') {
+            const info   = core.info || {};
+            const alarms = Array.isArray(info.alarms) ? info.alarms : [];
+            const action = String(info.action || 'set').trim();
+            const time   = String(info.time || (alarms[0] && alarms[0].time) || '').trim();
+            const label  = String(info.label || (alarms[0] && alarms[0].label) || '').trim();
+            const streamHtml = alarms.slice(action === 'set' ? 1 : 0, 6).map((a, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.08);
+                const daysStr = Array.isArray(a.days) && a.days.length ? a.days.join(' · ') : 'once';
+                return `<div class="alarm-stream-item" style="opacity:${opacity}">
+                    <span class="alarm-stream-time">${escapeHtml(String(a.time || ''))}</span>
+                    <span class="alarm-stream-label">${escapeHtml(String(a.label || ''))}</span>
+                    <span class="alarm-stream-days">${escapeHtml(daysStr)}</span>
+                </div>`;
+            }).join('');
+            const heroTime = action === 'set' ? time : (alarms[0] && alarms[0].time) || time || '—';
+            return `<div class="scene scene-alarm interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="alarm-shell">
+                    <div class="alarm-eyebrow">${escapeHtml(action === 'list' ? 'all alarms' : `alarm ${action}`)}</div>
+                    <div class="alarm-hero">${escapeHtml(heroTime || '—')}</div>
+                    ${label ? `<div class="alarm-label">${escapeHtml(label)}</div>` : ''}
+                    ${streamHtml ? `<div class="alarm-stream">${streamHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Health scene ──────────────────────────────────────────────────────
+        if (core.kind === 'health') {
+            const info    = core.info || {};
+            const metrics = (info.metrics && typeof info.metrics === 'object') ? info.metrics : {};
+            const steps   = Number(metrics.steps || 0);
+            const goal    = Number(metrics.steps_goal || 10000);
+            const pct     = goal > 0 ? Math.min(100, Math.round((steps / goal) * 100)) : 0;
+            const streamItems = [
+                { label: 'calories', val: `${metrics.calories || 0} kcal` },
+                { label: 'active',   val: `${metrics.active_min || 0} min` },
+                { label: 'sleep',    val: `${metrics.sleep_hours || 0}h` },
+                { label: 'heart',    val: `${metrics.heart_rate || 0} bpm` },
+                { label: 'streak',   val: `${metrics.streak_days || 0} days` },
+            ].filter(x => x.val && !x.val.startsWith('0'));
+            const streamHtml = streamItems.map((item, i) => {
+                const opacity = Math.max(0.12, 0.55 - i * 0.09);
+                return `<div class="health-stream-item" style="opacity:${opacity}">
+                    <span class="health-stream-label">${escapeHtml(item.label)}</span>
+                    <span class="health-stream-val">${escapeHtml(item.val)}</span>
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-health interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="health-shell">
+                    <div class="health-eyebrow">today · activity</div>
+                    <div class="health-hero">${steps.toLocaleString()}</div>
+                    <div class="health-hero-label">steps · ${pct}% of goal</div>
+                    <div class="health-progress-bar"><div class="health-progress-fill" style="width:${pct}%"></div></div>
+                    ${streamHtml ? `<div class="health-stream">${streamHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Podcast scene ─────────────────────────────────────────────────────
+        if (core.kind === 'podcast') {
+            const info    = core.info || {};
+            const show    = String(info.show    || '').trim();
+            const episode = String(info.episode || '').trim();
+            const prog    = Number(info.progress_ms || 0);
+            const dur     = Number(info.duration_ms  || 0);
+            const playing = Boolean(info.is_playing);
+            const pct     = dur > 0 ? Math.min(100, Math.round((prog / dur) * 100)) : (playing ? 30 : 0);
+            const fmtTime = (ms) => { const s = Math.floor(ms / 1000); const m = Math.floor(s / 60); const h = Math.floor(m / 60); return h > 0 ? `${h}h ${m % 60}m` : `${m}m`; };
+            return `<div class="scene scene-podcast interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="podcast-shell">
+                    <div class="podcast-eyebrow">${escapeHtml(show || 'podcast')}</div>
+                    <div class="podcast-episode">${escapeHtml(episode || 'Now playing')}</div>
+                    <div class="podcast-controls">
+                        <span class="podcast-btn" data-command="rewind 30 seconds">&#9664;&#9664;</span>
+                        <span class="podcast-btn podcast-playpause" data-command="${playing ? 'pause podcast' : 'play podcast'}">${playing ? '&#9646;&#9646;' : '&#9654;'}</span>
+                        <span class="podcast-btn" data-command="skip 30 seconds">&#9654;&#9654;</span>
+                    </div>
+                    <div class="podcast-progress-bar">
+                        <div class="podcast-progress-fill" style="width:${pct}%"></div>
+                    </div>
+                    <div class="podcast-times">
+                        <span>${fmtTime(prog)}</span>
+                        <span>${fmtTime(dur)}</span>
+                    </div>
+                </div>
+            </div>`;
+        }
+        // ── Smarthome scene ───────────────────────────────────────────────────
+        if (core.kind === 'smarthome') {
+            const info    = core.info || {};
+            const devices = Array.isArray(info.devices) ? info.devices : [
+                { name: 'Living Room', type: 'lights', state: 'on',     brightness: 70 },
+                { name: 'Thermostat',  type: 'thermostat', state: 'on', temp: 72 },
+                { name: 'Front Door',  type: 'lock',   state: 'locked' },
+                { name: 'Bedroom',     type: 'lights', state: 'off',    brightness: 0 },
+            ];
+            const temp   = Number(info.temp || (devices.find(d => d.type === 'thermostat')?.temp) || 72);
+            const unit   = String(info.unit || 'F');
+            const active = devices.filter(d => d.state === 'on' || d.state === 'locked').length;
+            const devHtml = devices.slice(0, 6).map((dv, i) => {
+                const opacity = Math.max(0.15, 0.6 - i * 0.08);
+                const on  = dv.state === 'on' || dv.state === 'locked';
+                const val = dv.type === 'thermostat' ? `${dv.temp || temp}°${unit}`
+                          : dv.brightness != null    ? `${dv.brightness}%`
+                          : (on ? 'on' : 'off');
+                return `<div class="sh-device-row" data-state="${on ? 'on' : 'off'}" style="opacity:${opacity}">
+                    <span class="sh-device-name">${escapeHtml(String(dv.name || 'Device').slice(0, 24))}</span>
+                    <span class="sh-device-val">${escapeHtml(val)}</span>
+                    <span class="sh-device-dot ${on ? 'dot-on' : 'dot-off'}"></span>
+                </div>`;
+            }).join('');
+            const heroLabel = String(info.action || '') === 'thermostat' ? `${temp}°${unit}` : `${active} active`;
+            return `<div class="scene scene-smarthome interactive">
+                <canvas class="scene-canvas smarthome-canvas" data-scene="smarthome"></canvas>
+                <div class="sh-shell">
+                    <div class="sh-eyebrow">home · ${devices.length} devices</div>
+                    <div class="sh-hero">${escapeHtml(heroLabel)}</div>
+                    <div class="sh-hero-label">${active} on · ${devices.length - active} off</div>
+                    ${devHtml ? `<div class="sh-device-list">${devHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Travel scene ──────────────────────────────────────────────────────
+        if (core.kind === 'travel') {
+            const info    = core.info || {};
+            const flights = Array.isArray(info.flights) ? info.flights : [];
+            const hotels  = Array.isArray(info.hotels)  ? info.hotels  : [];
+            const first   = flights[0] || {};
+            const hero    = first.dest || first.origin
+                ? `${first.origin || '?'} → ${first.dest || '?'}`
+                : (hotels[0]?.name || 'Upcoming Trip');
+            const sub     = first.airline
+                ? `${first.airline}${first.depart ? ' · ' + first.depart : ''}`
+                : (first.status || 'travel');
+            const streamItems = [
+                ...flights.slice(1).map(f => ({ label: `${f.origin || ''}→${f.dest || ''}`, val: f.depart || f.status || 'flight' })),
+                ...hotels.slice(0, 3).map(h => ({ label: h.name || 'Hotel', val: h.checkin || 'hotel' })),
+            ].slice(0, 5);
+            const streamHtml = streamItems.map((item, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.08);
+                return `<div class="travel-stream-item" style="opacity:${opacity}">
+                    <span class="travel-stream-label">${escapeHtml(String(item.label).slice(0, 30))}</span>
+                    <span class="travel-stream-val">${escapeHtml(String(item.val).slice(0, 20))}</span>
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-travel interactive">
+                <canvas class="scene-canvas travel-canvas" data-scene="travel"></canvas>
+                <div class="travel-shell">
+                    <div class="travel-eyebrow">${escapeHtml(String(info.action || 'travel').replace(/_/g, ' '))} · itinerary</div>
+                    <div class="travel-hero">${escapeHtml(hero)}</div>
+                    <div class="travel-hero-sub">${escapeHtml(sub)}</div>
+                    ${streamHtml ? `<div class="travel-stream">${streamHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Payments scene ────────────────────────────────────────────────────
+        if (core.kind === 'payments') {
+            const info    = core.info || {};
+            const action  = String(info.action || info.op || '').replace(/_/g, ' ').trim();
+            const amount  = Number(info.amount  || 0);
+            const balance = Number(info.balance || 0);
+            const recipient    = String(info.recipient || '').trim();
+            const transactions = Array.isArray(info.transactions) ? info.transactions : [];
+            const heroAmt   = amount  ? `$${amount.toFixed(2)}`  : (balance ? `$${balance.toFixed(2)}` : '—');
+            const heroLabel = recipient ? `→ ${recipient}` : (action || 'payment');
+            const txHtml = transactions.slice(0, 5).map((tx, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.08);
+                const sign = Number(tx.amount || 0) >= 0 ? '+' : '';
+                return `<div class="pay-tx-row" style="opacity:${opacity}">
+                    <span class="pay-tx-name">${escapeHtml(String(tx.name || tx.recipient || 'Transfer').slice(0, 28))}</span>
+                    <span class="pay-tx-amt">${escapeHtml(sign + '$' + Math.abs(Number(tx.amount || 0)).toFixed(2))}</span>
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-payments interactive">
+                <canvas class="scene-canvas payments-canvas" data-scene="payments"></canvas>
+                <div class="pay-shell">
+                    <div class="pay-eyebrow">${escapeHtml(String(info.source || 'scaffold'))} · payments</div>
+                    <div class="pay-hero">${escapeHtml(heroAmt)}</div>
+                    <div class="pay-hero-label">${escapeHtml(heroLabel)}</div>
+                    ${txHtml ? `<div class="pay-tx-list">${txHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Focus scene ───────────────────────────────────────────────────────
+        if (core.kind === 'focus') {
+            const info    = core.info || {};
+            const mode    = String(info.mode || String(info.op || '').replace('focus.', '')).trim() || 'focus';
+            const dur     = Number(info.duration_min || 25);
+            const action  = String(info.action || '').trim();
+            const blocked = Array.isArray(info.apps_blocked) ? info.apps_blocked : [];
+            const isPomodoro = mode === 'pomodoro' || info.op === 'focus.pomodoro';
+            const heroVal   = isPomodoro ? `${dur}m` : (dur ? `${dur} min` : 'Focus');
+            const heroLabel = isPomodoro ? 'pomodoro · deep work' : `${mode.replace(/_/g, ' ')} session`;
+            const pct  = Math.min(100, Math.round((dur / (isPomodoro ? 25 : 60)) * 100));
+            const circ = Math.round(2 * Math.PI * 20);
+            const dash = Math.round(circ * pct / 100);
+            const blockedHtml = blocked.slice(0, 6).map((app, i) => {
+                const opacity = Math.max(0.15, 0.55 - i * 0.08);
+                return `<span class="focus-blocked-app" style="opacity:${opacity}">${escapeHtml(String(app).slice(0, 16))}</span>`;
+            }).join('');
+            return `<div class="scene scene-focus interactive">
+                <canvas class="scene-canvas focus-canvas" data-scene="focus"></canvas>
+                <div class="focus-shell">
+                    <div class="focus-eyebrow">${escapeHtml(action || 'starting')} · focus mode</div>
+                    <div class="focus-hero">${escapeHtml(heroVal)}</div>
+                    <div class="focus-hero-label">${escapeHtml(heroLabel)}</div>
+                    <svg class="focus-ring" viewBox="0 0 48 48" width="48" height="48">
+                        <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(120,200,160,0.18)" stroke-width="4"/>
+                        <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(120,200,160,0.8)" stroke-width="4"
+                            stroke-dasharray="${dash} ${circ}" stroke-linecap="round"
+                            transform="rotate(-90 24 24)"/>
+                    </svg>
+                    ${blocked.length ? `<div class="focus-blocked-label">blocking ${blocked.length} apps</div><div class="focus-blocked-row">${blockedHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Video scene ───────────────────────────────────────────────────────
+        if (core.kind === 'video') {
+            const info     = core.info || {};
+            const title    = String(info.title   || '').trim();
+            const show     = String(info.show    || '').trim();
+            const service  = String(info.service || '').trim();
+            const action   = String(info.action  || '').trim();
+            const results  = Array.isArray(info.results) ? info.results : [];
+            const prog     = Number(info.progress_ms || 0);
+            const dur      = Number(info.duration_ms  || 0);
+            const pct      = dur > 0 ? Math.min(100, Math.round((prog / dur) * 100)) : 0;
+            const hero     = title || show || (results[0]?.title) || 'Now Watching';
+            const eyebrow  = service ? `${service} · ${action || 'streaming'}` : (action || 'video');
+            const streamHtml = results.slice(0, 5).map((r, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.08);
+                const label = String(r.title || r.show || '').slice(0, 36);
+                const meta  = String(r.year || r.genre || r.type || '').slice(0, 16);
+                return `<div class="video-stream-item" style="opacity:${opacity}">
+                    <span class="video-stream-title">${escapeHtml(label)}</span>
+                    ${meta ? `<span class="video-stream-meta">${escapeHtml(meta)}</span>` : ''}
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-video interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="video"></canvas>
+                <div class="video-shell">
+                    <div class="video-eyebrow">${escapeHtml(eyebrow)}</div>
+                    <div class="video-hero">${escapeHtml(hero)}</div>
+                    ${show && title ? `<div class="video-show">${escapeHtml(show)}</div>` : ''}
+                    ${dur > 0 ? `<div class="video-progress-bar"><div class="video-progress-fill" style="width:${pct}%"></div></div>` : ''}
+                    ${streamHtml ? `<div class="video-stream">${streamHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Food delivery scene ───────────────────────────────────────────────
+        if (core.kind === 'food_delivery') {
+            const info       = core.info || {};
+            const restaurant = String(info.restaurant || 'Your Order').trim();
+            const eta        = String(info.eta    || '').trim();
+            const status     = String(info.status || 'preparing').trim();
+            const items      = Array.isArray(info.items) ? info.items : [];
+            const total      = Number(info.total || 0);
+            const itemsHtml  = items.slice(0, 5).map((item, i) => {
+                const opacity = Math.max(0.1, 0.5 - i * 0.08);
+                const qty   = item.qty || item.quantity || 1;
+                const name  = String(item.name || item.title || 'Item').slice(0, 30);
+                return `<div class="food-item-row" style="opacity:${opacity}">
+                    <span class="food-item-qty">${escapeHtml(String(qty))}×</span>
+                    <span class="food-item-name">${escapeHtml(name)}</span>
+                </div>`;
+            }).join('');
+            const statusSteps = ['placed','preparing','ready','picked up','on the way','delivered'];
+            const stepIdx = statusSteps.findIndex(s => status.toLowerCase().includes(s.split(' ')[0]));
+            const stepPct = stepIdx >= 0 ? Math.round(((stepIdx + 1) / statusSteps.length) * 100) : 30;
+            return `<div class="scene scene-food-delivery interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="food_delivery"></canvas>
+                <div class="food-shell">
+                    <div class="food-eyebrow">food delivery · ${escapeHtml(status)}</div>
+                    <div class="food-hero">${escapeHtml(restaurant)}</div>
+                    ${eta ? `<div class="food-eta">ETA <strong>${escapeHtml(eta)}</strong></div>` : ''}
+                    <div class="food-progress-bar"><div class="food-progress-fill" style="width:${stepPct}%"></div></div>
+                    ${itemsHtml ? `<div class="food-items">${itemsHtml}</div>` : ''}
+                    ${total ? `<div class="food-total">$${escapeHtml(total.toFixed(2))}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Rideshare scene ───────────────────────────────────────────────────
+        if (core.kind === 'rideshare') {
+            const info    = core.info || {};
+            const dest    = String(info.dest    || '').trim();
+            const driver  = String(info.driver  || '').trim();
+            const eta     = String(info.eta     || '').trim();
+            const status  = String(info.status  || 'booking').trim();
+            const price   = String(info.price   || '').trim();
+            const vehicle = String(info.vehicle || '').trim();
+            const statusSteps = ['booking','driver found','en route','arrived','trip started','dropped off'];
+            const stepIdx = statusSteps.findIndex(s => status.toLowerCase().includes(s.split(' ')[0]));
+            const stepPct = stepIdx >= 0 ? Math.round(((stepIdx + 1) / statusSteps.length) * 100) : 20;
+            return `<div class="scene scene-rideshare interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="rideshare"></canvas>
+                <div class="ride-shell">
+                    <div class="ride-eyebrow">rideshare · ${escapeHtml(status)}</div>
+                    <div class="ride-hero">${escapeHtml(dest || 'Your Ride')}</div>
+                    ${driver ? `<div class="ride-driver">${escapeHtml(driver)}${vehicle ? ' · ' + escapeHtml(vehicle) : ''}</div>` : ''}
+                    ${eta ? `<div class="ride-eta">ETA <strong>${escapeHtml(eta)}</strong></div>` : ''}
+                    <div class="ride-progress-bar"><div class="ride-progress-fill" style="width:${stepPct}%"></div></div>
+                    ${price ? `<div class="ride-price">${escapeHtml(price)}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Camera scene ──────────────────────────────────────────────────────
+        if (core.kind === 'camera') {
+            const info = core.info || {};
+            const mode = String(info.mode || 'photo').trim();
+            const modeLabel = mode === 'scan' ? 'Document Scanner' : mode === 'video' ? 'Video Camera' : mode === 'selfie' ? 'Selfie' : 'Camera';
+            const modeIcon  = mode === 'scan' ? '⬛' : mode === 'video' ? '⬛' : '⬛';
+            return `<div class="scene scene-camera interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="camera"></canvas>
+                <div class="cam-shell">
+                    <div class="cam-eyebrow">camera · ${escapeHtml(mode)}</div>
+                    <div class="cam-hero">${escapeHtml(modeLabel)}</div>
+                    <div class="cam-viewfinder">
+                        <div class="cam-corner cam-corner-tl"></div>
+                        <div class="cam-corner cam-corner-tr"></div>
+                        <div class="cam-corner cam-corner-bl"></div>
+                        <div class="cam-corner cam-corner-br"></div>
+                    </div>
+                    <div class="cam-mode-label">${escapeHtml(String(info.action || 'ready'))}</div>
+                </div>
+            </div>`;
+        }
+        // ── Photos scene ──────────────────────────────────────────────────────
+        if (core.kind === 'photos') {
+            const info   = core.info || {};
+            const count  = Number(info.count  || 0);
+            const album  = String(info.album  || '').trim();
+            const query  = String(info.query  || '').trim();
+            const photos = Array.isArray(info.photos) ? info.photos : [];
+            const heroLabel = album || query || (count ? `${count.toLocaleString()} photos` : 'Library');
+            const gridHtml = photos.slice(0, 6).map((p, i) => {
+                const opacity = Math.max(0.2, 0.8 - i * 0.1);
+                return `<div class="photos-grid-cell" style="opacity:${opacity};background:${p.color || 'rgba(255,255,255,0.06)'}"></div>`;
+            }).join('') || [0,1,2,3,4,5].map(i => `<div class="photos-grid-cell" style="opacity:${Math.max(0.05, 0.4 - i*0.06)}"></div>`).join('');
+            return `<div class="scene scene-photos interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="photos"></canvas>
+                <div class="photos-shell">
+                    <div class="photos-eyebrow">photos${album ? ' · ' + escapeHtml(album) : ''}</div>
+                    <div class="photos-hero">${escapeHtml(heroLabel)}</div>
+                    <div class="photos-grid">${gridHtml}</div>
+                </div>
+            </div>`;
+        }
+        // ── Clock / Timer scene ────────────────────────────────────────────────
+        if (core.kind === 'clock') {
+            const info = core.info || {};
+            const op   = String(info.op || '');
+
+            // ── world clocks ───────────────────────────────────────────────
+            if (op === 'clock_world') {
+                const clocks = Array.isArray(info.clocks) ? info.clocks : [];
+                const tiles = clocks.map(c => `
+                    <div class="cw-tile">
+                        <div class="cw-city">${escapeHtml(c.city || c.zone)}</div>
+                        <div class="cw-time">${escapeHtml(c.time)}</div>
+                        <div class="cw-date">${escapeHtml(c.date || '')}</div>
+                    </div>`).join('');
+                return `<div class="scene scene-clock interactive">
+                    <canvas class="scene-canvas computer-canvas" data-scene="clock"></canvas>
+                    <div class="cw-shell">
+                        <div class="clock-eyebrow">world clocks · ${clocks.length} zones</div>
+                        <div class="cw-grid">${tiles || '<div class="cw-tile"><div class="cw-city">—</div></div>'}</div>
+                    </div>
+                </div>`;
+            }
+
+            // ── bedtime ────────────────────────────────────────────────────
+            if (op === 'clock_bedtime') {
+                const bedtimes = Array.isArray(info.bedtimes) ? info.bedtimes : [];
+                const wake     = String(info.wake_time || '');
+                const rows = bedtimes.map((b, i) => {
+                    const best = i === 1;
+                    return `<div class="cb-row${best ? ' cb-best' : ''}">
+                        <div class="cb-time">${escapeHtml(b.time)}</div>
+                        <div class="cb-meta">${b.cycles} cycles · ${b.hours}h</div>
+                        ${best ? '<div class="cb-tag">recommended</div>' : ''}
+                    </div>`;
+                }).join('');
+                return `<div class="scene scene-clock interactive">
+                    <canvas class="scene-canvas computer-canvas" data-scene="clock"></canvas>
+                    <div class="clock-shell">
+                        <div class="clock-eyebrow">bedtime${wake ? ' · wake ' + escapeHtml(wake) : ''}</div>
+                        <div class="cb-list">${rows || '<div class="cb-row"><div class="cb-time">Set a wake time</div></div>'}</div>
+                    </div>
+                </div>`;
+            }
+
+            // ── date calc ──────────────────────────────────────────────────
+            if (['date_age','date_countdown','date_day_of','date_days_until'].includes(op)) {
+                const ageYears  = info.age_years != null ? Number(info.age_years) : null;
+                const dayName   = String(info.day_name || '');
+                const delta     = info.delta_days != null ? Number(info.delta_days) : null;
+                const label     = String(info.label || '');
+                const dateStr   = String(info.date || info.target || '');
+                const weekNum   = info.week_number ? ` · week ${info.week_number}` : '';
+                const bday      = info.days_to_birthday != null ? `next birthday in ${info.days_to_birthday} days` : '';
+                const heroText  = ageYears != null ? `${ageYears}` : dayName || (delta != null ? String(Math.abs(delta)) : '—');
+                const heroLabel = ageYears != null ? 'years old'
+                                : dayName          ? dateStr + weekNum
+                                : delta != null    ? `days ${delta < 0 ? 'ago' : 'until'} ${label || dateStr}`
+                                : '';
+                return `<div class="scene scene-clock interactive">
+                    <canvas class="scene-canvas computer-canvas" data-scene="clock"></canvas>
+                    <div class="clock-shell">
+                        <div class="clock-eyebrow">${escapeHtml(op.replace('_',' '))}</div>
+                        <div class="clock-display" style="font-size:clamp(36px,6vw,64px)">${escapeHtml(heroText)}</div>
+                        <div class="clock-state">${escapeHtml(heroLabel)}</div>
+                        ${bday ? `<div class="clock-eyebrow" style="margin-top:8px;opacity:.7">${escapeHtml(bday)}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+
+            // ── timer / stopwatch (default) ────────────────────────────────
+            const mode    = String(info.mode    || 'timer').trim();
+            const label   = String(info.label   || '').trim();
+            const dur     = Number(info.duration_ms || 0);
+            const elapsed = Number(info.elapsed_ms  || 0);
+            const running = Boolean(info.running);
+            const fmtMs   = (ms) => { const s = Math.floor(ms/1000); const m = Math.floor(s/60); const h = Math.floor(m/60); return h > 0 ? `${h}:${String(m%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`; };
+            const display = dur ? fmtMs(dur) : (elapsed ? fmtMs(elapsed) : '00:00');
+            const pct     = dur > 0 && elapsed > 0 ? Math.min(100, Math.round((elapsed / dur) * 100)) : 0;
+            const circ    = Math.round(2 * Math.PI * 36);
+            const dash    = Math.round(circ * pct / 100);
+            return `<div class="scene scene-clock interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="clock"></canvas>
+                <div class="clock-shell">
+                    <div class="clock-eyebrow">${escapeHtml(mode)}${label ? ' · ' + escapeHtml(label) : ''}</div>
+                    <div class="clock-display">${escapeHtml(display)}</div>
+                    <div class="clock-state">${running ? 'running' : 'ready'}</div>
+                    <svg class="clock-ring" viewBox="0 0 80 80" width="64" height="64">
+                        <circle cx="40" cy="40" r="36" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="4"/>
+                        <circle cx="40" cy="40" r="36" fill="none" stroke="rgba(255,200,80,0.8)" stroke-width="4"
+                            stroke-dasharray="${dash} ${circ}" stroke-linecap="round"
+                            transform="rotate(-90 40 40)"/>
+                    </svg>
+                </div>
+            </div>`;
+        }
+        // ── Reference scene (dictionary, wikipedia, currency, units) ──────────
+        if (core.kind === 'reference') {
+            const info = core.info || {};
+            const op   = String(info.op || '');
+
+            // definition or etymology
+            if (op === 'dict_define' || op === 'dict_etymology') {
+                const word     = String(info.word || '');
+                const phonetic = String(info.phonetic || '');
+                const origin   = String(info.origin || '');
+                const meanings = Array.isArray(info.meanings) ? info.meanings : [];
+                const defsHtml = meanings.slice(0,3).map(m => {
+                    const defs = (m.definitions || []).slice(0,2).map(d => `<div class="ref-def">${escapeHtml(d)}</div>`).join('');
+                    const ex   = (m.examples  || []).slice(0,1).map(e => `<div class="ref-example">"${escapeHtml(e)}"</div>`).join('');
+                    return `<div class="ref-meaning"><div class="ref-pos">${escapeHtml(m.pos || '')}</div>${defs}${ex}</div>`;
+                }).join('');
+                return `<div class="scene scene-reference interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ref-shell">
+                        <div class="ref-word">${escapeHtml(word)}</div>
+                        ${phonetic ? `<div class="ref-phonetic">${escapeHtml(phonetic)}</div>` : ''}
+                        ${op === 'dict_etymology' && origin ? `<div class="ref-origin"><span class="ref-pos">origin</span> ${escapeHtml(origin)}</div>` : ''}
+                        <div class="ref-meanings">${defsHtml || '<div class="ref-def">No definition found.</div>'}</div>
+                    </div>
+                </div>`;
+            }
+
+            // thesaurus
+            if (op === 'dict_thesaurus') {
+                const word     = String(info.word || '');
+                const synonyms = Array.isArray(info.synonyms) ? info.synonyms : [];
+                const antonyms = Array.isArray(info.antonyms) ? info.antonyms : [];
+                const synPills = synonyms.slice(0,14).map(w => `<span class="ref-pill ref-syn">${escapeHtml(w)}</span>`).join('');
+                const antPills = antonyms.slice(0,6).map(w => `<span class="ref-pill ref-ant">${escapeHtml(w)}</span>`).join('');
+                return `<div class="scene scene-reference interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ref-shell">
+                        <div class="ref-word">${escapeHtml(word)}</div>
+                        <div class="ref-section-label">synonyms</div>
+                        <div class="ref-pill-row">${synPills || '<span class="ref-pill">none found</span>'}</div>
+                        ${antPills ? `<div class="ref-section-label" style="margin-top:10px">antonyms</div><div class="ref-pill-row">${antPills}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+
+            // wikipedia
+            if (op === 'dict_wikipedia') {
+                const title     = String(info.title || '');
+                const desc      = String(info.desc  || '');
+                const extract   = String(info.extract || '');
+                const thumbnail = String(info.thumbnail || '');
+                return `<div class="scene scene-reference interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ref-shell">
+                        ${thumbnail ? `<div class="ref-thumb-wrap"><img class="ref-thumb" src="${encodeURI(thumbnail)}" alt="" loading="lazy"></div>` : ''}
+                        <div class="ref-word">${escapeHtml(title)}</div>
+                        ${desc ? `<div class="ref-phonetic">${escapeHtml(desc)}</div>` : ''}
+                        <div class="ref-extract">${escapeHtml(extract.slice(0,500))}</div>
+                    </div>
+                </div>`;
+            }
+
+            // currency rates
+            if (op === 'currency_rates') {
+                const base  = String(info.base || 'USD');
+                const major = (info.major && typeof info.major === 'object') ? info.major : {};
+                const rows  = Object.entries(major).filter(([k]) => k !== base).slice(0,10).map(([sym, val], i) => {
+                    const opacity = Math.max(0.15, 0.8 - i * 0.07);
+                    return `<div class="cur-row" style="opacity:${opacity}">
+                        <span class="cur-sym">${escapeHtml(sym)}</span>
+                        <span class="cur-val">${Number(val).toFixed(4)}</span>
+                    </div>`;
+                }).join('');
+                return `<div class="scene scene-reference interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="cur-shell">
+                        <div class="ref-phonetic">base currency</div>
+                        <div class="ref-word">${escapeHtml(base)}</div>
+                        <div class="cur-list">${rows || '<div class="cur-row">No rates available</div>'}</div>
+                    </div>
+                </div>`;
+            }
+
+            // currency convert or unit convert
+            if (op === 'currency_convert' || op === 'unit_convert') {
+                const value  = op === 'currency_convert' ? Number(info.amount || 1) : Number(info.value || 1);
+                const from   = String(info.from || '');
+                const to     = String(info.to   || '');
+                const result = Number(info.result || 0);
+                const rate   = info.rate  ? Number(info.rate) : null;
+                const cat    = String(info.category || '');
+                return `<div class="scene scene-reference interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="conv-shell">
+                        <div class="conv-from"><span class="conv-val">${escapeHtml(String(value))}</span><span class="conv-unit">${escapeHtml(from)}</span></div>
+                        <div class="conv-arrow">↓</div>
+                        <div class="conv-to"><span class="conv-val">${escapeHtml(result.toLocaleString(undefined,{maximumFractionDigits:6}))}</span><span class="conv-unit">${escapeHtml(to)}</span></div>
+                        ${rate ? `<div class="conv-rate">rate: 1 ${escapeHtml(from)} = ${escapeHtml(String(rate))} ${escapeHtml(to)}</div>` : ''}
+                        ${cat ? `<div class="conv-rate">${escapeHtml(cat)}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+
+            // fallback
+            return `<div class="scene scene-reference interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                <div class="scene-grid"></div>
+                <div class="ref-shell"><div class="ref-word">${escapeHtml(core.headline || 'Reference')}</div></div>
+            </div>`;
+        }
+        // ── Recipe scene ───────────────────────────────────────────────────────
+        if (core.kind === 'recipe') {
+            const info        = core.info || {};
+            const name        = String(info.name     || '').trim();
+            const cuisine     = String(info.cuisine  || '').trim();
+            const time_min    = Number(info.time_min || 0);
+            const servings    = Number(info.servings || 0);
+            const ingredients = Array.isArray(info.ingredients) ? info.ingredients : [];
+            const results     = Array.isArray(info.results) ? info.results : [];
+            const hero        = name || (results[0]?.name) || 'Recipe';
+            const ingHtml = ingredients.slice(0, 5).map((ing, i) => {
+                const opacity = Math.max(0.12, 0.55 - i * 0.09);
+                const item = typeof ing === 'string' ? ing : String(ing.name || ing.item || ing);
+                return `<div class="recipe-ing-row" style="opacity:${opacity}">${escapeHtml(item.slice(0, 40))}</div>`;
+            }).join('');
+            const resHtml = !ingredients.length ? results.slice(0, 4).map((r, i) => {
+                const opacity = Math.max(0.12, 0.55 - i * 0.09);
+                return `<div class="recipe-ing-row" style="opacity:${opacity}">${escapeHtml(String(r.name || r.title || '').slice(0, 36))}</div>`;
+            }).join('') : '';
+            return `<div class="scene scene-recipe interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="recipe"></canvas>
+                <div class="recipe-shell">
+                    <div class="recipe-eyebrow">${[cuisine, time_min ? time_min + ' min' : '', servings ? servings + ' servings' : ''].filter(Boolean).join(' · ') || 'recipe'}</div>
+                    <div class="recipe-hero">${escapeHtml(hero)}</div>
+                    ${(ingHtml || resHtml) ? `<div class="recipe-ing-list">${ingHtml || resHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Grocery scene ──────────────────────────────────────────────────────
+        if (core.kind === 'grocery') {
+            const info   = core.info || {};
+            const items  = Array.isArray(info.items) ? info.items : [];
+            const done   = Number(info.done || items.filter(it => it.checked || it.done).length);
+            const total  = items.length;
+            const pct    = total > 0 ? Math.round((done / total) * 100) : 0;
+            const itemsHtml = items.slice(0, 6).map((it, i) => {
+                const opacity = Math.max(0.12, 0.55 - i * 0.08);
+                const checked = Boolean(it.checked || it.done);
+                const name    = String(it.name || it.item || it).slice(0, 32);
+                return `<div class="grocery-row ${checked ? 'grocery-row-done' : ''}" style="opacity:${opacity}">
+                    <span class="grocery-check">${checked ? '✓' : '·'}</span>
+                    <span class="grocery-name">${escapeHtml(name)}</span>
+                    ${it.qty ? `<span class="grocery-qty">${escapeHtml(String(it.qty))}</span>` : ''}
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-grocery interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="grocery"></canvas>
+                <div class="grocery-shell">
+                    <div class="grocery-eyebrow">grocery list · ${done}/${total} done</div>
+                    <div class="grocery-hero">${total} item${total !== 1 ? 's' : ''}</div>
+                    <div class="grocery-progress-bar"><div class="grocery-progress-fill" style="width:${pct}%"></div></div>
+                    ${itemsHtml ? `<div class="grocery-list">${itemsHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Translate scene ────────────────────────────────────────────────────
+        if (core.kind === 'translate') {
+            const info   = core.info || {};
+            const src    = String(info.src    || '').trim();
+            const result = String(info.result || '').trim();
+            const from   = String(info.from   || '').trim();
+            const to     = String(info.to     || '').trim();
+            return `<div class="scene scene-translate interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="translate"></canvas>
+                <div class="trans-shell">
+                    <div class="trans-eyebrow">${from && to ? escapeHtml(from + ' → ' + to) : 'translate'}</div>
+                    ${src    ? `<div class="trans-source">${escapeHtml(src.slice(0, 120))}</div>` : ''}
+                    ${result ? `<div class="trans-result">${escapeHtml(result.slice(0, 120))}</div>` : ''}
+                    ${!src && !result ? `<div class="trans-result">Translation ready</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── Books scene ────────────────────────────────────────────────────────
+        if (core.kind === 'book') {
+            const info     = core.info || {};
+            const title    = String(info.title  || '').trim();
+            const author   = String(info.author || '').trim();
+            const progress = Number(info.progress || 0);
+            const results  = Array.isArray(info.results) ? info.results : [];
+            const hero     = title || (results[0]?.title) || 'Books';
+            const resHtml  = !title ? results.slice(0, 4).map((r, i) => {
+                const opacity = Math.max(0.12, 0.55 - i * 0.09);
+                return `<div class="book-stream-item" style="opacity:${opacity}">
+                    <span class="book-stream-title">${escapeHtml(String(r.title || '').slice(0, 36))}</span>
+                    ${r.author ? `<span class="book-stream-author">${escapeHtml(String(r.author).slice(0, 24))}</span>` : ''}
+                </div>`;
+            }).join('') : '';
+            return `<div class="scene scene-book interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="book"></canvas>
+                <div class="book-shell">
+                    <div class="book-eyebrow">${author ? escapeHtml(author) : 'books'}</div>
+                    <div class="book-hero">${escapeHtml(hero)}</div>
+                    ${progress > 0 ? `<div class="book-progress-bar"><div class="book-progress-fill" style="width:${progress}%"></div></div><div class="book-pct">${progress}% complete</div>` : ''}
+                    ${resHtml ? `<div class="book-stream">${resHtml}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        // ── GitHub scene ──────────────────────────────────────────────────────
+        if (core.kind === 'github') {
+            const info  = core.info || {};
+            const items = Array.isArray(info.items) ? info.items : [];
+            const op    = String(info.op || '');
+            const repo  = String(info.repo || '');
+            if (op === 'github_issue_create') {
+                return `<div class="scene scene-enterprise interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ent-shell">
+                        <div class="ent-eyebrow">github · issue created</div>
+                        <div class="ent-hero">#${escapeHtml(String(info.number || '?'))}</div>
+                        ${info.title ? `<div class="ent-sub">${escapeHtml(String(info.title).slice(0,60))}</div>` : ''}
+                        ${repo ? `<div class="ent-meta">${escapeHtml(repo)}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+            const label = String(info.kind || 'prs') === 'issues' ? 'issues' : 'pull requests';
+            const rowsHtml = items.slice(0, 8).map((it, i) => {
+                const opacity = Math.max(0.12, 0.72 - i * 0.08);
+                const state = String(it.state || 'open');
+                return `<div class="ent-row" style="opacity:${opacity}">
+                    <span class="ent-row-num">#${escapeHtml(String(it.number || i+1))}</span>
+                    <span class="ent-row-title">${escapeHtml(String(it.title || '').slice(0,52))}</span>
+                    <span class="ent-row-state ent-state-${escapeAttr(state)}">${escapeHtml(state)}</span>
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-enterprise interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                <div class="scene-grid"></div>
+                <div class="ent-shell">
+                    <div class="ent-eyebrow">github · ${escapeHtml(label)}</div>
+                    <div class="ent-hero">${items.length} open</div>
+                    ${repo ? `<div class="ent-meta">${escapeHtml(repo)}</div>` : ''}
+                    <div class="ent-list">${rowsHtml || '<div class="ent-row"><span class="ent-row-title">No items found</span></div>'}</div>
+                </div>
+            </div>`;
+        }
+        // ── Jira scene ────────────────────────────────────────────────────────
+        if (core.kind === 'jira') {
+            const info   = core.info || {};
+            const issues = Array.isArray(info.issues) ? info.issues : [];
+            const op     = String(info.op || '');
+            if (op === 'jira_create' || op === 'jira_update') {
+                const label  = op === 'jira_create' ? 'issue created' : 'issue updated';
+                const key    = String(info.key || '?');
+                const detail = String(info.summary || info.status || '').slice(0, 60);
+                return `<div class="scene scene-enterprise interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ent-shell">
+                        <div class="ent-eyebrow">jira · ${escapeHtml(label)}</div>
+                        <div class="ent-hero">${escapeHtml(key)}</div>
+                        ${detail ? `<div class="ent-sub">${escapeHtml(detail)}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+            const priColor = (p) => {
+                const pl = (p || '').toLowerCase();
+                return pl === 'critical' || pl === 'highest' ? '#ff5555'
+                     : pl === 'high'   ? '#ff8844'
+                     : pl === 'medium' ? '#ffcc44'
+                     : 'rgba(170,187,204,0.7)';
+            };
+            const rowsHtml = issues.slice(0, 8).map((iss, i) => {
+                const opacity = Math.max(0.12, 0.72 - i * 0.08);
+                return `<div class="ent-row" style="opacity:${opacity}">
+                    <span class="ent-row-key" style="color:${priColor(iss.priority)}">${escapeHtml(iss.key || '?')}</span>
+                    <span class="ent-row-title">${escapeHtml(String(iss.summary || '').slice(0,48))}</span>
+                    <span class="ent-row-state">${escapeHtml(iss.status || '')}</span>
+                </div>`;
+            }).join('');
+            const view = String(info.view || 'my issues');
+            return `<div class="scene scene-enterprise interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                <div class="scene-grid"></div>
+                <div class="ent-shell">
+                    <div class="ent-eyebrow">jira · ${escapeHtml(view)}</div>
+                    <div class="ent-hero">${issues.length} issues</div>
+                    <div class="ent-list">${rowsHtml || '<div class="ent-row"><span class="ent-row-title">No issues</span></div>'}</div>
+                </div>
+            </div>`;
+        }
+        // ── Notion scene ──────────────────────────────────────────────────────
+        if (core.kind === 'notion') {
+            const info  = core.info || {};
+            const pages = Array.isArray(info.pages) ? info.pages : [];
+            const op    = String(info.op || '');
+            if (op === 'notion_create' || op === 'notion_update') {
+                const label = op === 'notion_create' ? 'page created' : 'page updated';
+                const title = String(info.title || '').slice(0, 60) || 'untitled';
+                return `<div class="scene scene-enterprise interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ent-shell">
+                        <div class="ent-eyebrow">notion · ${escapeHtml(label)}</div>
+                        <div class="ent-hero">${escapeHtml(title)}</div>
+                        <div class="ent-check">✓ saved</div>
+                    </div>
+                </div>`;
+            }
+            const rowsHtml = pages.slice(0, 8).map((p, i) => {
+                const opacity = Math.max(0.12, 0.72 - i * 0.08);
+                const icon = p.type === 'database' ? '▦' : '▢';
+                return `<div class="ent-row" style="opacity:${opacity}">
+                    <span class="ent-row-key">${icon}</span>
+                    <span class="ent-row-title">${escapeHtml(String(p.title || '').slice(0,52))}</span>
+                    <span class="ent-row-state">${escapeHtml(p.last_edited || '')}</span>
+                </div>`;
+            }).join('');
+            const query = String(info.query || '');
+            return `<div class="scene scene-enterprise interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                <div class="scene-grid"></div>
+                <div class="ent-shell">
+                    <div class="ent-eyebrow">notion · ${query ? escapeHtml('search: ' + query) : 'workspace'}</div>
+                    <div class="ent-hero">${pages.length} pages</div>
+                    <div class="ent-list">${rowsHtml || '<div class="ent-row"><span class="ent-row-title">No pages found</span></div>'}</div>
+                </div>
+            </div>`;
+        }
+        // ── Asana scene ───────────────────────────────────────────────────────
+        if (core.kind === 'asana') {
+            const info  = core.info || {};
+            const tasks = Array.isArray(info.tasks) ? info.tasks : [];
+            const op    = String(info.op || '');
+            if (op === 'asana_create' || op === 'asana_update') {
+                const label = op === 'asana_create' ? 'task created' : 'task updated';
+                const name  = String(info.name || '').slice(0, 60) || 'task';
+                return `<div class="scene scene-enterprise interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                    <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                    <div class="scene-grid"></div>
+                    <div class="ent-shell">
+                        <div class="ent-eyebrow">asana · ${escapeHtml(label)}</div>
+                        <div class="ent-hero">${escapeHtml(name)}</div>
+                        <div class="ent-check">✓ saved</div>
+                    </div>
+                </div>`;
+            }
+            const today = new Date().toISOString().slice(0, 10);
+            const open  = tasks.filter(t => !t.completed).length;
+            const rowsHtml = tasks.slice(0, 8).map((t, i) => {
+                const opacity  = Math.max(0.12, 0.72 - i * 0.08);
+                const check    = t.completed ? '✓' : '○';
+                const overdue  = t.due_on && t.due_on < today ? ' ent-overdue' : '';
+                return `<div class="ent-row${overdue}" style="opacity:${opacity}">
+                    <span class="ent-row-key">${check}</span>
+                    <span class="ent-row-title">${escapeHtml(String(t.name || '').slice(0,52))}</span>
+                    ${t.due_on ? `<span class="ent-row-state">${escapeHtml(t.due_on)}</span>` : ''}
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-enterprise interactive">
+                <canvas class="scene-canvas generic-canvas" data-scene="enterprise"></canvas>
+                <div class="scene-orb orb-a"></div><div class="scene-orb orb-c"></div>
+                <div class="scene-grid"></div>
+                <div class="ent-shell">
+                    <div class="ent-eyebrow">asana · my tasks</div>
+                    <div class="ent-hero">${open} open</div>
+                    <div class="ent-list">${rowsHtml || '<div class="ent-row"><span class="ent-row-title">No tasks</span></div>'}</div>
                 </div>
             </div>`;
         }
@@ -4063,6 +6223,25 @@ const UIEngine = {
         if (core.kind === 'calendar')     return 'Calendar + Time Context';
         if (core.kind === 'email')        return 'Email + Communication Layer';
         if (core.kind === 'content')      return 'Content Graph + Version History';
+        if (core.kind === 'smarthome') return 'Device Grid + Ambient State';
+        if (core.kind === 'travel')    return 'Itinerary + Transit Layer';
+        if (core.kind === 'payments')  return 'Transfer + Balance Flow';
+        if (core.kind === 'focus')     return 'Attention Mode + Block State';
+        if (core.kind === 'video')         return 'Stream + Playback State';
+        if (core.kind === 'food_delivery') return 'Order + Delivery Status';
+        if (core.kind === 'rideshare')     return 'Ride + Driver Handoff';
+        if (core.kind === 'camera')    return 'Viewfinder + Capture Mode';
+        if (core.kind === 'photos')    return 'Memory Grid + Recency';
+        if (core.kind === 'clock')     return 'Time + Interval State';
+        if (core.kind === 'recipe')    return 'Recipe + Ingredient Map';
+        if (core.kind === 'grocery')   return 'List + Completion Flow';
+        if (core.kind === 'translate') return 'Source + Translation Layer';
+        if (core.kind === 'book')      return 'Title + Reading Progress';
+        if (core.kind === 'github')    return 'Repo + PR Activity';
+        if (core.kind === 'jira')      return 'Issue Board + Priority';
+        if (core.kind === 'notion')    return 'Workspace + Pages';
+        if (core.kind === 'asana')     return 'Tasks + Project State';
+        if (core.kind === 'enterprise') return 'Enterprise + Integrations';
         const intent = String(envelope?.surfaceIntent?.raw || '').trim();
         return intent ? `Intent Lens: ${intent.slice(0, 48)}` : (latest.message || 'Intent + State');
     },
@@ -4119,12 +6298,71 @@ const UIEngine = {
         }
         if (core.kind === 'social') {
             const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const op = latest.op;
+            if (op === 'social_notifications') {
+                const items = Array.isArray(data.items) ? data.items : [];
+                return [
+                    { label: 'Unread', value: String(data.unread || 0), tone: 'accent' },
+                    { label: 'Total', value: String(items.length), tone: 'cool' },
+                    { label: 'Source', value: 'bluesky', tone: 'neutral' },
+                    { label: 'Mode', value: 'notifications', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_trending') {
+                const topics = Array.isArray(data.topics) ? data.topics : [];
+                return [
+                    { label: 'Topics', value: String(topics.length), tone: 'accent' },
+                    { label: 'Top', value: String(topics[0]?.topic || '—').slice(0, 24), tone: 'cool' },
+                    { label: 'Source', value: 'bluesky', tone: 'neutral' },
+                    { label: 'Mode', value: 'trending', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_profile_read') {
+                return [
+                    { label: 'Handle', value: String(data.handle || '—').slice(0, 24), tone: 'accent' },
+                    { label: 'Followers', value: Number(data.followersCount || 0).toLocaleString(), tone: 'cool' },
+                    { label: 'Posts', value: String(data.postsCount || 0), tone: 'neutral' },
+                    { label: 'Source', value: 'bluesky', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_dm_send') {
+                return [
+                    { label: 'To', value: String(data.recipient || '—').slice(0, 24), tone: 'accent' },
+                    { label: 'Delivery', value: 'sent', tone: 'cool' },
+                    { label: 'ConvoId', value: String(data.convoId || '—').slice(0, 16), tone: 'neutral' },
+                    { label: 'Source', value: 'bluesky', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_react') {
+                return [
+                    { label: 'Action', value: 'liked', tone: 'accent' },
+                    { label: 'Post', value: String(data.uri || '—').slice(0, 28), tone: 'cool' },
+                    { label: 'Source', value: 'bluesky', tone: 'neutral' },
+                    { label: 'Status', value: 'delivered', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_comment') {
+                return [
+                    { label: 'Action', value: 'replied', tone: 'accent' },
+                    { label: 'Post', value: String(data.uri || '—').slice(0, 28), tone: 'cool' },
+                    { label: 'Source', value: 'bluesky', tone: 'neutral' },
+                    { label: 'Status', value: 'delivered', tone: 'warm' },
+                ];
+            }
+            if (op === 'social_follow') {
+                return [
+                    { label: 'Action', value: String(data.action || 'followed'), tone: 'accent' },
+                    { label: 'Actor', value: String(data.actor || '—').slice(0, 24), tone: 'cool' },
+                    { label: 'Source', value: 'bluesky', tone: 'neutral' },
+                    { label: 'Status', value: 'delivered', tone: 'warm' },
+                ];
+            }
             const items = Array.isArray(data.items) ? data.items : [];
             return [
                 { label: 'Source', value: String(data.source || 'scaffold'), tone: 'accent' },
-                { label: 'Mode', value: latest.op === 'social_message_send' ? 'send' : 'feed', tone: 'neutral' },
+                { label: 'Mode', value: op === 'social_message_send' ? 'send' : 'feed', tone: 'neutral' },
                 { label: 'Items', value: String(items.length), tone: 'cool' },
-                { label: 'Delivery', value: String(data.delivery || (latest.op === 'social_message_send' ? 'queued' : 'n/a')), tone: 'warm' },
+                { label: 'Delivery', value: String(data.delivery || (op === 'social_message_send' ? 'queued' : 'n/a')), tone: 'warm' },
             ];
         }
         if (core.kind === 'banking') {
@@ -4209,6 +6447,215 @@ const UIEngine = {
                 { label: 'State', value: 'mapped', tone: 'warm' },
             ];
         }
+        if (core.kind === 'reference') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const op   = latest.op;
+            if (op === 'dict_define') {
+                const meanings = Array.isArray(data.meanings) ? data.meanings : [];
+                return [
+                    { label: 'Word', value: String(data.word || '—'), tone: 'accent' },
+                    { label: 'Phonetic', value: String(data.phonetic || '—'), tone: 'cool' },
+                    { label: 'Senses', value: String(meanings.length), tone: 'neutral' },
+                    { label: 'Source', value: 'wiktionary', tone: 'warm' },
+                ];
+            }
+            if (op === 'dict_etymology') {
+                return [
+                    { label: 'Word', value: String(data.word || '—'), tone: 'accent' },
+                    { label: 'Origin', value: String(data.origin || '—').slice(0, 28), tone: 'cool' },
+                    { label: 'Phonetic', value: String(data.phonetic || '—'), tone: 'neutral' },
+                    { label: 'Source', value: 'wiktionary', tone: 'warm' },
+                ];
+            }
+            if (op === 'dict_thesaurus') {
+                const syns = Array.isArray(data.synonyms) ? data.synonyms : [];
+                return [
+                    { label: 'Word', value: String(data.word || '—'), tone: 'accent' },
+                    { label: 'Synonyms', value: String(syns.length), tone: 'cool' },
+                    { label: 'Top', value: syns[0] || '—', tone: 'neutral' },
+                    { label: 'Source', value: 'datamuse', tone: 'warm' },
+                ];
+            }
+            if (op === 'dict_wikipedia') {
+                return [
+                    { label: 'Article', value: String(data.title || '—').slice(0, 24), tone: 'accent' },
+                    { label: 'Desc', value: String(data.description || '—').slice(0, 28), tone: 'cool' },
+                    { label: 'Source', value: 'wikipedia', tone: 'neutral' },
+                    { label: 'Mode', value: 'summary', tone: 'warm' },
+                ];
+            }
+            if (op === 'currency_rates') {
+                const major = (data.major && typeof data.major === 'object') ? data.major : {};
+                const eur = major.EUR ? Number(major.EUR).toFixed(3) : '—';
+                const gbp = major.GBP ? Number(major.GBP).toFixed(3) : '—';
+                return [
+                    { label: 'Base', value: String(data.base || 'USD'), tone: 'accent' },
+                    { label: 'EUR', value: eur, tone: 'cool' },
+                    { label: 'GBP', value: gbp, tone: 'neutral' },
+                    { label: 'Source', value: 'open.er-api', tone: 'warm' },
+                ];
+            }
+            if (op === 'currency_convert') {
+                return [
+                    { label: 'Result', value: `${Number(data.result||0).toLocaleString(undefined,{maximumFractionDigits:2})} ${data.to||''}`, tone: 'accent' },
+                    { label: 'From', value: `${data.amount||1} ${data.from||''}`, tone: 'cool' },
+                    { label: 'Rate', value: String(Number(data.rate||0).toFixed(4)), tone: 'neutral' },
+                    { label: 'Source', value: 'open.er-api', tone: 'warm' },
+                ];
+            }
+            if (op === 'unit_convert') {
+                return [
+                    { label: 'Result', value: `${data.result||0} ${data.to||''}`, tone: 'accent' },
+                    { label: 'From', value: `${data.value||1} ${data.from||''}`, tone: 'cool' },
+                    { label: 'Category', value: String(data.category || 'units'), tone: 'neutral' },
+                    { label: 'Mode', value: 'exact', tone: 'warm' },
+                ];
+            }
+            return [
+                { label: 'Query', value: String(data.word || data.query || data.title || '—').slice(0,24), tone: 'accent' },
+                { label: 'Source', value: 'reference', tone: 'cool' },
+                { label: 'Op', value: op, tone: 'neutral' },
+                { label: 'Status', value: 'ready', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'health') {
+            const data    = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const metrics = (data.metrics && typeof data.metrics === 'object') ? data.metrics : {};
+            const op      = latest.op;
+            const hero    = String(data.hero || '');
+            const sumLine = String(data.summary_line || '');
+            if (op === 'health_heart_rate') {
+                return [
+                    { label: 'Heart Rate', value: `${metrics.heart_rate || 0} bpm`, tone: 'accent' },
+                    { label: 'Resting', value: `${metrics.heart_rate_resting || 0} bpm`, tone: 'cool' },
+                    { label: 'HRV', value: `${metrics.hrv || 0} ms`, tone: 'neutral' },
+                    { label: 'Source', value: 'scaffold', tone: 'warm' },
+                ];
+            }
+            if (op === 'health_sleep') {
+                return [
+                    { label: 'Sleep', value: `${metrics.sleep_hours || 0}h`, tone: 'accent' },
+                    { label: 'Calories', value: `${metrics.calories || 0}`, tone: 'cool' },
+                    { label: 'Active', value: `${metrics.active_min || 0} min`, tone: 'neutral' },
+                    { label: 'Source', value: 'scaffold', tone: 'warm' },
+                ];
+            }
+            if (op === 'health_hrv') {
+                return [
+                    { label: 'HRV', value: `${metrics.hrv || 0} ms`, tone: 'accent' },
+                    { label: 'HR', value: `${metrics.heart_rate || 0} bpm`, tone: 'cool' },
+                    { label: 'Resting', value: `${metrics.heart_rate_resting || 0} bpm`, tone: 'neutral' },
+                    { label: 'Source', value: 'scaffold', tone: 'warm' },
+                ];
+            }
+            return [
+                { label: 'Metric', value: hero || 'activity', tone: 'accent' },
+                { label: 'Goal', value: sumLine || '—', tone: 'cool' },
+                { label: 'Streak', value: `${metrics.streak_days || 0} days`, tone: 'neutral' },
+                { label: 'Source', value: 'scaffold', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'clock') {
+            const data = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const op   = latest.op;
+            if (op === 'clock_world') {
+                const clocks = Array.isArray(data.clocks) ? data.clocks : [];
+                return [
+                    { label: 'Zones', value: String(clocks.length), tone: 'accent' },
+                    { label: 'Local', value: clocks[0]?.time || '—', tone: 'cool' },
+                    { label: 'UTC+0', value: clocks.find(c => c.zone?.includes('London'))?.time || '—', tone: 'neutral' },
+                    { label: 'Mode', value: 'world', tone: 'warm' },
+                ];
+            }
+            if (op === 'clock_bedtime') {
+                const beds = Array.isArray(data.bedtimes) ? data.bedtimes : [];
+                const best = beds[1] || beds[0] || {};
+                return [
+                    { label: 'Bedtime', value: best.time || '—', tone: 'accent' },
+                    { label: 'Cycles', value: String(best.cycles || 5), tone: 'cool' },
+                    { label: 'Duration', value: `${best.hours || 7.5}h`, tone: 'neutral' },
+                    { label: 'Wake', value: data.wake_time || '—', tone: 'warm' },
+                ];
+            }
+            if (['date_age','date_countdown','date_day_of','date_days_until'].includes(op)) {
+                const delta = data.delta_days != null ? Number(data.delta_days) : null;
+                return [
+                    { label: 'Result', value: String(data.day_name || (data.age_years != null ? `${data.age_years}y` : (delta != null ? `${Math.abs(delta)}d` : '—'))), tone: 'accent' },
+                    { label: 'Date', value: String(data.date || data.target || '—'), tone: 'cool' },
+                    { label: 'Op', value: op.replace('date_',''), tone: 'neutral' },
+                    { label: 'Mode', value: 'calc', tone: 'warm' },
+                ];
+            }
+            return [
+                { label: 'Mode', value: String(data.mode || 'timer'), tone: 'accent' },
+                { label: 'State', value: data.running ? 'running' : 'ready', tone: 'cool' },
+                { label: 'Label', value: String(data.label || '—'), tone: 'neutral' },
+                { label: 'Source', value: 'local', tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'github') {
+            const data  = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(data.items) ? data.items : [];
+            const op    = latest.op;
+            return [
+                { label: op === 'github_issue_create' ? 'Number' : 'Open',
+                  value: op === 'github_issue_create' ? `#${data.number || '?'}` : String(items.filter(i => i.state === 'open').length),
+                  tone: 'accent' },
+                { label: 'Repo',   value: String(data.repo || '—').slice(0, 24),    tone: 'cool'    },
+                { label: 'Source', value: String(data.source || 'scaffold'),         tone: 'neutral' },
+                { label: 'Mode',   value: String(data.kind || op.replace('github_','')), tone: 'warm' },
+            ];
+        }
+        if (core.kind === 'jira') {
+            const data   = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const issues = Array.isArray(data.issues) ? data.issues : [];
+            const op     = latest.op;
+            if (op === 'jira_create') {
+                return [
+                    { label: 'Key',     value: String(data.key || '?'),                  tone: 'accent'  },
+                    { label: 'Summary', value: String(data.summary || '—').slice(0, 24), tone: 'cool'    },
+                    { label: 'Source',  value: 'jira',                                   tone: 'neutral' },
+                    { label: 'Status',  value: 'created',                                tone: 'warm'    },
+                ];
+            }
+            const critical = issues.filter(i => (i.priority || '').toLowerCase() === 'critical').length;
+            return [
+                { label: 'Issues',   value: String(issues.length),                                  tone: 'accent'                    },
+                { label: 'Critical', value: String(critical),                                        tone: critical > 0 ? 'warm' : 'cool' },
+                { label: 'Source',   value: String(data.source || 'scaffold'),                       tone: 'neutral'                   },
+                { label: 'View',     value: String(data.view || 'my issues').replace(/_/g, ' '),    tone: 'cool'                      },
+            ];
+        }
+        if (core.kind === 'notion') {
+            const data  = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const pages = Array.isArray(data.pages) ? data.pages : [];
+            const op    = latest.op;
+            const dbs   = pages.filter(p => p.type === 'database').length;
+            return [
+                { label: op === 'notion_create' ? 'Status' : 'Pages',
+                  value: op === 'notion_create' ? 'created' : String(pages.length),       tone: 'accent'  },
+                { label: op === 'notion_create' ? 'Title' : 'Databases',
+                  value: op === 'notion_create' ? String(data.title || '—').slice(0, 20) : String(dbs), tone: 'cool' },
+                { label: 'Source', value: String(data.source || 'scaffold'),              tone: 'neutral' },
+                { label: 'Mode',   value: data.query ? 'search' : 'browse',               tone: 'warm'    },
+            ];
+        }
+        if (core.kind === 'asana') {
+            const data  = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+            const op    = latest.op;
+            const open  = tasks.filter(t => !t.completed).length;
+            const today = new Date().toISOString().slice(0, 10);
+            const overdue = tasks.filter(t => t.due_on && t.due_on < today).length;
+            return [
+                { label: op === 'asana_create' ? 'Status' : 'Open',
+                  value: op === 'asana_create' ? 'created' : String(open),               tone: 'accent'                       },
+                { label: op === 'asana_create' ? 'Task' : 'Total',
+                  value: op === 'asana_create' ? String(data.name || '—').slice(0, 20) : String(tasks.length), tone: 'cool' },
+                { label: 'Overdue', value: String(overdue), tone: overdue > 0 ? 'warm' : 'neutral' },
+                { label: 'Source',  value: String(data.source || 'scaffold'),             tone: 'cool'                         },
+            ];
+        }
         return [
             { label: 'Intent', value: String(envelope?.taskIntent?.operation || 'read'), tone: 'accent' },
             { label: 'Session', value: String(this.state.session.sessionId || '-').slice(0, 8), tone: 'neutral' },
@@ -4241,6 +6688,8 @@ const UIEngine = {
             this._sceneRenderer = this.makeExpensesRenderer(canvas);
         } else if (scene === 'notes') {
             this._sceneRenderer = this.makeNotesRenderer(canvas);
+        } else if (scene === 'connections') {
+            this._sceneRenderer = this.makeConnectionsRenderer(canvas);
         } else if (scene === 'graph') {
             this._sceneRenderer = this.makeGraphRenderer(canvas);
         } else if (scene === 'webdeck') {
@@ -4249,6 +6698,8 @@ const UIEngine = {
             this._sceneRenderer = this.makeMcpRenderer(canvas);
         } else if (scene === 'sports') {
             this._sceneRenderer = this.makeSportsRenderer(canvas);
+        } else if (scene === 'phone') {
+            this._sceneRenderer = this.makePhoneRenderer(canvas);
         } else if (['document','spreadsheet','presentation','code','terminal','calendar','email','content'].includes(scene)) {
             this._sceneRenderer = this.makeComputerRenderer(canvas);
         } else if (scene === 'music') {
@@ -4263,6 +6714,22 @@ const UIEngine = {
             this._sceneRenderer = this.makeTravelRenderer(canvas);
         } else if (scene === 'payments') {
             this._sceneRenderer = this.makePaymentsRenderer(canvas);
+        } else if (scene === 'network') {
+            this._sceneRenderer = this.makeNetworkRenderer(canvas);
+        } else if (scene === 'banking') {
+            this._sceneRenderer = this.makeBankingRenderer(canvas);
+        } else if (scene === 'contacts') {
+            this._sceneRenderer = this.makeContactsRenderer(canvas);
+        } else if (scene === 'location') {
+            this._sceneRenderer = this.makeLocationRenderer(canvas);
+        } else if (scene === 'social') {
+            this._sceneRenderer = this.makeSocialRenderer(canvas);
+        } else if (scene === 'telephony') {
+            this._sceneRenderer = this.makeTelephonyRenderer(canvas);
+        } else if (scene === 'reminders') {
+            this._sceneRenderer = this.makeRemindersRenderer(canvas);
+        } else if (scene === 'finance') {
+            this._sceneRenderer = this.makeFinanceRenderer(canvas);
         } else if (scene === 'focus') {
             this._sceneRenderer = this.makeFocusRenderer(canvas);
         } else if (['notifications','handoff','wallet','vpn','dictionary','password',
@@ -4270,7 +6737,7 @@ const UIEngine = {
                     'accessibility','shortcuts','currency','phone','camera',
                     'photos','food_delivery','rideshare','video','alarm','clock',
                     'podcast','recipe','grocery','translate','book',
-                    'enterprise'].includes(scene)) {
+                    'enterprise','github','jira','notion','asana'].includes(scene)) {
             this._sceneRenderer = this.makeComputerRenderer(canvas);
         } else {
             this._sceneRenderer = this.makeGenericRenderer(canvas);
@@ -4434,6 +6901,39 @@ const UIEngine = {
             ctx.fillRect(0, 0, w, h);
         };
     },
+    makePhoneRenderer(canvas) {
+        const ctx = canvas.getContext('2d');
+        let frame = 0;
+        const draw = () => {
+            const w = canvas.offsetWidth; const h = canvas.offsetHeight;
+            if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+            ctx.clearRect(0, 0, w, h);
+            // Radial pulse — warm ember tones
+            frame++;
+            const sceneEl = canvas.closest('[data-call-state]');
+            const state = String(sceneEl ? sceneEl.dataset.callState : 'ringing');
+            const baseAlpha = state === 'active' ? 0.18 : state === 'held' ? 0.09 : 0.13;
+            const pulse = Math.sin(frame * (state === 'ringing' ? 0.07 : 0.03)) * 0.5 + 0.5;
+            const r1 = w * (0.32 + pulse * 0.06);
+            const grad = ctx.createRadialGradient(w * 0.5, h * 0.38, 0, w * 0.5, h * 0.38, r1);
+            grad.addColorStop(0, `rgba(255,120,60,${(baseAlpha + pulse * 0.06).toFixed(3)})`);
+            grad.addColorStop(0.5, `rgba(200,80,40,${(baseAlpha * 0.5).toFixed(3)})`);
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, w, h);
+            // Thin ring
+            ctx.beginPath();
+            ctx.arc(w * 0.5, h * 0.38, r1 * (0.85 + pulse * 0.04), 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(255,160,100,${(0.10 + pulse * 0.08).toFixed(3)})`;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        };
+        let raf;
+        const loop = () => { draw(); raf = requestAnimationFrame(loop); };
+        loop();
+        return { stop: () => cancelAnimationFrame(raf) };
+    },
+
     makeComputerRenderer(canvas) {
         const scene = String(canvas.dataset.scene || 'document');
         const THEMES = {
@@ -5548,106 +8048,176 @@ const UIEngine = {
         return () => draw();
     },
 
+    makeConnectionsRenderer(canvas) {
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.004;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // Deep dark base
+            ctx.fillStyle = 'rgba(6, 8, 18, 1)';
+            ctx.fillRect(0, 0, w, h);
+            // Slow breathing ambient glow — blue-indigo
+            const pulse = 0.06 + Math.sin(t) * 0.025;
+            const amb = ctx.createRadialGradient(w * 0.38, h * 0.5, 0, w * 0.38, h * 0.5, w * 0.72);
+            amb.addColorStop(0, `rgba(60, 80, 200, ${pulse})`);
+            amb.addColorStop(0.5, `rgba(40, 55, 140, ${pulse * 0.4})`);
+            amb.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = amb;
+            ctx.fillRect(0, 0, w, h);
+            // Vignette
+            const vig = ctx.createRadialGradient(w * 0.5, h * 0.5, h * 0.1, w * 0.5, h * 0.5, w * 0.85);
+            vig.addColorStop(0, 'rgba(0,0,0,0)');
+            vig.addColorStop(1, 'rgba(0,0,0,0.72)');
+            ctx.fillStyle = vig;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
     makeTasksRenderer(canvas) {
         const open = Math.max(0, Number(canvas.dataset.open || 0));
         const done = Math.max(0, Number(canvas.dataset.done || 0));
         const total = Math.max(1, open + done);
-        const lanes = 10;
+        const completion = done / total;
         let t = 0;
         return () => {
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             const { dpr, w, h } = this.fitCanvas(canvas);
-            t += 0.013;
+            t += 0.010;
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
-            const bg = ctx.createLinearGradient(0, 0, 0, h);
-            bg.addColorStop(0, 'rgba(24, 55, 87, 0.22)');
-            bg.addColorStop(1, 'rgba(24, 55, 87, 0.03)');
+            // Base: deep dark, slightly warm at completion
+            const warm = completion;
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, `rgba(${8 + warm * 18 | 0}, ${14 + warm * 8 | 0}, ${28 - warm * 10 | 0}, 1)`);
+            bg.addColorStop(1, `rgba(4, 8, 18, 1)`);
             ctx.fillStyle = bg;
             ctx.fillRect(0, 0, w, h);
-            ctx.strokeStyle = 'rgba(24, 55, 87, 0.12)';
-            ctx.lineWidth = 1;
-            for (let i = 0; i <= lanes; i += 1) {
-                const y = Math.round((i / lanes) * h);
-                ctx.beginPath();
-                ctx.moveTo(0, y);
-                ctx.lineTo(w, y);
-                ctx.stroke();
+            // Progress bloom — fills from left, glows teal→gold based on completion
+            const sweep = Math.max(0.04, completion) * w;
+            const pulse = 0.5 + Math.sin(t * 1.4) * 0.12;
+            const r = Math.round(20 + completion * 220);
+            const g = Math.round(184 - completion * 80);
+            const b = Math.round(166 - completion * 120);
+            const bloom = ctx.createLinearGradient(0, 0, sweep * 1.4, 0);
+            bloom.addColorStop(0,   `rgba(${r},${g},${b},${0.28 + pulse * 0.12})`);
+            bloom.addColorStop(0.6, `rgba(${r},${g},${b},${0.10})`);
+            bloom.addColorStop(1,   `rgba(${r},${g},${b},0)`);
+            ctx.fillStyle = bloom;
+            ctx.fillRect(0, 0, Math.min(w, sweep * 1.8), h);
+            // Edge glow at sweep front
+            if (completion > 0.02 && completion < 0.99) {
+                const edge = ctx.createRadialGradient(sweep, h * 0.5, 0, sweep, h * 0.5, h * 0.55);
+                edge.addColorStop(0,   `rgba(${r},${g},${b},${0.22 + pulse * 0.1})`);
+                edge.addColorStop(1,   `rgba(${r},${g},${b},0)`);
+                ctx.fillStyle = edge;
+                ctx.fillRect(0, 0, w, h);
             }
-            const completion = done / total;
-            const sweep = Math.max(0.08, completion) * w;
-            const pulse = 0.2 + Math.sin(t * 2) * 0.08;
-            const grad = ctx.createLinearGradient(0, 0, sweep, 0);
-            grad.addColorStop(0, `rgba(20, 184, 166, ${0.18 + pulse})`);
-            grad.addColorStop(1, 'rgba(20, 184, 166, 0)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, sweep, h);
+            // Subtle horizontal scan lines
+            ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+            ctx.lineWidth = 1;
+            for (let y = 0; y < h; y += 32) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+            }
+            // Vignette
+            const vig = ctx.createRadialGradient(w * 0.5, h * 0.5, h * 0.2, w * 0.5, h * 0.5, w * 0.75);
+            vig.addColorStop(0, 'rgba(0,0,0,0)');
+            vig.addColorStop(1, 'rgba(0,0,0,0.5)');
+            ctx.fillStyle = vig;
+            ctx.fillRect(0, 0, w, h);
         };
     },
 
     makeExpensesRenderer(canvas) {
-        const total = Math.max(0, Number(canvas.dataset.total || 0));
-        const entries = Math.max(1, Number(canvas.dataset.items || 1));
-        const bars = Math.max(8, Math.min(22, entries * 2));
-        const amplitude = Math.min(1, total / 1500);
+        const totalVal = Math.max(0, Number(canvas.dataset.total || 0));
+        const entries  = Math.max(1, Number(canvas.dataset.items || 1));
+        const barCount = Math.max(12, Math.min(28, entries * 2));
+        const intensity = Math.min(1, totalVal / 2000);
         let t = 0;
         return () => {
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             const { dpr, w, h } = this.fitCanvas(canvas);
-            t += 0.02;
+            t += 0.016;
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
-            const bg = ctx.createLinearGradient(0, 0, 0, h);
-            bg.addColorStop(0, 'rgba(9, 94, 76, 0.18)');
-            bg.addColorStop(1, 'rgba(9, 94, 76, 0.03)');
-            ctx.fillStyle = bg;
+            // Deep green-black base
+            ctx.fillStyle = 'rgba(4, 14, 10, 1)';
             ctx.fillRect(0, 0, w, h);
-            const bw = w / (bars * 1.4);
-            for (let i = 0; i < bars; i += 1) {
-                const x = i * bw * 1.4 + 8;
-                const signal = (Math.sin(t + i * 0.38) + 1) / 2;
-                const hPct = 0.16 + signal * (0.42 + amplitude * 0.3);
-                const bh = Math.max(10, h * hPct);
-                const y = h - bh;
-                const alpha = 0.22 + signal * 0.3;
-                ctx.fillStyle = `rgba(16, 158, 129, ${alpha})`;
-                ctx.fillRect(x, y, bw, bh);
+            // Radial glow center-bottom
+            const glow = ctx.createRadialGradient(w * 0.5, h, 0, w * 0.5, h * 0.6, w * 0.7);
+            glow.addColorStop(0, `rgba(16, 158, 129, ${0.18 + intensity * 0.22})`);
+            glow.addColorStop(1, 'rgba(16, 158, 129, 0)');
+            ctx.fillStyle = glow;
+            ctx.fillRect(0, 0, w, h);
+            // Animated bars rising from bottom
+            const bw = (w - 16) / (barCount * 1.5);
+            for (let i = 0; i < barCount; i++) {
+                const x = 8 + i * bw * 1.5;
+                const signal = (Math.sin(t * 0.8 + i * 0.42) + 1) / 2;
+                const bh = h * (0.08 + signal * (0.55 + intensity * 0.3));
+                const alpha = 0.15 + signal * (0.3 + intensity * 0.2);
+                const g2 = ctx.createLinearGradient(0, h - bh, 0, h);
+                g2.addColorStop(0, `rgba(20, 200, 160, ${alpha})`);
+                g2.addColorStop(1, `rgba(8, 120, 90, ${alpha * 0.4})`);
+                ctx.fillStyle = g2;
+                ctx.fillRect(x, h - bh, bw, bh);
             }
+            // Vignette
+            const vig = ctx.createRadialGradient(w * 0.5, h * 0.4, h * 0.1, w * 0.5, h * 0.4, w * 0.8);
+            vig.addColorStop(0, 'rgba(0,0,0,0)');
+            vig.addColorStop(1, 'rgba(0,0,0,0.6)');
+            ctx.fillStyle = vig;
+            ctx.fillRect(0, 0, w, h);
         };
     },
 
     makeNotesRenderer(canvas) {
         const count = Math.max(1, Number(canvas.dataset.count || 1));
-        const particles = Array.from({ length: Math.min(36, 10 + count * 3) }, (_, i) => ({
-            x: ((i * 37) % 997) / 997,
-            y: ((i * 71) % 991) / 991,
-            s: 0.4 + ((i * 13) % 10) / 10,
-            p: i * 0.27,
+        // Slow-drifting particles — more particles = more notes
+        const particles = Array.from({ length: Math.min(60, 18 + count * 4) }, (_, i) => ({
+            x: ((i * 37 + 11) % 997) / 997,
+            y: ((i * 71 + 23) % 991) / 991,
+            r: 0.8 + ((i * 13) % 10) / 10 * 2.2,
+            p: i * 0.31,
+            speed: 0.006 + ((i * 7) % 10) / 10 * 0.006,
         }));
         let t = 0;
         return () => {
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             const { dpr, w, h } = this.fitCanvas(canvas);
-            t += 0.01;
+            t += 0.008;
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
-            const bg = ctx.createLinearGradient(0, 0, w, h);
-            bg.addColorStop(0, 'rgba(64, 82, 181, 0.16)');
-            bg.addColorStop(1, 'rgba(64, 82, 181, 0.02)');
-            ctx.fillStyle = bg;
+            // Deep indigo base
+            ctx.fillStyle = 'rgba(6, 8, 22, 1)';
             ctx.fillRect(0, 0, w, h);
+            // Ambient glow
+            const amb = ctx.createRadialGradient(w * 0.35, h * 0.4, 0, w * 0.35, h * 0.4, w * 0.65);
+            amb.addColorStop(0, 'rgba(80, 60, 200, 0.20)');
+            amb.addColorStop(1, 'rgba(80, 60, 200, 0)');
+            ctx.fillStyle = amb;
+            ctx.fillRect(0, 0, w, h);
+            // Particles — slow gentle drift
             particles.forEach((p, idx) => {
-                const x = (p.x * w + Math.sin(t + p.p) * 16) % (w + 20);
-                const y = (p.y * h + Math.cos(t * 1.1 + p.p) * 12) % (h + 20);
-                const alpha = 0.12 + ((Math.sin(t * 1.7 + idx) + 1) / 2) * 0.2;
-                ctx.fillStyle = `rgba(84, 106, 223, ${alpha})`;
+                const x = ((p.x * w + Math.sin(t * p.speed * 60 + p.p) * 22) % (w + 30) + w + 30) % (w + 30);
+                const y = ((p.y * h + Math.cos(t * p.speed * 55 + p.p) * 16) % (h + 30) + h + 30) % (h + 30);
+                const alpha = 0.15 + ((Math.sin(t * 1.2 + idx * 0.6) + 1) / 2) * 0.35;
+                ctx.fillStyle = `rgba(140, 120, 255, ${alpha})`;
                 ctx.beginPath();
-                ctx.arc(x, y, 2 + p.s * 3, 0, Math.PI * 2);
+                ctx.arc(x, y, p.r, 0, Math.PI * 2);
                 ctx.fill();
             });
+            // Vignette
+            const vig = ctx.createRadialGradient(w * 0.5, h * 0.45, h * 0.15, w * 0.5, h * 0.45, w * 0.75);
+            vig.addColorStop(0, 'rgba(0,0,0,0)');
+            vig.addColorStop(1, 'rgba(0,0,0,0.65)');
+            ctx.fillStyle = vig;
+            ctx.fillRect(0, 0, w, h);
         };
     },
 
@@ -6218,9 +8788,9 @@ const UIEngine = {
     },
 
     pushHistory(intent, envelope, execution, plan, plannerSource = 'local', kernelTrace = null, merge = null) {
-        this.state.history.push({
+        const entry = {
             intent,
-            summary: execution.message || plan.subtitle,
+            summary: execution?.message || plan?.subtitle || '',
             timestamp: Date.now(),
             envelope,
             executionSnapshot: execution ? JSON.parse(JSON.stringify(execution)) : null,
@@ -6228,12 +8798,23 @@ const UIEngine = {
             kernelTrace,
             merge,
             plannerSource,
-            memorySnapshot: JSON.parse(JSON.stringify(this.state.memory))
-        });
+            memorySnapshot: JSON.parse(JSON.stringify(this.state.memory)),
+            thumbnail: null
+        };
+        this.state.history.push(entry);
 
         if (this.state.history.length > HISTORY_LIMIT) this.state.history.shift();
         this.state.session.activeHistoryIndex = this.state.history.length - 1;
         this.updateHistoryReel();
+
+        // Async thumbnail: capture canvas after animation settles
+        setTimeout(() => {
+            const thumb = this._captureThumbnail();
+            if (thumb) {
+                entry.thumbnail = thumb;
+                this.updateHistoryReel();
+            }
+        }, 320);
     },
 
     stepHistory(delta) {
@@ -6267,10 +8848,36 @@ const UIEngine = {
         this.handleIntent(cmd);
     },
 
+    showHistoryReel() {
+        this.updateHistoryReel();
+        this.historyReel.classList.add('reel-visible');
+    },
+
+    hideHistoryReel() {
+        this.historyReel.classList.remove('reel-visible');
+    },
+
     updateHistoryReel() {
-        this.historyReel.innerHTML = this.state.history.map((entry, index) => `
-            <button class="history-node ${index === this.state.session.activeHistoryIndex ? 'active' : ''}" data-history-index="${index}" data-label="${escapeAttr(entry.intent)}" title="${escapeAttr(entry.summary)}"></button>
-        `).join('');
+        this.historyReel.innerHTML = this.state.history.map((entry, index) => {
+            const isActive = index === this.state.session.activeHistoryIndex;
+            const inner = entry.thumbnail
+                ? `<img src="${entry.thumbnail}" alt="" />`
+                : `<div class="history-node-placeholder">${escapeHtml(String(entry.intent || '').slice(0, 6))}</div>`;
+            return `<button class="history-node${isActive ? ' active' : ''}" data-history-index="${index}" title="${escapeAttr(entry.summary || entry.intent)}">
+                ${inner}
+                <div class="history-node-label">${escapeHtml(String(entry.intent || '').slice(0, 32))}</div>
+            </button>`;
+        }).join('');
+    },
+
+    _captureThumbnail() {
+        // For functional surfaces the canvas is hidden — use a solid color placeholder via bg
+        const canvas = this.container.querySelector('canvas.scene-canvas');
+        if (!canvas || canvas.offsetParent === null) return null; // hidden or detached
+        try {
+            if (canvas.width === 0 || canvas.height === 0) return null;
+            return canvas.toDataURL('image/jpeg', 0.4);
+        } catch (_) { return null; }
     },
 
     restoreFromHistory(index) {
@@ -6818,6 +9425,1226 @@ const UIEngine = {
             ctx.fillStyle = `rgba(160,200,255,${0.7 * breathe})`;
             ctx.fill();
         };
+    },
+
+    makeNetworkRenderer(canvas) {
+        // Mesh network scene — dark void with slow travelling signal nodes
+        // and faint edge lines, evoking a P2P gossip network topology.
+        let t = 0;
+        const nodes = Array.from({ length: 14 }, () => ({
+            x: 0.1 + 0.8 * Math.random(),
+            y: 0.1 + 0.8 * Math.random(),
+            vx: (Math.random() - 0.5) * 0.0006,
+            vy: (Math.random() - 0.5) * 0.0006,
+            r: 3 + Math.random() * 4,
+            phase: Math.random() * Math.PI * 2,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.004;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.fillStyle = '#04070f';
+            ctx.fillRect(0, 0, w, h);
+            // Update node positions (wrap)
+            for (const n of nodes) {
+                n.x = ((n.x + n.vx) + 1) % 1;
+                n.y = ((n.y + n.vy) + 1) % 1;
+            }
+            // Draw edges between nearby nodes
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    const dx = (nodes[i].x - nodes[j].x) * w;
+                    const dy = (nodes[i].y - nodes[j].y) * h;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < 180) {
+                        const alpha = (1 - dist / 180) * 0.18;
+                        ctx.beginPath();
+                        ctx.moveTo(nodes[i].x * w, nodes[i].y * h);
+                        ctx.lineTo(nodes[j].x * w, nodes[j].y * h);
+                        ctx.strokeStyle = `rgba(60,160,255,${alpha})`;
+                        ctx.lineWidth = 0.8;
+                        ctx.stroke();
+                    }
+                }
+            }
+            // Draw nodes
+            for (const n of nodes) {
+                const pulse = 0.7 + 0.3 * Math.sin(t * 1.2 + n.phase);
+                const grd = ctx.createRadialGradient(n.x * w, n.y * h, 0, n.x * w, n.y * h, n.r * 3);
+                grd.addColorStop(0, `rgba(80,180,255,${0.6 * pulse})`);
+                grd.addColorStop(1, 'rgba(40,100,200,0)');
+                ctx.fillStyle = grd;
+                ctx.beginPath();
+                ctx.arc(n.x * w, n.y * h, n.r * 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(n.x * w, n.y * h, n.r * pulse, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(140,210,255,${0.85 * pulse})`;
+                ctx.fill();
+            }
+        };
+    },
+
+    makeBankingRenderer(canvas) {
+        // Dark navy with a slowly scrolling candlestick/bar chart and a
+        // faint grid — financial terminal atmosphere.
+        let t = 0;
+        const bars = Array.from({ length: 28 }, (_, i) => ({
+            v: 0.25 + 0.55 * Math.random(),
+            up: Math.random() > 0.45,
+            phase: i * 0.38,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.004;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // Background
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#020b14');
+            bg.addColorStop(1, '#030f1c');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Horizontal grid lines
+            for (let g = 1; g < 5; g++) {
+                const y = h * g / 5;
+                ctx.beginPath();
+                ctx.moveTo(0, y); ctx.lineTo(w, y);
+                ctx.strokeStyle = 'rgba(60,120,200,0.08)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+            // Bar chart — scrolls slightly right-to-left
+            const barW = w / bars.length;
+            const scroll = (t * 18) % barW;
+            for (let i = 0; i < bars.length; i++) {
+                const bar = bars[i];
+                const x = i * barW - scroll + barW;
+                const bh = bar.v * h * 0.55;
+                const y = h * 0.75 - bh;
+                const wave = 0.92 + 0.08 * Math.sin(t * 0.6 + bar.phase);
+                const color = bar.up ? `rgba(40,200,120,${0.55 * wave})` : `rgba(220,70,70,${0.5 * wave})`;
+                ctx.fillStyle = color;
+                ctx.fillRect(x + 1, y, barW - 3, bh);
+                // Wick
+                ctx.strokeStyle = bar.up ? `rgba(40,200,120,${0.4 * wave})` : `rgba(220,70,70,${0.35 * wave})`;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(x + barW / 2, y - 6);
+                ctx.lineTo(x + barW / 2, y + bh + 6);
+                ctx.stroke();
+            }
+            // Accent glow at bottom-left
+            const grd = ctx.createRadialGradient(0, h, 0, 0, h, w * 0.5);
+            grd.addColorStop(0, 'rgba(20,100,200,0.12)');
+            grd.addColorStop(1, 'rgba(20,100,200,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
+    makeContactsRenderer(canvas) {
+        // Warm charcoal with avatar-orbs orbiting a central hub — people network.
+        let t = 0;
+        const orbs = Array.from({ length: 8 }, (_, i) => ({
+            angle: (i / 8) * Math.PI * 2,
+            radius: 0.22 + 0.12 * (i % 3) / 2,
+            speed: 0.0004 + 0.0002 * (i % 3),
+            r: 6 + (i % 3) * 3,
+            hue: 20 + i * 30,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.006;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.fillStyle = '#0c0b0f';
+            ctx.fillRect(0, 0, w, h);
+            const cx = w * 0.5, cy = h * 0.44;
+            // Hub glow
+            const hubGrd = ctx.createRadialGradient(cx, cy, 0, cx, cy, 60);
+            hubGrd.addColorStop(0, 'rgba(255,180,100,0.18)');
+            hubGrd.addColorStop(1, 'rgba(255,140,60,0)');
+            ctx.fillStyle = hubGrd;
+            ctx.fillRect(0, 0, w, h);
+            // Hub dot
+            ctx.beginPath();
+            ctx.arc(cx, cy, 8, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255,200,140,0.8)';
+            ctx.fill();
+            // Orbiting avatar orbs
+            for (const orb of orbs) {
+                orb.angle += orb.speed;
+                const ox = cx + Math.cos(orb.angle) * orb.radius * Math.min(w, h);
+                const oy = cy + Math.sin(orb.angle) * orb.radius * Math.min(w, h) * 0.6;
+                // Connection line
+                ctx.beginPath();
+                ctx.moveTo(cx, cy); ctx.lineTo(ox, oy);
+                ctx.strokeStyle = `hsla(${orb.hue},60%,65%,0.12)`;
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                // Orb glow
+                const orbGrd = ctx.createRadialGradient(ox, oy, 0, ox, oy, orb.r * 3);
+                orbGrd.addColorStop(0, `hsla(${orb.hue},70%,70%,0.5)`);
+                orbGrd.addColorStop(1, `hsla(${orb.hue},60%,60%,0)`);
+                ctx.fillStyle = orbGrd;
+                ctx.beginPath();
+                ctx.arc(ox, oy, orb.r * 3, 0, Math.PI * 2);
+                ctx.fill();
+                // Orb dot
+                ctx.beginPath();
+                ctx.arc(ox, oy, orb.r, 0, Math.PI * 2);
+                ctx.fillStyle = `hsla(${orb.hue},75%,72%,0.85)`;
+                ctx.fill();
+            }
+        };
+    },
+
+    makeLocationRenderer(canvas) {
+        // Midnight blue with a pulsing pin at center and radiating range rings.
+        let t = 0;
+        const particles = Array.from({ length: 30 }, () => ({
+            x: Math.random(), y: Math.random(),
+            vx: (Math.random() - 0.5) * 0.0003,
+            vy: (Math.random() - 0.5) * 0.0003,
+            a: 0.05 + Math.random() * 0.12,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.008;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#010814');
+            bg.addColorStop(1, '#020c1c');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            const cx = w * 0.5, cy = h * 0.42;
+            // Radiating range rings
+            for (let ring = 0; ring < 5; ring++) {
+                const prog = ((t * 0.35 + ring * 0.2) % 1);
+                const radius = 30 + prog * Math.min(w, h) * 0.45;
+                const alpha = (1 - prog) * 0.22;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(60,180,255,${alpha})`;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+            // Particles (map points)
+            for (const p of particles) {
+                p.x = ((p.x + p.vx) + 1) % 1;
+                p.y = ((p.y + p.vy) + 1) % 1;
+                ctx.beginPath();
+                ctx.arc(p.x * w, p.y * h, 1.5, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(100,200,255,${p.a})`;
+                ctx.fill();
+            }
+            // Pin glow
+            const pinGrd = ctx.createRadialGradient(cx, cy, 0, cx, cy, 50);
+            pinGrd.addColorStop(0, 'rgba(60,180,255,0.35)');
+            pinGrd.addColorStop(1, 'rgba(30,120,220,0)');
+            ctx.fillStyle = pinGrd;
+            ctx.fillRect(0, 0, w, h);
+            // Pin shape
+            const pulse = 0.88 + 0.12 * Math.sin(t * 1.4);
+            ctx.beginPath();
+            ctx.arc(cx, cy - 4, 10 * pulse, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(80,200,255,${0.85 * pulse})`;
+            ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(cx, cy + 14 * pulse);
+            ctx.lineTo(cx - 7 * pulse, cy - 2 * pulse);
+            ctx.lineTo(cx + 7 * pulse, cy - 2 * pulse);
+            ctx.closePath();
+            ctx.fillStyle = `rgba(80,200,255,${0.7 * pulse})`;
+            ctx.fill();
+        };
+    },
+
+    makeSocialRenderer(canvas) {
+        // Deep indigo with a flowing feed-wave and orbiting reaction sparks.
+        let t = 0;
+        const sparks = Array.from({ length: 18 }, (_, i) => ({
+            x: Math.random(), y: Math.random(),
+            vx: (Math.random() - 0.5) * 0.0005,
+            vy: -0.0004 - Math.random() * 0.0004,
+            r: 1.5 + Math.random() * 2.5,
+            hue: [340, 30, 200, 140, 280][i % 5],
+            phase: Math.random() * Math.PI * 2,
+        }));
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.007;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w * 0.4, h);
+            bg.addColorStop(0, '#08040f');
+            bg.addColorStop(1, '#0c0618');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Feed wave lines
+            for (let row = 0; row < 4; row++) {
+                const y = h * (0.25 + row * 0.15);
+                const amp = 4 + row;
+                ctx.beginPath();
+                for (let x = 0; x <= w; x += 4) {
+                    const wy = y + amp * Math.sin((x / w) * 6 + t * 1.2 + row);
+                    x === 0 ? ctx.moveTo(x, wy) : ctx.lineTo(x, wy);
+                }
+                ctx.strokeStyle = `rgba(160,100,255,${0.06 + 0.03 * row})`;
+                ctx.lineWidth = 1.2;
+                ctx.stroke();
+            }
+            // Accent glow
+            const grd = ctx.createRadialGradient(w * 0.3, h * 0.4, 0, w * 0.3, h * 0.4, w * 0.4);
+            grd.addColorStop(0, 'rgba(140,80,255,0.1)');
+            grd.addColorStop(1, 'rgba(100,40,200,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+            // Reaction sparks drifting upward
+            for (const s of sparks) {
+                s.x = ((s.x + s.vx) + 1) % 1;
+                s.y = ((s.y + s.vy) + 1) % 1;
+                const alpha = 0.5 + 0.4 * Math.sin(t * 1.5 + s.phase);
+                const grd2 = ctx.createRadialGradient(s.x * w, s.y * h, 0, s.x * w, s.y * h, s.r * 2.5);
+                grd2.addColorStop(0, `hsla(${s.hue},80%,72%,${alpha})`);
+                grd2.addColorStop(1, `hsla(${s.hue},70%,60%,0)`);
+                ctx.fillStyle = grd2;
+                ctx.beginPath();
+                ctx.arc(s.x * w, s.y * h, s.r * 2.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        };
+    },
+
+    makeTelephonyRenderer(canvas) {
+        // Deep charcoal with a live soundwave radiating from center — call signal.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.012;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.fillStyle = '#080a0c';
+            ctx.fillRect(0, 0, w, h);
+            const cx = w * 0.5, cy = h * 0.44;
+            // Call rings radiating outward
+            for (let ring = 0; ring < 6; ring++) {
+                const prog = ((t * 0.4 + ring / 6) % 1);
+                const radius = 18 + prog * Math.min(w, h) * 0.42;
+                const alpha = (1 - prog) * 0.28;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(80,220,140,${alpha})`;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+            // Soundwave bars either side of center
+            const bars = 14;
+            const barSpan = w * 0.28;
+            for (let i = 0; i < bars; i++) {
+                const x = cx - barSpan + (i / (bars - 1)) * barSpan * 2;
+                const amp = 0.5 + 0.5 * Math.sin(t * 4 + i * 0.7 + Math.sin(t * 2 + i * 0.3));
+                const bh = 6 + amp * 28;
+                const alpha = 0.35 + 0.35 * amp;
+                ctx.fillStyle = `rgba(60,220,130,${alpha})`;
+                ctx.fillRect(x - 2, cy - bh / 2, 4, bh);
+            }
+            // Center glow
+            const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, 45);
+            grd.addColorStop(0, 'rgba(60,220,130,0.22)');
+            grd.addColorStop(1, 'rgba(40,180,100,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
+    makeRemindersRenderer(canvas) {
+        // Dark olive-green with an analog clock face and gentle glow rings
+        // for each pending reminder.
+        let t = 0;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.005;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, 0, h);
+            bg.addColorStop(0, '#050a06');
+            bg.addColorStop(1, '#070d07');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            const cx = w * 0.5, cy = h * 0.44;
+            const R = Math.min(w, h) * 0.22;
+            // Outer glow ring
+            const grd = ctx.createRadialGradient(cx, cy, R * 0.7, cx, cy, R * 1.6);
+            grd.addColorStop(0, 'rgba(120,200,100,0.08)');
+            grd.addColorStop(1, 'rgba(80,160,70,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+            // Clock face ring
+            ctx.beginPath();
+            ctx.arc(cx, cy, R, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(100,180,80,0.25)';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            // Hour ticks
+            for (let tick = 0; tick < 12; tick++) {
+                const angle = (tick / 12) * Math.PI * 2 - Math.PI / 2;
+                const isMain = tick % 3 === 0;
+                const r0 = isMain ? R * 0.85 : R * 0.9;
+                ctx.beginPath();
+                ctx.moveTo(cx + Math.cos(angle) * r0, cy + Math.sin(angle) * r0);
+                ctx.lineTo(cx + Math.cos(angle) * R, cy + Math.sin(angle) * R);
+                ctx.strokeStyle = `rgba(120,200,90,${isMain ? 0.4 : 0.2})`;
+                ctx.lineWidth = isMain ? 2 : 1;
+                ctx.stroke();
+            }
+            // Animated hands (wall-clock driven by t for smoothness)
+            const nowS = t * 60; // fake seconds from t
+            const minAngle = (nowS / 60) * Math.PI * 2 - Math.PI / 2;
+            const hrAngle = (nowS / 720) * Math.PI * 2 - Math.PI / 2;
+            // Minute hand
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(cx + Math.cos(minAngle) * R * 0.78, cy + Math.sin(minAngle) * R * 0.78);
+            ctx.strokeStyle = 'rgba(140,220,100,0.7)';
+            ctx.lineWidth = 2;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+            // Hour hand
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(cx + Math.cos(hrAngle) * R * 0.5, cy + Math.sin(hrAngle) * R * 0.5);
+            ctx.strokeStyle = 'rgba(140,220,100,0.55)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            ctx.lineCap = 'butt';
+            // Center dot
+            ctx.beginPath();
+            ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(160,240,120,0.85)';
+            ctx.fill();
+        };
+    },
+
+    makeFinanceRenderer(canvas) {
+        // Dark navy with a scrolling line chart and candlestick-style
+        // price action — portfolio / market atmosphere.
+        let t = 0;
+        const points = Array.from({ length: 60 }, (_, i) => {
+            let v = 0.5;
+            return { v: (v += (Math.random() - 0.48) * 0.08), i };
+        });
+        // Normalize
+        const min = Math.min(...points.map(p => p.v));
+        const max = Math.max(...points.map(p => p.v));
+        const rng = max - min || 1;
+        for (const p of points) p.v = (p.v - min) / rng;
+        return () => {
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const { dpr, w, h } = this.fitCanvas(canvas);
+            t += 0.003;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            const bg = ctx.createLinearGradient(0, 0, w, h);
+            bg.addColorStop(0, '#02080f');
+            bg.addColorStop(1, '#020c16');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, w, h);
+            // Grid
+            for (let g = 1; g < 4; g++) {
+                ctx.beginPath();
+                ctx.moveTo(0, h * g / 4); ctx.lineTo(w, h * g / 4);
+                ctx.strokeStyle = 'rgba(40,100,180,0.07)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+            // Scrolling line chart
+            const scroll = (t * 12) % (w / points.length);
+            const step = w / (points.length - 1);
+            const chartTop = h * 0.15, chartH = h * 0.55;
+            // Area fill
+            ctx.beginPath();
+            ctx.moveTo(-scroll, chartTop + chartH);
+            for (let i = 0; i < points.length; i++) {
+                const x = i * step - scroll;
+                const y = chartTop + (1 - points[i].v) * chartH;
+                i === 0 ? ctx.lineTo(x, y) : ctx.lineTo(x, y);
+            }
+            ctx.lineTo((points.length - 1) * step - scroll, chartTop + chartH);
+            ctx.closePath();
+            const areaGrd = ctx.createLinearGradient(0, chartTop, 0, chartTop + chartH);
+            areaGrd.addColorStop(0, 'rgba(50,180,120,0.18)');
+            areaGrd.addColorStop(1, 'rgba(30,120,80,0)');
+            ctx.fillStyle = areaGrd;
+            ctx.fill();
+            // Line
+            ctx.beginPath();
+            for (let i = 0; i < points.length; i++) {
+                const x = i * step - scroll;
+                const y = chartTop + (1 - points[i].v) * chartH;
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = 'rgba(60,210,130,0.65)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            // Accent glow lower-right
+            const grd = ctx.createRadialGradient(w, h, 0, w, h, w * 0.6);
+            grd.addColorStop(0, 'rgba(30,100,200,0.1)');
+            grd.addColorStop(1, 'rgba(20,80,160,0)');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, w, h);
+        };
+    },
+
+    // ── Mesh: auto-join local network + notification badge ───────────────────
+
+    async _initNetworkMesh() {
+        if (this._meshInitDone) return;
+        this._meshInitDone = true;
+        try {
+            // Auto-join public_local (derives geohash from IP on backend)
+            await fetch('/api/networks/join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ networkType: 'public_local', label: 'Local' }),
+            });
+        } catch (_) { /* non-fatal */ }
+        // Start background poll every 30s
+        this._pollNetworkMessages();
+        this._meshPollInterval = setInterval(() => this._pollNetworkMessages(), 30000);
+    },
+
+    async _pollNetworkMessages() {
+        try {
+            const res = await fetch('/api/networks');
+            if (!res.ok) return;
+            const data = await res.json();
+            const networks = Array.isArray(data.networks) ? data.networks : [];
+            let totalNew = 0;
+            for (const net of networks) {
+                const topic = net.topic;
+                if (!topic) continue;
+                const msgRes = await fetch(`/api/networks/messages?topic=${encodeURIComponent(topic)}`);
+                if (!msgRes.ok) continue;
+                const msgData = await msgRes.json();
+                const msgs = Array.isArray(msgData.messages) ? msgData.messages : [];
+                const lastSeen = this._meshLastSeen?.[topic] || 0;
+                const newCount = msgs.filter(m => (m.receivedAt || 0) > lastSeen).length;
+                totalNew += newCount;
+                if (msgs.length) {
+                    const latest = msgs[msgs.length - 1];
+                    if (!this._meshLastSeen) this._meshLastSeen = {};
+                    this._meshLastSeen[topic] = latest.receivedAt || Date.now();
+                }
+            }
+            this._updateMeshBadge(totalNew);
+        } catch (_) { /* non-fatal */ }
+    },
+
+    _updateMeshBadge(count) {
+        let badge = document.getElementById('genome-mesh-badge');
+        if (!badge) {
+            badge = document.createElement('button');
+            badge.id = 'genome-mesh-badge';
+            badge.type = 'button';
+            badge.title = 'Genome Mesh';
+            badge.setAttribute('aria-label', 'Open Genome Mesh');
+            badge.addEventListener('click', () => {
+                this.input.value = 'show local mesh';
+                this.handleSubmit();
+            });
+            document.body.appendChild(badge);
+        }
+        badge.className = 'mesh-badge' + (count > 0 ? ' mesh-badge--active' : '');
+        badge.innerHTML = count > 0
+            ? `<span class="mesh-badge-icon">◉</span><span class="mesh-badge-count">${count}</span>`
+            : `<span class="mesh-badge-icon">◉</span>`;
+    },
+
+    // ─── Functional Surfaces ────────────────────────────────────────────────
+
+    _showConfirm(remote, originalIntent) {
+        this._dismissConfirm(); // clear any existing
+        const summary = remote.summary || remote.confirmSummary || remote.message || 'This action requires confirmation.';
+        const op = remote.op || remote.confirmOp || '';
+        const overlay = document.createElement('div');
+        overlay.className = 'confirm-overlay';
+        overlay.id = 'genome-confirm-overlay';
+        overlay.innerHTML = `
+            <div class="confirm-card">
+                <div class="confirm-icon">⚠️</div>
+                <div class="confirm-title">Confirm Action</div>
+                <div class="confirm-summary">${escapeHtml(summary)}</div>
+                ${op ? `<div class="confirm-summary" style="font-size:12px;font-family:monospace;opacity:0.6">${escapeHtml(op)}</div>` : ''}
+                <div class="confirm-actions">
+                    <button class="confirm-cancel" id="confirm-cancel-btn">Cancel</button>
+                    <button class="confirm-approve" id="confirm-approve-btn">Approve</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        document.getElementById('confirm-cancel-btn').addEventListener('click', () => {
+            SoundEngine.click();
+            this._dismissConfirm();
+        });
+        document.getElementById('confirm-approve-btn').addEventListener('click', () => {
+            SoundEngine.click();
+            this._dismissConfirm();
+            // Re-submit with confirmed flag appended to body via extras
+            this._processTurnConfirmed(originalIntent);
+        });
+    },
+
+    _dismissConfirm() {
+        document.getElementById('genome-confirm-overlay')?.remove();
+    },
+
+    async _processTurnConfirmed(text) {
+        this.container.classList.add('refracting');
+        this.inputContainer.classList.add('active-intent');
+        const startTime = performance.now();
+        try {
+            this.state.session.isApplyingLocalTurn = true;
+            const activeSurface = this.state.activeSurface;
+            const activeContent = activeSurface?.getData
+                ? { domain: activeSurface.domain, name: activeSurface.name, data: activeSurface.getData() }
+                : null;
+            const remote = await RemoteTurnService.process(
+                text,
+                this.state.session.sessionId,
+                this.state.session.revision,
+                this.state.session.deviceId,
+                'rebase_if_commutative',
+                `${this.state.session.deviceId}:${Date.now().toString(36)}:c`,
+                activeContent,
+                true // confirmed
+            );
+            const domain = remote.envelope?.uiIntent?.kind || '';
+            if (domain) SemanticCache.invalidate(domain);
+            this.state.memory = remote.memory || this.state.memory;
+            const envelope = remote.envelope;
+            const execution = remote.execution;
+            const kernelTrace = remote.kernelTrace || this.deriveKernelTrace(execution, remote.route);
+            const safePlan = UIPlanSchema.normalize(remote.plan);
+            this.state.session.sessionId = remote.sessionId || this.state.session.sessionId;
+            this.state.session.revision = Number(remote.revision || this.state.session.revision);
+            this.state.session.lastEnvelope = envelope;
+            this.state.session.lastExecution = execution;
+            this.state.session.lastKernelTrace = kernelTrace;
+            this.render(safePlan, envelope, kernelTrace);
+            SoundEngine.transition();
+            this.pushHistory(text, envelope, execution, safePlan, 'confirmed', kernelTrace, null);
+            this.state.metrics.latency = Math.round(performance.now() - startTime);
+            this.updateStatus(execution.ok ? 'STABLE:CONFIRMED' : 'NEEDS INPUT');
+            this.showToast(execution.message || 'Action confirmed.', execution.ok ? 'ok' : 'warn');
+            this.saveState();
+        } catch (err) {
+            SoundEngine.error();
+            this.showToast('Confirmed action failed.', 'warn', 3000);
+            this.handleTransportFailure('turn', err);
+        } finally {
+            this.state.session.isApplyingLocalTurn = false;
+            this.container.classList.remove('refracting');
+            this.inputContainer.classList.remove('active-intent');
+        }
+    },
+
+    _applyUpdatedContent(updatedContent) {
+        const surf = this.state.activeSurface;
+        if (!surf) return;
+        if (surf.domain === 'document') {
+            const body = this.container.querySelector('[data-func-domain="document"]');
+            if (body && typeof updatedContent === 'string') {
+                // Preserve cursor position around the update
+                const sel = window.getSelection();
+                const hadFocus = body.contains(sel?.anchorNode);
+                body.innerHTML = updatedContent;
+                if (hadFocus) body.focus();
+                this._contentSave(surf.domain, surf.name, updatedContent);
+            }
+        } else if (surf.domain === 'spreadsheet') {
+            const table = this.container.querySelector('[data-func-domain="spreadsheet"]');
+            if (table && typeof updatedContent === 'object') {
+                for (const [id, raw] of Object.entries(updatedContent)) {
+                    const td = table.querySelector(`td[data-cell="${id}"]`);
+                    if (td) { td.textContent = raw; }
+                }
+            }
+        } else if (surf.domain === 'code') {
+            const textarea = this.container.querySelector('.func-code-textarea');
+            if (textarea && typeof updatedContent === 'string') {
+                textarea.value = updatedContent;
+                this._contentSave(surf.domain, surf.name, updatedContent);
+            }
+        } else if (surf.domain === 'presentation') {
+            const slide = this.container.querySelector('[data-func-domain="presentation"]');
+            if (slide && typeof updatedContent === 'string') {
+                slide.innerHTML = updatedContent;
+            }
+        }
+    },
+
+    _initFunctionalSurfaces() {
+        // Tear down previous surface (clear auto-save timer, etc.)
+        if (this.state.activeSurface?.cleanup) this.state.activeSurface.cleanup();
+        this.state.activeSurface = null;
+
+        const docBody = this.container.querySelector('[data-func-domain="document"]');
+        if (docBody) { this._initDocumentSurface(docBody); return; }
+
+        const sheet = this.container.querySelector('[data-func-domain="spreadsheet"]');
+        if (sheet) { this._initSpreadsheetSurface(sheet); return; }
+
+        const codeWrap = this.container.querySelector('[data-func-domain="code"]');
+        if (codeWrap) { this._initCodeSurface(codeWrap); return; }
+
+        const termInput = this.container.querySelector('[data-terminal-input]');
+        if (termInput) { this._initTerminalSurface(termInput); return; }
+
+        const presSlide = this.container.querySelector('[data-func-domain="presentation"]');
+        if (presSlide) { this._initPresentationSurface(presSlide); return; }
+
+        const phoneEl = this.container.querySelector('[data-func-domain="telephony"]');
+        if (phoneEl) { this._initTelephonySurface(phoneEl); return; }
+    },
+
+    _initTelephonySurface(el) {
+        const callSid = String(el.dataset.callSid || '').trim();
+        if (!callSid) return;
+
+        const badge = el.querySelector('.phone-state-badge');
+        const timerEl = el.querySelector('.phone-timer');
+        const hangupBtn = el.querySelector('.phone-btn-hangup');
+        const holdBtn = el.querySelector('.phone-btn-hold');
+        const muteBtn = el.querySelector('.phone-btn-mute');
+        const dtmfBtn = el.querySelector('.phone-btn-dtmf');
+        const dtmfPad = el.querySelector('.phone-dtmf-pad');
+
+        // ── Timer ──────────────────────────────────────────────────────────────
+        let timerInterval = null;
+        const startTimer = (epochStart) => {
+            clearInterval(timerInterval);
+            timerEl.dataset.start = String(epochStart || Date.now());
+            timerEl.dataset.active = '1';
+            timerInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - Number(timerEl.dataset.start)) / 1000);
+                const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+                const s = String(elapsed % 60).padStart(2, '0');
+                timerEl.textContent = `${m}:${s}`;
+            }, 1000);
+        };
+        const stopTimer = () => {
+            clearInterval(timerInterval);
+            timerEl.dataset.active = '0';
+        };
+        if (el.dataset.callState === 'active') startTimer(Date.now());
+
+        // ── State sync ─────────────────────────────────────────────────────────
+        const applyState = (state) => {
+            if (badge) { badge.dataset.state = state; badge.textContent = state; }
+            el.dataset.callState = state;
+            if (state === 'active' && timerEl.dataset.active !== '1') startTimer(Date.now());
+            if (state === 'held' || state === 'ended') stopTimer();
+            if (holdBtn) {
+                holdBtn.dataset.held = state === 'held' ? '1' : '0';
+                holdBtn.title = state === 'held' ? 'Resume' : 'Hold';
+            }
+        };
+
+        const onPhoneState = (evt) => {
+            const d = evt.detail || {};
+            if (d.callSid !== callSid) return;
+            applyState(String(d.state || ''));
+        };
+        document.addEventListener('phoneStateUpdate', onPhoneState);
+
+        // ── Controls ───────────────────────────────────────────────────────────
+        const token = () => sessionStorage.getItem('genome_session') || '';
+        const callApi = async (path, body) => {
+            try {
+                const r = await fetch(path, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token() },
+                    body: JSON.stringify(body || {}),
+                });
+                return r.ok ? await r.json() : { ok: false };
+            } catch { return { ok: false }; }
+        };
+
+        if (hangupBtn) {
+            hangupBtn.addEventListener('click', async () => {
+                hangupBtn.disabled = true;
+                await callApi(`/api/telephony/hangup/${encodeURIComponent(callSid)}`);
+                applyState('ended');
+            });
+        }
+
+        if (holdBtn) {
+            holdBtn.addEventListener('click', async () => {
+                const isHeld = el.dataset.callState === 'held';
+                const res = await callApi(
+                    `/api/telephony/hold/${encodeURIComponent(callSid)}`,
+                    { hold: !isHeld }
+                );
+                if (res.ok) applyState(res.state || (isHeld ? 'active' : 'held'));
+            });
+        }
+
+        if (muteBtn) {
+            // Mute is client-side only — MediaStream track mute (no Twilio API needed)
+            muteBtn.addEventListener('click', () => {
+                const muted = muteBtn.dataset.muted === '1';
+                muteBtn.dataset.muted = muted ? '0' : '1';
+                muteBtn.title = muted ? 'Mute' : 'Unmute';
+                muteBtn.classList.toggle('active', !muted);
+            });
+        }
+
+        if (dtmfBtn && dtmfPad) {
+            dtmfBtn.addEventListener('click', () => {
+                const hidden = dtmfPad.hidden;
+                dtmfPad.hidden = !hidden;
+                dtmfBtn.classList.toggle('active', hidden);
+            });
+            dtmfPad.addEventListener('click', async (e) => {
+                const key = e.target.closest('.phone-dtmf-key');
+                if (!key) return;
+                const digit = String(key.dataset.digit || '');
+                key.classList.add('pressed');
+                setTimeout(() => key.classList.remove('pressed'), 150);
+                await callApi(
+                    `/api/telephony/dtmf/${encodeURIComponent(callSid)}`,
+                    { digits: digit }
+                );
+            });
+        }
+
+        this.state.activeSurface = {
+            domain: 'telephony',
+            cleanup: () => {
+                clearInterval(timerInterval);
+                document.removeEventListener('phoneStateUpdate', onPhoneState);
+            },
+        };
+    },
+
+    async _contentLoad(domain, name) {
+        if (!name) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            return json.ok ? json.data : null;
+        } catch { return null; }
+    },
+
+    async _contentSave(domain, name, data) {
+        if (!name) return;
+        const statusEl = this.container.querySelector('[data-save-status]');
+        if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'func-save-status saving'; }
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                body: JSON.stringify({ data })
+            });
+            const ok = res.ok && (await res.json()).ok;
+            if (statusEl) { statusEl.textContent = ok ? 'Saved' : 'Error'; statusEl.className = `func-save-status${ok ? '' : ' error'}`; }
+        } catch {
+            if (statusEl) { statusEl.textContent = 'Error'; statusEl.className = 'func-save-status error'; }
+        }
+    },
+
+    _makeAutoSave(domain, name, getDataFn, delayMs = 30000) {
+        let timer = null;
+        const schedule = () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => this._contentSave(domain, name, getDataFn()), delayMs);
+        };
+        return { schedule, cleanup: () => clearTimeout(timer) };
+    },
+
+    _initDocumentSurface(bodyEl) {
+        const domain = 'document';
+        const name = bodyEl.dataset.funcName || '';
+
+        // Toolbar: execCommand bindings
+        const toolbar = this.container.querySelector('[data-func-toolbar="document"]');
+        if (toolbar) {
+            toolbar.addEventListener('mousedown', (e) => {
+                const btn = e.target.closest('[data-cmd]');
+                if (!btn) return;
+                e.preventDefault(); // keep editor focus
+                const cmd = btn.dataset.cmd;
+                if (cmd.startsWith('formatBlock:')) {
+                    document.execCommand('formatBlock', false, cmd.split(':')[1]);
+                } else {
+                    document.execCommand(cmd, false, null);
+                }
+                bodyEl.focus();
+            });
+        }
+
+        const getData = () => bodyEl.innerHTML;
+        const saver = this._makeAutoSave(domain, name, getData);
+
+        bodyEl.addEventListener('input', () => saver.schedule());
+        bodyEl.addEventListener('blur', () => {
+            saver.cleanup();
+            this._contentSave(domain, name, getData());
+        });
+
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+
+        // Load saved content
+        this._contentLoad(domain, name).then((saved) => {
+            if (saved && typeof saved === 'string' && saved.trim()) {
+                bodyEl.innerHTML = saved;
+            } else {
+                // Scaffold: agent topic/name as default heading
+                const h = escapeHtml(name || 'Untitled');
+                bodyEl.innerHTML = `<h1>${h}</h1><p></p>`;
+            }
+            bodyEl.focus();
+            // Place cursor at end
+            const range = document.createRange();
+            range.selectNodeContents(bodyEl);
+            range.collapse(false);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        });
+    },
+
+    _initSpreadsheetSurface(tableEl) {
+        const domain = 'spreadsheet';
+        const name = tableEl.dataset.funcName || '';
+
+        // Formula bar + cell ref sync
+        const formulaBar = this.container.querySelector('[data-formula-bar]');
+        const cellRef = this.container.querySelector('[data-cell-ref]');
+
+        // cells: { "A1": { raw: "=SUM(A1:A3)", display: "6" } }
+        const cells = {};
+
+        const cellCoords = (cellId) => {
+            const m = cellId.match(/^([A-Z]+)(\d+)$/);
+            if (!m) return null;
+            return { col: m[1], row: parseInt(m[2], 10) };
+        };
+
+        const colIndex = (col) => col.charCodeAt(0) - 65; // A=0
+
+        const getCellValue = (cellId) => {
+            const c = cells[cellId];
+            if (!c) return '';
+            return c.display !== undefined ? c.display : c.raw;
+        };
+
+        const evalFormula = (formula) => {
+            try {
+                const f = formula.slice(1).trim(); // strip '='
+                // Range resolver: A1:A5 → array of values
+                const resolved = f.replace(/([A-Z]+\d+):([A-Z]+\d+)/g, (_, from, to) => {
+                    const fc = cellCoords(from), tc = cellCoords(to);
+                    if (!fc || !tc) return '0';
+                    const vals = [];
+                    for (let r = fc.row; r <= tc.row; r++) {
+                        for (let ci = colIndex(fc.col); ci <= colIndex(tc.col); ci++) {
+                            const id = String.fromCharCode(65 + ci) + r;
+                            vals.push(Number(getCellValue(id)) || 0);
+                        }
+                    }
+                    return `[${vals.join(',')}]`;
+                });
+                // Function rewrites
+                const expr = resolved
+                    .replace(/\bSUM\(\[([^\]]*)\]\)/g, (_, v) => `(${v.split(',').map(Number).reduce((a, b) => a + b, 0)})`)
+                    .replace(/\bAVG\(\[([^\]]*)\]\)/g, (_, v) => { const a = v.split(',').map(Number); return a.reduce((x, y) => x + y, 0) / a.length; })
+                    .replace(/\bIF\((.+),(.+),(.+)\)/g, (_, cond, t, f2) => `((${cond}) ? (${t}) : (${f2}))`)
+                    // Single-cell references
+                    .replace(/\b([A-Z]+\d+)\b/g, (id) => String(Number(getCellValue(id)) || 0));
+                // eslint-disable-next-line no-new-func
+                const result = Function(`"use strict"; return (${expr})`)();
+                return typeof result === 'number' ? (Number.isFinite(result) ? String(Math.round(result * 1000) / 1000) : '#ERR') : String(result);
+            } catch { return '#ERR'; }
+        };
+
+        const commitCell = (td) => {
+            const id = td.dataset.cell;
+            if (!id) return;
+            const raw = td.textContent;
+            const display = raw.startsWith('=') ? evalFormula(raw) : raw;
+            cells[id] = { raw, display };
+            td.textContent = display;
+        };
+
+        // Focus cell: show raw in formula bar
+        tableEl.addEventListener('focusin', (e) => {
+            const td = e.target.closest('td[data-cell]');
+            if (!td) return;
+            const id = td.dataset.cell;
+            if (cellRef) cellRef.textContent = id;
+            if (formulaBar) formulaBar.value = cells[id]?.raw ?? td.textContent;
+            td.textContent = cells[id]?.raw ?? td.textContent;
+        });
+
+        tableEl.addEventListener('focusout', (e) => {
+            const td = e.target.closest('td[data-cell]');
+            if (td) { commitCell(td); saver.schedule(); }
+        });
+
+        tableEl.addEventListener('keydown', (e) => {
+            const td = e.target.closest('td[data-cell]');
+            if (!td) return;
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                commitCell(td);
+                // Move to next row
+                const coords = cellCoords(td.dataset.cell);
+                if (coords) {
+                    const next = tableEl.querySelector(`td[data-cell="${coords.col}${coords.row + 1}"]`);
+                    if (next) next.focus();
+                }
+            }
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                commitCell(td);
+                const coords = cellCoords(td.dataset.cell);
+                if (coords) {
+                    const nextCol = String.fromCharCode(coords.col.charCodeAt(0) + (e.shiftKey ? -1 : 1));
+                    const next = tableEl.querySelector(`td[data-cell="${nextCol}${coords.row}"]`);
+                    if (next) next.focus();
+                }
+            }
+        });
+
+        if (formulaBar) {
+            formulaBar.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    const id = cellRef?.textContent;
+                    const td = id ? tableEl.querySelector(`td[data-cell="${id}"]`) : null;
+                    if (td) { td.textContent = formulaBar.value; commitCell(td); td.focus(); }
+                }
+            });
+        }
+
+        const getData = () => {
+            const out = {};
+            for (const [id, c] of Object.entries(cells)) out[id] = c.raw;
+            return out;
+        };
+        const saver = this._makeAutoSave(domain, name, getData);
+
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+
+        // Load saved content
+        this._contentLoad(domain, name).then((saved) => {
+            if (saved && typeof saved === 'object') {
+                for (const [id, raw] of Object.entries(saved)) {
+                    const td = tableEl.querySelector(`td[data-cell="${id}"]`);
+                    if (td) { td.textContent = raw; commitCell(td); }
+                }
+            }
+            // Focus A1
+            const a1 = tableEl.querySelector('td[data-cell="A1"]');
+            if (a1) a1.focus();
+        });
+    },
+
+    _initCodeSurface(wrapEl) {
+        const domain = 'code';
+        const name = wrapEl.dataset.funcName || '';
+        const textarea = wrapEl.querySelector('textarea');
+        if (!textarea) return;
+
+        // Tab key inserts spaces
+        textarea.addEventListener('keydown', (e) => {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = textarea.selectionStart;
+                const end = textarea.selectionEnd;
+                textarea.value = textarea.value.slice(0, start) + '  ' + textarea.value.slice(end);
+                textarea.selectionStart = textarea.selectionEnd = start + 2;
+                saver.schedule();
+            }
+        });
+
+        textarea.addEventListener('input', () => saver.schedule());
+        textarea.addEventListener('blur', () => {
+            saver.cleanup();
+            this._contentSave(domain, name, textarea.value);
+        });
+
+        const getData = () => textarea.value;
+        const saver = this._makeAutoSave(domain, name, getData);
+
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+
+        // Load saved content
+        this._contentLoad(domain, name).then((saved) => {
+            textarea.value = (typeof saved === 'string' && saved) ? saved : '';
+            textarea.focus();
+        });
+    },
+
+    _initTerminalSurface(inputEl) {
+        const outputEl = this.container.querySelector('[data-terminal-output]');
+        const history = [];
+        let histIdx = -1;
+
+        const appendLine = (text, cls = 't-out') => {
+            if (!outputEl) return;
+            const span = document.createElement('span');
+            span.className = `t-line ${cls}`;
+            span.textContent = text;
+            outputEl.appendChild(span);
+            outputEl.scrollTop = outputEl.scrollHeight;
+        };
+
+        appendLine('GenomeUI Terminal — type a command', 't-out');
+
+        inputEl.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter') {
+                const cmd = inputEl.value.trim();
+                if (!cmd) return;
+                inputEl.value = '';
+                history.unshift(cmd);
+                histIdx = -1;
+
+                appendLine(`$ ${cmd}`, 't-cmd');
+
+                // Dispatch to backend terminal_exec op
+                try {
+                    const token = sessionStorage.getItem('genome_session') || '';
+                    const res = await fetch('/api/turn', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                        body: JSON.stringify({
+                            intent: cmd,
+                            sessionId: this.state.session.sessionId,
+                            baseRevision: this.state.session.revision,
+                            deviceId: this.state.session.deviceId,
+                            activeContent: { domain: 'terminal', op: 'terminal_run', command: cmd }
+                        })
+                    });
+                    if (res.ok) {
+                        const data = await res.json();
+                        const output = data?.execution?.data?.output || data?.message || '(no output)';
+                        const lines = String(output).split('\n');
+                        for (const line of lines) appendLine(line, 't-out');
+                    } else {
+                        appendLine(`Error: ${res.status}`, 't-err');
+                    }
+                } catch (err) {
+                    appendLine(`Error: ${err.message}`, 't-err');
+                }
+            }
+            if (e.key === 'ArrowUp') {
+                histIdx = Math.min(histIdx + 1, history.length - 1);
+                if (history[histIdx] !== undefined) inputEl.value = history[histIdx];
+                e.preventDefault();
+            }
+            if (e.key === 'ArrowDown') {
+                histIdx = Math.max(histIdx - 1, -1);
+                inputEl.value = histIdx >= 0 ? history[histIdx] : '';
+                e.preventDefault();
+            }
+        });
+
+        // Terminal doesn't use activeSurface content — no saves
+        this.state.activeSurface = { domain: 'terminal', name: '', getData: () => null, cleanup: () => {} };
+        inputEl.focus();
+    },
+
+    _initPresentationSurface(stageSlideEl) {
+        const domain = 'presentation';
+        const name = stageSlideEl.dataset.funcName || '';
+        const panel = this.container.querySelector('[data-pres-panel]');
+        const toolbar = this.container.querySelector('[data-func-toolbar="presentation"]');
+
+        // slides: array of HTML strings
+        const slides = [stageSlideEl.innerHTML];
+        let activeIdx = 0;
+
+        const syncPanel = () => {
+            if (!panel) return;
+            panel.innerHTML = slides.map((_, i) => `
+                <div class="func-pres-thumb-wrap">
+                    <div class="func-pres-thumb${i === activeIdx ? ' active' : ''}" data-slide-index="${i}"></div>
+                    <div class="func-pres-thumb-num">${i + 1}</div>
+                </div>`).join('');
+        };
+
+        const switchSlide = (idx) => {
+            // Save current
+            slides[activeIdx] = stageSlideEl.innerHTML;
+            activeIdx = idx;
+            stageSlideEl.innerHTML = slides[activeIdx];
+            stageSlideEl.dataset.slideIndex = String(activeIdx);
+            syncPanel();
+            stageSlideEl.focus();
+        };
+
+        panel?.addEventListener('click', (e) => {
+            const thumb = e.target.closest('[data-slide-index]');
+            if (thumb) switchSlide(Number(thumb.dataset.slideIndex));
+        });
+
+        toolbar?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-slide-cmd]');
+            if (!btn) return;
+            const cmd = btn.dataset.slideCmd;
+            if (cmd === 'add') {
+                slides.splice(activeIdx + 1, 0, '<h1>New Slide</h1><p></p>');
+                switchSlide(activeIdx + 1);
+                saver.schedule();
+            } else if (cmd === 'delete' && slides.length > 1) {
+                slides.splice(activeIdx, 1);
+                switchSlide(Math.min(activeIdx, slides.length - 1));
+                saver.schedule();
+            }
+        });
+
+        stageSlideEl.addEventListener('input', () => {
+            slides[activeIdx] = stageSlideEl.innerHTML;
+            saver.schedule();
+        });
+
+        stageSlideEl.addEventListener('blur', () => {
+            slides[activeIdx] = stageSlideEl.innerHTML;
+        });
+
+        const getData = () => slides.slice();
+        const saver = this._makeAutoSave(domain, name, getData);
+
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+
+        // Load saved content
+        this._contentLoad(domain, name).then((saved) => {
+            if (Array.isArray(saved) && saved.length) {
+                slides.length = 0;
+                slides.push(...saved);
+                stageSlideEl.innerHTML = slides[0];
+                syncPanel();
+            }
+            stageSlideEl.focus();
+        });
+
+        syncPanel();
     },
 };
 

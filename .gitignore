@@ -9,3 +9,4 @@ backend/data/
 __pycache__/
 src-tauri/target/
 src-tauri/gen/
+.grepai/
