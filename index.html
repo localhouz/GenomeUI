@@ -9,7 +9,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Genome">
     <title>Latent Surface | No-App OS</title>
-    <link rel="stylesheet" href="index.css">
+    <link rel="stylesheet" href="index.css?v=mobilefix4">
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
     <link rel="apple-touch-icon" sizes="192x192" href="/icon-192.png">
@@ -35,7 +35,7 @@
 
         <div id="command-bar">
             <div class="input-container">
-                <div id="window-controls" class="window-controls" aria-hidden="true">
+                <div id="window-controls" class="window-controls">
                     <button class="wc-btn wc-close" id="wc-close" title="Close" type="button"></button>
                     <button class="wc-btn wc-minimize" id="wc-minimize" title="Minimize" type="button"></button>
                     <button class="wc-btn wc-maximize" id="wc-maximize" title="Maximize" type="button"></button>
@@ -55,7 +55,27 @@
         </div>
     </main>
 
-    <script type="module" src="app.js"></script>
+    <script>
+        window.addEventListener('error', function (event) {
+            var existing = document.getElementById('genome-mobile-error');
+            if (existing) existing.remove();
+            var node = document.createElement('div');
+            node.id = 'genome-mobile-error';
+            node.style.cssText = 'position:fixed;left:12px;right:12px;top:12px;z-index:20000;padding:12px 14px;border-radius:14px;background:#3b1015;color:#fff;font:12px/1.45 monospace;box-shadow:0 12px 40px rgba(0,0,0,.35);white-space:pre-wrap;';
+            node.textContent = 'Genome mobile boot error:\n' + String((event && (event.message || (event.error && event.error.message))) || 'unknown error');
+            document.body.appendChild(node);
+        });
+        window.addEventListener('unhandledrejection', function (event) {
+            var existing = document.getElementById('genome-mobile-error');
+            if (existing) existing.remove();
+            var node = document.createElement('div');
+            node.id = 'genome-mobile-error';
+            node.style.cssText = 'position:fixed;left:12px;right:12px;top:12px;z-index:20000;padding:12px 14px;border-radius:14px;background:#3b1015;color:#fff;font:12px/1.45 monospace;box-shadow:0 12px 40px rgba(0,0,0,.35);white-space:pre-wrap;';
+            node.textContent = 'Genome mobile promise error:\n' + String((event && event.reason && (event.reason.message || event.reason)) || 'unknown rejection');
+            document.body.appendChild(node);
+        });
+    </script>
+    <script type="module" src="app.js?v=mobilefix4"></script>
 </body>
 
 </html>

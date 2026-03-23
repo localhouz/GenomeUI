@@ -1,0 +1,12 @@
+{"subject":"astronomy","question":"What causes the phases of the Moon?","choices":{"A":"Earth's shadow falling on the Moon every night","B":"The Moon changing shape as it spins","C":"The portion of the Moon lit by the Sun that is visible from Earth","D":"Cloud cover in Earth's atmosphere"},"answer":"C"}
+{"subject":"biology","question":"Which organelle is primarily responsible for producing ATP in eukaryotic cells?","choices":{"A":"Nucleus","B":"Mitochondrion","C":"Golgi apparatus","D":"Ribosome"},"answer":"B"}
+{"subject":"chemistry","question":"What is the pH of a neutral solution at 25°C?","choices":{"A":"1","B":"5","C":"7","D":"14"},"answer":"C"}
+{"subject":"computer_science","question":"Which data structure uses Last-In, First-Out ordering?","choices":{"A":"Queue","B":"Stack","C":"Heap","D":"Graph"},"answer":"B"}
+{"subject":"economics","question":"If demand increases while supply stays constant, what typically happens to equilibrium price?","choices":{"A":"It falls","B":"It stays unchanged","C":"It rises","D":"It becomes zero"},"answer":"C"}
+{"subject":"history","question":"Which event began in 1914?","choices":{"A":"World War I","B":"World War II","C":"The French Revolution","D":"The American Civil War"},"answer":"A"}
+{"subject":"law","question":"In the United States, which branch interprets laws?","choices":{"A":"Executive","B":"Judicial","C":"Legislative","D":"Administrative"},"answer":"B"}
+{"subject":"logic","question":"If all mammals are warm-blooded and all whales are mammals, which conclusion follows?","choices":{"A":"All warm-blooded animals are whales","B":"No whales are warm-blooded","C":"All whales are warm-blooded","D":"Some mammals are not animals"},"answer":"C"}
+{"subject":"mathematics","question":"What is the derivative of x^2?","choices":{"A":"x","B":"2x","C":"x^2","D":"2"},"answer":"B"}
+{"subject":"physics","question":"What is the SI unit of force?","choices":{"A":"Joule","B":"Pascal","C":"Newton","D":"Watt"},"answer":"C"}
+{"subject":"politics","question":"What is the primary purpose of checks and balances in a constitutional system?","choices":{"A":"To eliminate elections","B":"To centralize power in one branch","C":"To prevent any one branch from becoming too powerful","D":"To remove the judiciary"},"answer":"C"}
+{"subject":"statistics","question":"What does a median represent?","choices":{"A":"The arithmetic average","B":"The most frequent value","C":"The middle value in an ordered dataset","D":"The spread of the data"},"answer":"C"}

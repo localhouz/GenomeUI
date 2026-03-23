@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+# Load .env early so os.getenv() picks up secrets regardless of launch method
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)
+except ImportError:
+    pass
+
 import asyncio
+import ast
 import base64
 import copy
 import html
@@ -14,28 +22,33 @@ import os
 import pathlib
 import re
 import secrets
+import socket
+import subprocess
 import time as _time
 import sqlite3 as _sqlite3
 import uuid
 from collections import deque
 
 _log = logging.getLogger("genomeui")
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import quote_plus, urlencode, urlparse, urlunparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from .semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY, extract_slots_for_op, classify_async  # noqa: F401 (re-exported for callers)
+from .semantics import parse_semantic_command, parse_semantic_command_async, TAXONOMY, extract_slots_for_op, classify_async, classify_fast  # noqa: F401 (re-exported for callers)
 from . import auth as _auth
 from . import nous_loader as _nous
+from . import db as _db
 from .mesh_bridge import mesh_bridge as _mesh
 from . import identity as _identity
 from . import geolocation as _geo
+from . import scheduler as _sched
+from . import push_dispatch as _push_dispatch
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="GenomeUI Backend", version="1.0.0")
@@ -55,7 +68,7 @@ app.add_middleware(
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL_SMALL = os.getenv("OLLAMA_MODEL_SMALL", "")
 OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
-STORE_PATH = pathlib.Path(os.getenv("GENOMEUI_STORE_PATH", "backend/data/sessions.json"))
+LEGACY_SESSION_JSON_PATH = pathlib.Path(os.getenv("GENOMEUI_LEGACY_SESSION_JSON_PATH", "backend/data/sessions.json"))
 CONNECTOR_VAULT_PATH = pathlib.Path(os.getenv("GENOMEUI_CONNECTOR_VAULT_PATH", "backend/data/connector_vault.json"))
 CONTENT_STORE_PATH = pathlib.Path(os.getenv("GENOMEUI_CONTENT_STORE_PATH", "backend/data/content_store.db"))
 MCP_CONFIG_PATH = pathlib.Path(os.getenv("GENOMEUI_MCP_CONFIG_PATH", ".mcp.json"))
@@ -101,7 +114,392 @@ NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID", "")
 NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET", "")
 ASANA_CLIENT_ID = os.getenv("ASANA_CLIENT_ID", "")
 ASANA_CLIENT_SECRET = os.getenv("ASANA_CLIENT_SECRET", "")
+OUTLOOK_CLIENT_ID = os.getenv("OUTLOOK_CLIENT_ID", "")
+OUTLOOK_CLIENT_SECRET = os.getenv("OUTLOOK_CLIENT_SECRET", "")
+YAHOO_CLIENT_ID = os.getenv("YAHOO_CLIENT_ID", "")
+YAHOO_CLIENT_SECRET = os.getenv("YAHOO_CLIENT_SECRET", "")
 OAUTH_REDIRECT_BASE = os.getenv("OAUTH_REDIRECT_BASE", "http://localhost:5173")
+NOUS_HEALTH_URL = str(os.getenv("GENOMEUI_NOUS_HEALTH_URL", "http://127.0.0.1:7700/health")).strip()
+NOUS_CLASSIFY_TIMEOUT_S = max(0.05, float(os.getenv("GENOMEUI_NOUS_CLASSIFY_TIMEOUT_S", "1.0")))
+GENOME_BACKEND_PUBLIC_URL = str(os.getenv("GENOME_BACKEND_PUBLIC_URL", "http://localhost:8787")).strip().rstrip("/")
+
+
+def _is_loopback_host(host: str) -> bool:
+    value = str(host or "").strip().lower()
+    return value in {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _detect_lan_ipv4() -> str:
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            ip = str(probe.getsockname()[0] or "").strip()
+            if ip and not _is_loopback_host(ip):
+                return ip
+        finally:
+            probe.close()
+    except Exception:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            value = str(ip or "").strip()
+            if value and not _is_loopback_host(value):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
+def _rewrite_loopback_url(raw_url: str, fallback_port: int | None = None) -> str:
+    value = str(raw_url or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return value.rstrip("/")
+    if not _is_loopback_host(parsed.hostname or ""):
+        return value.rstrip("/")
+    lan_ip = _detect_lan_ipv4()
+    if not lan_ip:
+        return value.rstrip("/")
+    netloc = f"{lan_ip}:{parsed.port or fallback_port}" if (parsed.port or fallback_port) else lan_ip
+    return urlunparse(parsed._replace(netloc=netloc)).rstrip("/")
+
+
+def _derive_handoff_backend_url(request: Request | None = None) -> str:
+    configured = _rewrite_loopback_url(GENOME_BACKEND_PUBLIC_URL, fallback_port=8787) or GENOME_BACKEND_PUBLIC_URL
+    try:
+        parsed = urlparse(configured)
+        if parsed.hostname and not _is_loopback_host(parsed.hostname):
+            return configured.rstrip("/")
+    except Exception:
+        return configured.rstrip("/")
+    if request is not None:
+        rewritten = _rewrite_loopback_url(str(request.base_url), fallback_port=request.url.port or 8787)
+        if rewritten:
+            return rewritten.rstrip("/")
+    return configured.rstrip("/")
+
+
+def _build_handoff_bridge_url(request: Request | None, session_id: str, token: str, backend_url: str) -> str:
+    base = _derive_handoff_backend_url(request).rstrip("/")
+    params = urlencode({
+        "session": str(session_id or "").strip(),
+        "token": str(token or "").strip(),
+        "backend": str(backend_url or "").strip(),
+    })
+    return f"{base}/handoff/open?{params}"
+
+
+async def _dispatch_handoff_relay_takeover(
+    session_id: str,
+    session: SessionState,
+    from_device_id: str,
+    token: str,
+    backend_url: str,
+) -> bool:
+    if not (_genome_identity and _mesh.relay_connected):
+        return False
+    devices = session.presence.get("devices") if isinstance(session.presence.get("devices"), dict) else {}
+    payload = {
+        "type": "genome_handoff",
+        "sessionId": session_id,
+        "token": token,
+        "backendUrl": backend_url,
+        "fromDeviceId": from_device_id,
+        "ts": now_ms(),
+    }
+    unsigned = {
+        "v": 1,
+        "networkType": "p2p",
+        "networkId": f"genome-handoff:{session_id}",
+        "from": _genome_identity.did,
+        "payload": payload,
+        "ts": int(_time.time() * 1000),
+    }
+    canonical = json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False)
+    envelope = {**unsigned, "sig": _genome_identity.sign(canonical.encode("utf-8"))}
+    sent = False
+    for device_id, item in devices.items():
+        if str(device_id) == str(from_device_id) or not isinstance(item, dict):
+            continue
+        target_did = str(item.get("did", "") or "").strip()
+        if not target_did:
+            continue
+        try:
+            await _mesh.relay_route(target_did, envelope)
+            sent = True
+        except Exception as exc:
+            _log.warning("Relay handoff route failed for %s: %s", target_did, exc)
+    return sent
+
+
+def _normalize_surface_role(value: str) -> str:
+    role = str(value or "").strip().lower()
+    return role if role in {"mobile", "desktop", "tablet", "tv", "overlay", "web"} else "mobile"
+
+
+def _paired_surface_payload(
+    surface_id: str,
+    label: str,
+    platform: str,
+    role: str,
+    did: str,
+    relay_url: str,
+    apns: str,
+    fcm: str,
+    session_id: str = "",
+    capabilities: list[str] | None = None,
+    preferred: bool = False,
+    updated_at: int | None = None,
+) -> dict[str, Any]:
+    caps = [str(item).strip() for item in (capabilities or []) if str(item).strip()]
+    return {
+        "surfaceId": normalize_device_id(surface_id),
+        "profileId": "default",
+        "label": str(label or "").strip()[:160],
+        "platform": str(platform or "").strip().lower()[:64],
+        "role": _normalize_surface_role(role),
+        "did": str(did or "").strip()[:160],
+        "relayUrl": str(relay_url or "").strip()[:512],
+        "pushTokens": {
+            "apns": str(apns or "").strip()[:512],
+            "fcm": str(fcm or "").strip()[:2048],
+        },
+        "sessionId": normalize_session_id(session_id) if session_id else "",
+        "capabilities": caps[:32],
+        "preferred": bool(preferred),
+        "updatedAt": int(updated_at or now_ms()),
+    }
+
+
+async def _register_paired_surface_from_fields(
+    *,
+    surface_id: str,
+    label: str = "",
+    platform: str = "",
+    role: str = "mobile",
+    did: str = "",
+    relay_url: str = "",
+    apns: str = "",
+    fcm: str = "",
+    session_id: str = "",
+    capabilities: list[str] | None = None,
+    preferred: bool = False,
+) -> dict[str, Any]:
+    prior: dict[str, Any] = {}
+    try:
+        loaded = await _db.load_paired_surface(str(surface_id))
+        if isinstance(loaded, dict):
+            prior = loaded
+    except Exception:
+        prior = {}
+    surface = _paired_surface_payload(
+        surface_id=surface_id,
+        label=label or str(prior.get("label", "") or ""),
+        platform=platform or str(prior.get("platform", "") or ""),
+        role=role or str(prior.get("role", "mobile") or "mobile"),
+        did=did or str(prior.get("did", "") or ""),
+        relay_url=relay_url or str(prior.get("relayUrl", "") or ""),
+        apns=apns or str((((prior.get("pushTokens") or {}) if isinstance(prior.get("pushTokens"), dict) else {}).get("apns", "")) or ""),
+        fcm=fcm or str((((prior.get("pushTokens") or {}) if isinstance(prior.get("pushTokens"), dict) else {}).get("fcm", "")) or ""),
+        session_id=session_id or str(prior.get("sessionId", "") or ""),
+        capabilities=capabilities if capabilities is not None else (prior.get("capabilities", []) if isinstance(prior.get("capabilities"), list) else []),
+        preferred=bool(preferred or prior.get("preferred", False)),
+        updated_at=now_ms(),
+    )
+    if not str(surface.get("surfaceId", "")).strip():
+        raise HTTPException(status_code=400, detail="invalid surface id")
+    try:
+        await _db.save_paired_surface(str(surface["surfaceId"]), "default", surface)
+    except Exception:
+        pass
+    return surface
+
+
+async def _list_paired_surfaces(limit: int = 50) -> list[dict[str, Any]]:
+    try:
+        items = await _db.list_paired_surfaces("default", limit=max(1, int(limit)))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        push_tokens = item.get("pushTokens", {}) if isinstance(item.get("pushTokens"), dict) else {}
+        out.append(
+            _paired_surface_payload(
+                surface_id=str(item.get("surfaceId", "") or ""),
+                label=str(item.get("label", "") or ""),
+                platform=str(item.get("platform", "") or ""),
+                role=str(item.get("role", "") or "mobile"),
+                did=str(item.get("did", "") or ""),
+                relay_url=str(item.get("relayUrl", "") or ""),
+                apns=str(push_tokens.get("apns", "") or ""),
+                fcm=str(push_tokens.get("fcm", "") or ""),
+                session_id=str(item.get("sessionId", "") or ""),
+                capabilities=item.get("capabilities", []) if isinstance(item.get("capabilities"), list) else [],
+                preferred=bool(item.get("preferred", False)),
+                updated_at=int(item.get("updatedAt", 0) or 0),
+            )
+        )
+    return out
+
+
+async def _set_preferred_surface(surface_id: str) -> dict[str, Any] | None:
+    target_id = normalize_device_id(surface_id)
+    if not target_id:
+        return None
+    items = await _list_paired_surfaces(limit=200)
+    target: dict[str, Any] | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        current_id = normalize_device_id(str(item.get("surfaceId", "") or ""))
+        if not current_id:
+            continue
+        preferred = current_id == target_id
+        saved = await _register_paired_surface_from_fields(
+            surface_id=current_id,
+            label=str(item.get("label", "") or ""),
+            platform=str(item.get("platform", "") or ""),
+            role=str(item.get("role", "") or "mobile"),
+            did=str(item.get("did", "") or ""),
+            relay_url=str(item.get("relayUrl", "") or ""),
+            apns=str((((item.get("pushTokens") or {}) if isinstance(item.get("pushTokens"), dict) else {}).get("apns", "")) or ""),
+            fcm=str((((item.get("pushTokens") or {}) if isinstance(item.get("pushTokens"), dict) else {}).get("fcm", "")) or ""),
+            session_id=str(item.get("sessionId", "") or ""),
+            capabilities=item.get("capabilities", []) if isinstance(item.get("capabilities"), list) else [],
+            preferred=preferred,
+        )
+        if preferred:
+            target = saved
+    return target
+
+
+async def _dispatch_handoff_to_paired_surfaces(
+    session_id: str,
+    from_device_id: str,
+    token: str,
+    backend_url: str,
+    preferred_role: str = "mobile",
+    target_surface_id: str = "",
+) -> dict[str, Any]:
+    surfaces = await _list_paired_surfaces(limit=20)
+    preferred = _normalize_surface_role(preferred_role)
+    target_surface_norm = normalize_device_id(target_surface_id)
+    ordered = sorted(
+        surfaces,
+        key=lambda item: (
+            0 if target_surface_norm and normalize_device_id(str(item.get("surfaceId", "") or "")) == target_surface_norm else 1,
+            0 if bool(item.get("preferred", False)) else 1,
+            0 if str(item.get("role", "mobile")) == preferred else 1,
+            0 if str(item.get("did", "")).strip() else 1,
+            -int(item.get("updatedAt", 0) or 0),
+        ),
+    )
+    routed = False
+    wake = False
+    target: dict[str, Any] | None = None
+    from_did = _genome_identity.did if _genome_identity else "genome-local"
+    for item in ordered:
+        surface_id = normalize_device_id(str(item.get("surfaceId", "") or ""))
+        if not surface_id or surface_id == from_device_id:
+            continue
+        target = item
+        target_did = str(item.get("did", "") or "").strip()
+        if target_did and _genome_identity is not None and bool(getattr(_mesh, "relay_connected", False)):
+            payload = {
+                "type": "genome_handoff",
+                "sessionId": session_id,
+                "token": token,
+                "backendUrl": backend_url,
+                "fromDeviceId": from_device_id,
+                "ts": now_ms(),
+            }
+            unsigned = {
+                "v": 1,
+                "networkType": "p2p",
+                "networkId": f"genome-handoff:{session_id}",
+                "from": _genome_identity.did,
+                "payload": payload,
+                "ts": int(_time.time() * 1000),
+            }
+            canonical = json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False)
+            envelope = {**unsigned, "sig": _genome_identity.sign(canonical.encode("utf-8"))}
+            try:
+                await _mesh.relay_route(target_did, envelope)
+                routed = True
+            except Exception as exc:
+                _log.warning("Paired surface relay handoff route failed for %s: %s", target_did, exc)
+        push_tokens = item.get("pushTokens", {}) if isinstance(item.get("pushTokens"), dict) else {}
+        if push_tokens and any(str(push_tokens.get(key, "") or "").strip() for key in ("apns", "fcm")):
+            try:
+                await _push_dispatch.dispatch(
+                    tokens={"apns": str(push_tokens.get("apns", "") or ""), "fcm": str(push_tokens.get("fcm", "") or "")},
+                    msg_id=f"handoff:{token}:{surface_id}",
+                    from_did=from_did,
+                    data={"type": "genome_handoff", "sessionId": session_id, "token": token, "backendUrl": backend_url},
+                )
+                wake = True
+            except Exception as exc:
+                _log.warning("Paired surface push wake failed for %s: %s", surface_id, exc)
+        if routed or wake:
+            break
+    return {
+        "routed": routed,
+        "woke": wake,
+        "targetSurfaceId": str((target or {}).get("surfaceId", "") or ""),
+        "targetLabel": str((target or {}).get("label", "") or ""),
+        "targetRole": str((target or {}).get("role", "") or ""),
+        "targetPreferred": bool((target or {}).get("preferred", False)),
+    }
+
+# ── IMAP/SMTP server table ──────────────────────────────────────────────────────
+# Maps email domain → (imap_host, imap_port, smtp_host, smtp_port)
+# None = OAuth-only provider (deprecated basic auth)
+_IMAP_SERVER_TABLE: dict[str, tuple[str, int, str, int] | None] = {
+    "icloud.com":     ("imap.mail.me.com",  993, "smtp.mail.me.com",  587),
+    "me.com":         ("imap.mail.me.com",  993, "smtp.mail.me.com",  587),
+    "mac.com":        ("imap.mail.me.com",  993, "smtp.mail.me.com",  587),
+    "zoho.com":       ("imap.zoho.com",     993, "smtp.zoho.com",     587),
+    "zohomail.com":   ("imap.zoho.com",     993, "smtp.zoho.com",     587),
+    "fastmail.com":   ("imap.fastmail.com", 993, "smtp.fastmail.com", 587),
+    "fastmail.fm":    ("imap.fastmail.com", 993, "smtp.fastmail.com", 587),
+    "gmx.com":        ("imap.gmx.com",      993, "smtp.gmx.com",      587),
+    "gmx.net":        ("imap.gmx.net",      993, "smtp.gmx.net",      587),
+    "gmx.de":         ("imap.gmx.net",      993, "smtp.gmx.net",      587),
+    "yandex.com":     ("imap.yandex.com",   993, "smtp.yandex.com",   587),
+    "yandex.ru":      ("imap.yandex.ru",    993, "smtp.yandex.ru",    587),
+    # OAuth-only (deprecated basic auth)
+    "gmail.com":      None, "googlemail.com": None,
+    "outlook.com":    None, "hotmail.com":    None,
+    "live.com":       None, "msn.com":        None,
+    "yahoo.com":      None, "yahoo.co.uk":    None, "aol.com": None,
+}
+
+
+def _imap_server_for_domain(domain: str) -> tuple[str, int, str, int]:
+    """Return (imap_host, imap_port, smtp_host, smtp_port). Falls back to imap.{domain}."""
+    domain = domain.lower().strip()
+    entry = _IMAP_SERVER_TABLE.get(domain)
+    if entry:
+        return entry
+    return (f"imap.{domain}", 993, f"smtp.{domain}", 587)
+
+
+def _oauth_provider_for_domain(domain: str) -> str | None:
+    """Return the OAuth provider name for domains that require OAuth, else None."""
+    domain = domain.lower().strip()
+    if domain in {"gmail.com", "googlemail.com"}:
+        return "gmail"
+    if domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
+        return "outlook"
+    if domain in {"yahoo.com", "yahoo.co.uk", "aol.com"}:
+        return "yahoo"
+    return None
 # ── Twilio (PSTN bridge) ─────────────────────────────────────────────────────
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -521,6 +919,7 @@ class TurnBody(BaseModel):
 
 class HandoffStartBody(BaseModel):
     deviceId: str
+    targetSurfaceId: str | None = None
 
 
 class HandoffClaimBody(BaseModel):
@@ -533,6 +932,30 @@ class PresenceBody(BaseModel):
     label: str | None = None
     platform: str | None = None
     userAgent: str | None = None
+    did: str | None = None
+    relayUrl: str | None = None
+
+
+class PushTokenBody(BaseModel):
+    deviceId: str
+    apns: str | None = None
+    fcm: str | None = None
+    did: str | None = None
+    relayUrl: str | None = None
+
+
+class SurfaceRegisterBody(BaseModel):
+    surfaceId: str
+    label: str | None = None
+    platform: str | None = None
+    role: str | None = None
+    did: str | None = None
+    relayUrl: str | None = None
+    apns: str | None = None
+    fcm: str | None = None
+    sessionId: str | None = None
+    capabilities: list[str] | None = None
+    preferred: bool | None = None
 
 
 class PresencePruneBody(BaseModel):
@@ -553,6 +976,16 @@ class ContinuityAutopilotConfigBody(BaseModel):
 
 class ContinuityAutopilotResetBody(BaseModel):
     clearHistory: bool = False
+
+
+class ShellObjectOpenBody(BaseModel):
+    kind: str
+    domain: str | None = None
+    name: str | None = None
+    branch: str | None = None
+    itemId: str | None = None
+    service: str | None = None
+    scene: str | None = None
 
 
 class RestoreBody(BaseModel):
@@ -584,10 +1017,15 @@ class ConnectorSecretBody(BaseModel):
     value: str
 
 
+class NotificationActionBody(BaseModel):
+    app: str = ""
+
+
 @dataclass
 class SessionState:
     memory: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {"tasks": [], "expenses": [], "notes": [], "teams": []})
     graph: dict[str, Any] = field(default_factory=lambda: {"entities": [], "relations": [], "events": []})
+    workspace: dict[str, Any] = field(default_factory=lambda: {"repoId": "user-global", "branch": "main", "worktrees": {}, "activeContent": None})
     jobs: list[dict[str, Any]] = field(default_factory=list)
     presence: dict[str, Any] = field(default_factory=lambda: {"devices": {}, "updatedAt": 0})
     handoff: dict[str, Any] = field(default_factory=lambda: {"activeDeviceId": None, "pending": None, "lastClaimAt": None})
@@ -609,6 +1047,7 @@ class SessionState:
     journal: list[dict[str, Any]] = field(default_factory=list)
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    notifications: list[dict[str, Any]] = field(default_factory=list)
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     sockets: set[WebSocket] = field(default_factory=set)
 
@@ -1191,9 +1630,10 @@ def persist_connector_vault_to_disk_sync() -> bool:
 # ── Content Store (git-style, SQLite) ──────────────────────────────────────────
 
 def _content_db() -> _sqlite3.Connection:
-    """Return a SQLite connection to the content store, initialising schema on first use."""
+    """Return a SQLite connection to the content repository, initialising schema on first use."""
     CONTENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = _sqlite3.connect(str(CONTENT_STORE_PATH), check_same_thread=False)
+    con.row_factory = _sqlite3.Row
     con.execute("""
         CREATE TABLE IF NOT EXISTS content_objects (
             hash       TEXT PRIMARY KEY,
@@ -1210,65 +1650,603 @@ def _content_db() -> _sqlite3.Connection:
             PRIMARY KEY (name, domain)
         )""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_heads_domain ON content_heads(domain, updated_at DESC)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_items (
+            item_id       TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            domain        TEXT NOT NULL,
+            content_type  TEXT NOT NULL,
+            created_at    REAL NOT NULL,
+            updated_at    REAL NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main',
+            UNIQUE(name, domain)
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_revisions (
+            rev_hash       TEXT PRIMARY KEY,
+            item_id        TEXT NOT NULL REFERENCES content_items(item_id),
+            parent_hash    TEXT REFERENCES content_revisions(rev_hash),
+            branch         TEXT NOT NULL,
+            content_data   TEXT NOT NULL,
+            commit_message TEXT NOT NULL,
+            created_at     REAL NOT NULL
+        )""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_content_revisions_item ON content_revisions(item_id, created_at DESC)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_branches (
+            item_id     TEXT NOT NULL REFERENCES content_items(item_id),
+            branch      TEXT NOT NULL,
+            head_hash   TEXT NOT NULL REFERENCES content_revisions(rev_hash),
+            updated_at  REAL NOT NULL,
+            PRIMARY KEY (item_id, branch)
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_worktrees (
+            session_id  TEXT NOT NULL,
+            item_id     TEXT NOT NULL REFERENCES content_items(item_id),
+            branch      TEXT NOT NULL,
+            updated_at  REAL NOT NULL,
+            PRIMARY KEY (session_id, item_id)
+        )""")
+    legacy_rows = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='content_heads'").fetchone()
+    migrated_count = con.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
+    if legacy_rows and int(migrated_count or 0) == 0:
+        rows = con.execute(
+            "SELECT h.name, h.domain, h.hash, h.updated_at, o.delta_data "
+            "FROM content_heads h JOIN content_objects o ON h.hash = o.hash"
+        ).fetchall()
+        now = _time.time()
+        for row in rows:
+            item_id = str(uuid.uuid4())
+            content_type = _infer_content_type(str(row["domain"]), row["delta_data"])
+            con.execute(
+                "INSERT OR IGNORE INTO content_items (item_id, name, domain, content_type, created_at, updated_at, default_branch) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'main')",
+                (item_id, row["name"], row["domain"], content_type, float(row["updated_at"] or now), float(row["updated_at"] or now)),
+            )
+            item = con.execute(
+                "SELECT item_id FROM content_items WHERE name = ? AND domain = ?",
+                (row["name"], row["domain"]),
+            ).fetchone()
+            if not item:
+                continue
+            con.execute(
+                "INSERT OR IGNORE INTO content_revisions (rev_hash, item_id, parent_hash, branch, content_data, commit_message, created_at) "
+                "VALUES (?, ?, NULL, 'main', ?, 'Imported legacy head', ?)",
+                (row["hash"], item["item_id"], row["delta_data"], float(row["updated_at"] or now)),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO content_branches (item_id, branch, head_hash, updated_at) VALUES (?, 'main', ?, ?)",
+                (item["item_id"], row["hash"], float(row["updated_at"] or now)),
+            )
     con.commit()
     return con
 
 
-def content_commit(domain: str, name: str, data: str | dict[str, Any]) -> str:
-    """Persist a new version of content. Returns sha256 hash of the stored data."""
-    raw = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
-    h = hashlib.sha256(raw.encode()).hexdigest()
+def _content_payload_to_raw(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")) if isinstance(data, (dict, list)) else str(data)
+
+
+def _content_raw_to_payload(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return raw
+
+
+def _infer_content_type(domain: str, data: Any) -> str:
+    domain_norm = str(domain or "").strip().lower()
+    if domain_norm in {"document", "spreadsheet", "presentation", "code"}:
+        return domain_norm
+    if isinstance(data, dict):
+        if any(str(k).upper().startswith(("A", "B", "C")) for k in data.keys()):
+            return "spreadsheet"
+    return "document" if domain_norm in {"content", ""} else domain_norm
+
+
+def _content_commit_hash(item_id: str, branch: str, parent_hash: str, raw: str) -> str:
+    payload = "\n".join([item_id, branch, parent_hash, raw])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _content_head_row(con: _sqlite3.Connection, domain: str, name: str, branch: str = "main") -> _sqlite3.Row | None:
+    return con.execute(
+        "SELECT i.item_id, i.name, i.domain, i.content_type, i.updated_at, i.default_branch, "
+        "b.branch, b.head_hash, r.parent_hash, r.content_data, r.commit_message, r.created_at "
+        "FROM content_items i "
+        "JOIN content_branches b ON b.item_id = i.item_id "
+        "JOIN content_revisions r ON r.rev_hash = b.head_hash "
+        "WHERE i.domain = ? AND i.name = ? AND b.branch = ?",
+        (domain, name, branch),
+    ).fetchone()
+
+
+def content_attach_session(session_id: str, item_id: str, name: str, domain: str, branch: str, head_hash: str, updated_at: int) -> None:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        return
+    session = ensure_session(sid)
+    worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+    key = f"{domain}:{name}"
+    worktrees[key] = {
+        "itemId": item_id,
+        "name": name,
+        "domain": domain,
+        "branch": branch,
+        "updatedAt": int(updated_at or now_ms()),
+    }
+    session.workspace["worktrees"] = worktrees
+    session.workspace["branch"] = branch or "main"
+    session.workspace["activeContent"] = {
+        "itemId": item_id,
+        "name": name,
+        "domain": domain,
+        "branch": branch or "main",
+        "hash": head_hash,
+        "updatedAt": int(updated_at or now_ms()),
+    }
+
+
+def content_session_worktrees(session_id: str) -> list[dict[str, Any]]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        return []
+    session = ensure_session(sid)
+    worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+    active_item_id = str((session.workspace.get("activeContent") or {}).get("itemId", "") or "")
+    out: list[dict[str, Any]] = []
+    for item in worktrees.values():
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("itemId", "") or "")
+        out.append(
+            {
+                "itemId": item_id,
+                "name": str(item.get("name", "") or ""),
+                "domain": str(item.get("domain", "") or ""),
+                "branch": str(item.get("branch", "main") or "main"),
+                "updatedAt": int(item.get("updatedAt", 0) or 0),
+                "active": item_id == active_item_id,
+            }
+        )
+    out.sort(key=lambda row: (0 if row.get("active") else 1, -int(row.get("updatedAt", 0) or 0), row.get("name", "")))
+    return out
+
+
+def content_activate_session_worktree(session_id: str, item_id: str) -> dict[str, Any] | None:
+    sid = normalize_session_id(session_id)
+    target_item_id = str(item_id or "").strip()
+    if not sid or not target_item_id:
+        return None
+    session = ensure_session(sid)
+    worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+    target = next((item for item in worktrees.values() if isinstance(item, dict) and str(item.get("itemId", "") or "") == target_item_id), None)
+    if not target:
+        return None
+    branch = str(target.get("branch", "main") or "main")
+    loaded = content_load(str(target.get("domain", "")), str(target.get("name", "")), branch=branch, session_id=sid)
+    if not loaded:
+        return None
+    session.workspace["branch"] = branch
+    session.workspace["activeContent"] = {
+        "itemId": loaded.get("itemId", ""),
+        "name": loaded.get("name", ""),
+        "domain": loaded.get("domain", ""),
+        "branch": loaded.get("branch", branch),
+        "hash": loaded.get("hash", ""),
+        "updatedAt": int(float(loaded.get("updated_at", _time.time())) * 1000),
+    }
+    return loaded
+
+
+def content_detach_session_worktree(session_id: str, item_id: str) -> bool:
+    sid = normalize_session_id(session_id)
+    target_item_id = str(item_id or "").strip()
+    if not sid or not target_item_id:
+        return False
+    session = ensure_session(sid)
+    worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+    target_key = next((key for key, item in worktrees.items() if isinstance(item, dict) and str(item.get("itemId", "") or "") == target_item_id), None)
+    if target_key is None:
+        return False
+    active_item_id = str((session.workspace.get("activeContent") or {}).get("itemId", "") or "")
+    worktrees.pop(target_key, None)
+    session.workspace["worktrees"] = worktrees
+    if active_item_id == target_item_id:
+        remaining = next((item for item in worktrees.values() if isinstance(item, dict)), None)
+        if remaining:
+            content_activate_session_worktree(sid, str(remaining.get("itemId", "") or ""))
+        else:
+            session.workspace["activeContent"] = None
+    with _content_db() as con:
+        con.execute("DELETE FROM content_worktrees WHERE session_id = ? AND item_id = ?", (sid, target_item_id))
+    return True
+
+
+def content_attach_existing_to_session(session_id: str, domain: str, name: str, branch: str = "main") -> dict[str, Any] | None:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        return None
+    loaded = content_load(domain, name, branch=branch, session_id=sid)
+    if not loaded:
+        return None
+    session = ensure_session(sid)
+    worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+    session.workspace["worktrees"] = worktrees
+    return loaded
+
+
+def content_commit(
+    domain: str,
+    name: str,
+    data: Any,
+    *,
+    branch: str = "main",
+    message: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Persist a new revision in the content repository and return head metadata."""
+    domain_norm = str(domain or "").strip().lower() or "document"
+    name_norm = str(name or "").strip()
+    if not name_norm:
+        raise ValueError("content name required")
+    branch_norm = str(branch or "main").strip() or "main"
+    raw = _content_payload_to_raw(data)
+    content_type = _infer_content_type(domain_norm, data)
     now = _time.time()
     with _content_db() as con:
+        item = con.execute(
+            "SELECT item_id, content_type FROM content_items WHERE name = ? AND domain = ?",
+            (name_norm, domain_norm),
+        ).fetchone()
+        if not item:
+            item_id = str(uuid.uuid4())
+            con.execute(
+                "INSERT INTO content_items (item_id, name, domain, content_type, created_at, updated_at, default_branch) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (item_id, name_norm, domain_norm, content_type, now, now, branch_norm),
+            )
+        else:
+            item_id = str(item["item_id"])
+            con.execute(
+                "UPDATE content_items SET updated_at = ?, content_type = ? WHERE item_id = ?",
+                (now, content_type, item_id),
+            )
+        branch_row = con.execute(
+            "SELECT head_hash FROM content_branches WHERE item_id = ? AND branch = ?",
+            (item_id, branch_norm),
+        ).fetchone()
+        parent_hash = str(branch_row["head_hash"]) if branch_row else ""
+        rev_hash = _content_commit_hash(item_id, branch_norm, parent_hash, raw)
+        commit_message = str(message or ("Initial revision" if not parent_hash else "Updated content")).strip()
         con.execute(
-            "INSERT OR IGNORE INTO content_objects (hash, delta_from, delta_data, created_at) VALUES (?, NULL, ?, ?)",
-            (h, raw, now),
+            "INSERT OR IGNORE INTO content_revisions (rev_hash, item_id, parent_hash, branch, content_data, commit_message, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rev_hash, item_id, parent_hash or None, branch_norm, raw, commit_message, now),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO content_branches (item_id, branch, head_hash, updated_at) VALUES (?, ?, ?, ?)",
+            (item_id, branch_norm, rev_hash, now),
         )
         con.execute(
             "INSERT OR REPLACE INTO content_heads (name, domain, hash, updated_at) VALUES (?, ?, ?, ?)",
-            (name, domain, h, now),
+            (name_norm, domain_norm, rev_hash, now),
         )
-    return h
+        if session_id:
+            con.execute(
+                "INSERT OR REPLACE INTO content_worktrees (session_id, item_id, branch, updated_at) VALUES (?, ?, ?, ?)",
+                (session_id, item_id, branch_norm, now),
+            )
+    payload = {
+        "itemId": item_id,
+        "name": name_norm,
+        "domain": domain_norm,
+        "type": content_type,
+        "branch": branch_norm,
+        "hash": rev_hash,
+        "parentHash": parent_hash,
+        "message": commit_message,
+        "data": _content_raw_to_payload(raw),
+        "updated_at": now,
+        "source": "live",
+        "connected": True,
+        "authoritative": True,
+    }
+    if session_id:
+        content_attach_session(session_id, item_id, name_norm, domain_norm, branch_norm, rev_hash, int(now * 1000))
+    return payload
 
 
-def content_load(domain: str, name: str) -> dict[str, Any] | None:
-    """Load the current version of a named content item. Returns None if not found."""
+def content_load(domain: str, name: str, *, branch: str = "main", session_id: str = "") -> dict[str, Any] | None:
+    """Load the current head for a named content item."""
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    branch_norm = str(branch or "main").strip() or "main"
     con = _content_db()
-    row = con.execute(
-        "SELECT o.delta_data, h.updated_at FROM content_heads h "
-        "JOIN content_objects o ON h.hash = o.hash "
-        "WHERE h.name = ? AND h.domain = ?",
-        (name, domain),
-    ).fetchone()
-    con.close()
+    try:
+        row = _content_head_row(con, domain_norm, name_norm, branch_norm)
+    finally:
+        con.close()
     if not row:
         return None
-    raw, updated_at = row
-    try:
-        data: Any = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        data = raw
-    return {"name": name, "domain": domain, "data": data, "updated_at": updated_at}
+    payload = {
+        "itemId": str(row["item_id"]),
+        "name": str(row["name"]),
+        "domain": str(row["domain"]),
+        "type": str(row["content_type"]),
+        "branch": str(row["branch"]),
+        "hash": str(row["head_hash"]),
+        "parentHash": str(row["parent_hash"] or ""),
+        "message": str(row["commit_message"] or ""),
+        "data": _content_raw_to_payload(str(row["content_data"])),
+        "updated_at": float(row["updated_at"] or row["created_at"] or _time.time()),
+        "source": "live",
+        "connected": True,
+        "authoritative": True,
+    }
+    if session_id:
+        content_attach_session(session_id, payload["itemId"], payload["name"], payload["domain"], payload["branch"], payload["hash"], int(payload["updated_at"] * 1000))
+    return payload
 
 
-def content_list(domain: str) -> list[dict[str, Any]]:
-    """List all content heads for a domain, newest first."""
+def content_history(domain: str, name: str, *, branch: str = "main", limit: int = 20) -> list[dict[str, Any]]:
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    branch_norm = str(branch or "main").strip() or "main"
     con = _content_db()
-    rows = con.execute(
-        "SELECT name, updated_at FROM content_heads WHERE domain = ? ORDER BY updated_at DESC",
-        (domain,),
-    ).fetchall()
-    con.close()
-    return [{"name": r[0], "domain": domain, "updated_at": r[1]} for r in rows]
+    try:
+        row = _content_head_row(con, domain_norm, name_norm, branch_norm)
+        if not row:
+            return []
+        item_id = str(row["item_id"])
+        head_hash = str(row["head_hash"])
+        current = head_hash
+        out: list[dict[str, Any]] = []
+        while current and len(out) < max(1, min(int(limit), 100)):
+            rev = con.execute(
+                "SELECT rev_hash, parent_hash, commit_message, created_at, content_data FROM content_revisions WHERE rev_hash = ? AND item_id = ?",
+                (current, item_id),
+            ).fetchone()
+            if not rev:
+                break
+            content_data = _content_raw_to_payload(str(rev["content_data"]))
+            summary = ""
+            if isinstance(content_data, str):
+                summary = content_data.replace("\n", " ").strip()[:80]
+            elif isinstance(content_data, dict):
+                summary = ", ".join(str(k) for k in list(content_data.keys())[:4])
+            out.append(
+                {
+                    "hash": str(rev["rev_hash"]),
+                    "parentHash": str(rev["parent_hash"] or ""),
+                    "message": str(rev["commit_message"] or ""),
+                    "createdAt": float(rev["created_at"] or _time.time()),
+                    "current": str(rev["rev_hash"]) == head_hash,
+                    "summary": summary,
+                }
+            )
+            current = str(rev["parent_hash"] or "")
+        return out
+    finally:
+        con.close()
+
+
+def content_branch_create(domain: str, name: str, branch: str, *, from_branch: str = "main") -> dict[str, Any] | None:
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    branch_norm = str(branch or "").strip()
+    from_branch_norm = str(from_branch or "main").strip() or "main"
+    if not branch_norm:
+        return None
+    with _content_db() as con:
+        head = _content_head_row(con, domain_norm, name_norm, from_branch_norm)
+        if not head:
+            return None
+        now = _time.time()
+        con.execute(
+            "INSERT OR REPLACE INTO content_branches (item_id, branch, head_hash, updated_at) VALUES (?, ?, ?, ?)",
+            (head["item_id"], branch_norm, head["head_hash"], now),
+        )
+        return {
+            "itemId": str(head["item_id"]),
+            "name": str(head["name"]),
+            "domain": str(head["domain"]),
+            "branch": branch_norm,
+            "fromBranch": from_branch_norm,
+            "hash": str(head["head_hash"]),
+            "updated_at": now,
+            "source": "live",
+            "connected": True,
+            "authoritative": True,
+        }
+
+
+def content_branches(domain: str, name: str) -> list[dict[str, Any]]:
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    con = _content_db()
+    try:
+        item = con.execute(
+            "SELECT item_id, default_branch FROM content_items WHERE domain = ? AND name = ?",
+            (domain_norm, name_norm),
+        ).fetchone()
+        if not item:
+            return []
+        rows = con.execute(
+            "SELECT b.branch, b.head_hash, b.updated_at, i.default_branch "
+            "FROM content_branches b JOIN content_items i ON i.item_id = b.item_id "
+            "WHERE b.item_id = ? ORDER BY CASE WHEN b.branch = i.default_branch THEN 0 ELSE 1 END, b.updated_at DESC, b.branch ASC",
+            (str(item["item_id"]),),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "branch": str(row["branch"]),
+                    "hash": str(row["head_hash"]),
+                    "updated_at": float(row["updated_at"] or _time.time()),
+                    "isDefault": str(row["branch"]) == str(row["default_branch"]),
+                    "source": "live",
+                    "connected": True,
+                    "authoritative": True,
+                }
+            )
+        return out
+    finally:
+        con.close()
+
+
+def content_merge(
+    domain: str,
+    name: str,
+    source_branch: str,
+    *,
+    target_branch: str = "main",
+    session_id: str = "",
+) -> dict[str, Any] | None:
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    source_branch_norm = str(source_branch or "").strip()
+    target_branch_norm = str(target_branch or "main").strip() or "main"
+    if not name_norm or not source_branch_norm or source_branch_norm == target_branch_norm:
+        return None
+    con = _content_db()
+    try:
+        source = _content_head_row(con, domain_norm, name_norm, source_branch_norm)
+        target = _content_head_row(con, domain_norm, name_norm, target_branch_norm)
+        if not source or not target:
+            return None
+        rev = con.execute(
+            "SELECT content_data FROM content_revisions WHERE rev_hash = ? AND item_id = ?",
+            (source["head_hash"], source["item_id"]),
+        ).fetchone()
+        if not rev:
+            return None
+        payload = _content_raw_to_payload(str(rev["content_data"]))
+    finally:
+        con.close()
+    merged = content_commit(
+        domain_norm,
+        name_norm,
+        payload,
+        branch=target_branch_norm,
+        message=f"Merge branch {source_branch_norm} into {target_branch_norm}",
+        session_id=session_id,
+    )
+    if merged:
+        merged["mergedFromBranch"] = source_branch_norm
+    return merged
+
+
+def content_revert(domain: str, name: str, target_hash: str, *, branch: str = "main", session_id: str = "") -> dict[str, Any] | None:
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
+    branch_norm = str(branch or "main").strip() or "main"
+    target_hash_norm = str(target_hash or "").strip()
+    if not target_hash_norm:
+        return None
+    con = _content_db()
+    try:
+        row = _content_head_row(con, domain_norm, name_norm, branch_norm)
+        if not row:
+            return None
+        rev = con.execute(
+            "SELECT content_data FROM content_revisions WHERE rev_hash = ? AND item_id = ?",
+            (target_hash_norm, row["item_id"]),
+        ).fetchone()
+        if not rev:
+            return None
+        payload = _content_raw_to_payload(str(rev["content_data"]))
+    finally:
+        con.close()
+    return content_commit(
+        domain_norm,
+        name_norm,
+        payload,
+        branch=branch_norm,
+        message=f"Revert to {target_hash_norm[:8]}",
+        session_id=session_id,
+    )
+
+
+def content_list(domain: str = "", *, query: str = "", content_type: str = "") -> list[dict[str, Any]]:
+    """List repository heads, optionally across all domains."""
+    domain_norm = str(domain or "").strip().lower()
+    query_norm = str(query or "").strip().lower()
+    type_norm = str(content_type or "").strip().lower()
+    sql = (
+        "SELECT i.item_id, i.name, i.domain, i.content_type, i.updated_at, b.branch, b.head_hash, "
+        "r.content_data, r.commit_message, "
+        "(SELECT COUNT(*) FROM content_revisions cr WHERE cr.item_id = i.item_id) AS revision_count, "
+        "(SELECT COUNT(*) FROM content_branches cb WHERE cb.item_id = i.item_id) AS branch_count, "
+        "(SELECT COUNT(*) FROM content_worktrees cw WHERE cw.item_id = i.item_id) AS attached_sessions "
+        "FROM content_items i "
+        "JOIN content_branches b ON b.item_id = i.item_id AND b.branch = i.default_branch "
+        "LEFT JOIN content_revisions r ON r.rev_hash = b.head_hash AND r.item_id = i.item_id "
+        "WHERE 1=1"
+    )
+    params: list[Any] = []
+    if domain_norm and domain_norm not in {"all", "*"}:
+        sql += " AND i.domain = ?"
+        params.append(domain_norm)
+    if type_norm:
+        sql += " AND i.content_type = ?"
+        params.append(type_norm)
+    if query_norm:
+        sql += " AND (LOWER(i.name) LIKE ? OR LOWER(i.domain) LIKE ? OR LOWER(i.content_type) LIKE ? OR LOWER(COALESCE(r.content_data, '')) LIKE ?)"
+        params.extend([f"%{query_norm}%", f"%{query_norm}%", f"%{query_norm}%", f"%{query_norm}%"])
+    sql += " ORDER BY i.updated_at DESC"
+    con = _content_db()
+    try:
+        rows = con.execute(sql, params).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            raw_content = _content_raw_to_payload(str(row["content_data"] or ""))
+            summary = ""
+            if isinstance(raw_content, str):
+                summary = raw_content.replace("\n", " ").strip()[:120]
+            elif isinstance(raw_content, dict):
+                summary = ", ".join(str(k) for k in list(raw_content.keys())[:4])
+            out.append(
+                {
+                    "itemId": str(row["item_id"]),
+                    "name": str(row["name"]),
+                    "domain": str(row["domain"]),
+                    "type": str(row["content_type"]),
+                    "branch": str(row["branch"]),
+                    "hash": str(row["head_hash"]),
+                    "summary": summary,
+                    "headMessage": str(row["commit_message"] or ""),
+                    "revisionCount": int(row["revision_count"] or 0),
+                    "branchCount": int(row["branch_count"] or 0),
+                    "attachedSessions": int(row["attached_sessions"] or 0),
+                    "updated_at": float(row["updated_at"] or _time.time()),
+                    "source": "live",
+                    "connected": True,
+                    "authoritative": True,
+                }
+            )
+        return out
+    finally:
+        con.close()
 
 
 def content_delete(domain: str, name: str) -> bool:
-    """Remove a content head (objects remain for history). Returns True if deleted."""
+    """Delete a content item from the repository."""
+    domain_norm = str(domain or "").strip().lower()
+    name_norm = str(name or "").strip()
     with _content_db() as con:
-        cur = con.execute(
-            "DELETE FROM content_heads WHERE name = ? AND domain = ?", (name, domain)
-        )
-    return cur.rowcount > 0
+        item = con.execute(
+            "SELECT item_id FROM content_items WHERE name = ? AND domain = ?",
+            (name_norm, domain_norm),
+        ).fetchone()
+        if not item:
+            return False
+        item_id = str(item["item_id"])
+        con.execute("DELETE FROM content_worktrees WHERE item_id = ?", (item_id,))
+        con.execute("DELETE FROM content_branches WHERE item_id = ?", (item_id,))
+        con.execute("DELETE FROM content_items WHERE item_id = ?", (item_id,))
+    return True
 
 
 # ── MCP Server Registry ────────────────────────────────────────────────────────
@@ -1615,16 +2593,69 @@ def connector_revoke_scope(scope: str) -> dict[str, Any]:
 def connector_grants_report() -> dict[str, Any]:
     catalog = sorted(connector_scope_catalog())
     grants = CONNECTOR_VAULT.get("grants", {}) if isinstance(CONNECTOR_VAULT.get("grants"), dict) else {}
+    scope_meta: dict[str, dict[str, Any]] = {}
+    for item in CONNECTOR_MANIFESTS:
+        if not isinstance(item, dict):
+            continue
+        connector_id = str(item.get("id", "") or "").strip()
+        domain = str(item.get("domain", "") or "").strip()
+        provider = str(item.get("provider", "") or "").strip()
+        scopes = item.get("scopes", []) if isinstance(item.get("scopes"), list) else []
+        risk_map = item.get("riskMap", {}) if isinstance(item.get("riskMap"), dict) else {}
+        for scope in scopes:
+            scope_norm = str(scope or "").strip().lower()
+            if not scope_norm:
+                continue
+            support = (item.get("deviceProfiles", {}) or {}).get(scope_norm) if isinstance(item.get("deviceProfiles"), dict) else {}
+            scope_meta.setdefault(scope_norm, {
+                "connectors": [],
+                "capabilities": set(),
+                "domains": set(),
+                "providers": set(),
+                "risk": "",
+                "support": "",
+            })
+            scope_meta[scope_norm]["connectors"].append(connector_id)
+            scope_meta[scope_norm]["domains"].add(domain)
+            scope_meta[scope_norm]["providers"].add(provider)
+            if not scope_meta[scope_norm]["risk"]:
+                scope_meta[scope_norm]["risk"] = str(risk_map.get(scope_norm, "") or "")
+            if isinstance(support, dict) and not scope_meta[scope_norm]["support"]:
+                desktop_support = str(support.get("desktop", "") or "").strip()
+                mobile_support = str(support.get("mobile", "") or "").strip()
+                fallback = str(support.get("fallback", "") or "").strip()
+                scope_meta[scope_norm]["support"] = " / ".join([part for part in [desktop_support, mobile_support, fallback] if part])
     items: list[dict[str, Any]] = []
+    for capability_name, spec in CAPABILITY_REGISTRY.items():
+        scopes = spec.get("connector_scopes", []) if isinstance(spec.get("connector_scopes"), list) else []
+        for scope in scopes:
+            scope_norm = normalize_connector_scope(str(scope))
+            if scope_norm:
+                scope_meta.setdefault(scope_norm, {
+                    "connectors": [],
+                    "capabilities": set(),
+                    "domains": set(),
+                    "providers": set(),
+                    "risk": "",
+                    "support": "",
+                })
+                scope_meta[scope_norm]["capabilities"].add(str(capability_name))
     for scope in catalog:
         grant = grants.get(scope, {}) if isinstance(grants.get(scope), dict) else {}
         granted = connector_scope_granted(scope)
+        meta = scope_meta.get(scope, {})
         items.append(
             {
                 "scope": scope,
                 "granted": granted,
                 "grantedAt": int(grant.get("grantedAt", 0) or 0),
                 "expiresAt": int(grant.get("expiresAt", 0) or 0),
+                "connectors": list(meta.get("connectors", [])),
+                "capabilities": sorted(list(meta.get("capabilities", set()))),
+                "domains": sorted(list(meta.get("domains", set()))),
+                "providers": sorted(list(meta.get("providers", set()))),
+                "risk": str(meta.get("risk", "") or ""),
+                "support": str(meta.get("support", "") or ""),
             }
         )
     granted_count = sum(1 for item in items if bool(item.get("granted", False)))
@@ -1859,15 +2890,10 @@ def _get_live_token(
     client_id: str | None,
     client_secret: str | None,
 ) -> str | None:
-    """Return a valid access token for a service, refreshing if within 60 s of expiry."""
-    tok = _auth.vault_retrieve(service)
-    if not tok:
-        return None
-    expires_at = float(tok.get("expires_at", 0))
-    # Refresh if expiring soon (or no expiry info and token_url provided)
-    if token_url and client_id and client_secret and _time.time() > expires_at - 60:
-        tok = _oauth_token_refresh(service, token_url, client_id, client_secret)
-    if not tok:
+    """Return a valid access token for a service, using the shared vault refresh helper."""
+    try:
+        tok = _auth.refresh_token_if_needed_sync(service)
+    except Exception:
         return None
     return str(tok.get("access_token", "")) or None
 
@@ -2743,19 +3769,28 @@ MOCK_SLACK_CHANNELS: list[dict[str, Any]] = [
     {"id": "C004", "name": "product", "unread_count": 2, "is_private": False},
 ]
 
+
+def with_scene_contract(payload: dict[str, Any], *, connected: bool, authoritative: bool, fallback_reason: str = "") -> dict[str, Any]:
+    out = dict(payload)
+    out["connected"] = bool(connected)
+    out["authoritative"] = bool(authoritative)
+    if fallback_reason:
+        out["fallbackReason"] = str(fallback_reason)
+    return out
+
 MOCK_GITHUB_PRS: list[dict[str, Any]] = [
-    {"number": 42, "title": "Add OAuth connector for Slack", "state": "open",
+    {"number": 42, "title": "Add OAuth connector for Slack", "state": "done",
      "repo": "org/genomeui", "author": "steve", "created_at": "2026-03-01"},
-    {"number": 41, "title": "Fix semantic cache TTL for sports", "state": "open",
+    {"number": 41, "title": "Fix semantic cache TTL for sports", "state": "done",
      "repo": "org/genomeui", "author": "alice", "created_at": "2026-02-28"},
-    {"number": 39, "title": "Taxonomy wave-4 build-out", "state": "open",
+    {"number": 39, "title": "Taxonomy wave-4 build-out", "state": "done",
      "repo": "org/genomeui", "author": "bob", "created_at": "2026-02-25"},
 ]
 
 MOCK_GITHUB_ISSUES: list[dict[str, Any]] = [
-    {"number": 88, "title": "Terminal surface breaks on Windows", "state": "open",
+    {"number": 88, "title": "Terminal surface breaks on Windows", "state": "done",
      "repo": "org/genomeui", "author": "carol", "created_at": "2026-03-04"},
-    {"number": 87, "title": "Spreadsheet formula evaluator missing AVERAGE", "state": "open",
+    {"number": 87, "title": "Spreadsheet formula evaluator missing AVERAGE", "state": "done",
      "repo": "org/genomeui", "author": "steve", "created_at": "2026-03-02"},
 ]
 
@@ -2787,9 +3822,14 @@ MOCK_ASANA_TASKS: list[dict[str, Any]] = [
 def spotify_now_playing_snapshot() -> dict[str, Any]:
     mode = _effective_mode("spotify", SPOTIFY_PROVIDER_MODE)
     if mode == "live":
-        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        token = _get_token("spotify")
         if not token:
-            return {"ok": False, "source": "live", "error": "Spotify not connected — connect via /api/connectors/oauth/spotify/begin"}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Spotify not connected", "track": None, "artist": "", "album": "", "album_art": ""},
+                connected=False,
+                authoritative=False,
+                fallback_reason="connector_not_connected",
+            )
         try:
             with httpx.Client(timeout=5.0) as client:
                 resp = client.get(
@@ -2797,26 +3837,59 @@ def spotify_now_playing_snapshot() -> dict[str, Any]:
                     headers={"Authorization": f"Bearer {token}"},
                 )
             if resp.status_code == 204:
-                return {"ok": True, "source": "live", "is_playing": False, "track": None}
+                return with_scene_contract(
+                    {"ok": False, "source": "live", "is_playing": False, "track": None, "artist": "", "album": "", "album_art": "", "error": "No active Spotify device"},
+                    connected=True,
+                    authoritative=False,
+                    fallback_reason="no_active_device",
+                )
+            if resp.status_code == 401:
+                return with_scene_contract(
+                    {"ok": False, "source": "live", "error": "Spotify session expired", "track": None, "artist": "", "album": "", "album_art": ""},
+                    connected=False,
+                    authoritative=False,
+                    fallback_reason="token_expired",
+                )
+            if resp.status_code != 200:
+                return with_scene_contract(
+                    {"ok": False, "source": "live", "error": f"Spotify request failed ({resp.status_code})", "track": None, "artist": "", "album": "", "album_art": ""},
+                    connected=True,
+                    authoritative=False,
+                    fallback_reason="connector_error",
+                )
             data = resp.json()
             item = data.get("item") or {}
             artists = item.get("artists") or [{}]
             images = (item.get("album") or {}).get("images") or [{}]
-            return {
-                "ok": True,
-                "source": "live",
-                "track": item.get("name"),
-                "artist": artists[0].get("name"),
-                "album": (item.get("album") or {}).get("name"),
-                "progress_ms": data.get("progress_ms"),
-                "duration_ms": item.get("duration_ms"),
-                "is_playing": data.get("is_playing", False),
-                "album_art": images[0].get("url", ""),
-            }
-        except Exception:
-            return {"ok": False, "source": "live", "error": "Spotify request failed"}
+            return with_scene_contract(
+                {
+                    "ok": True,
+                    "source": "live",
+                    "track": item.get("name"),
+                    "artist": artists[0].get("name"),
+                    "album": (item.get("album") or {}).get("name"),
+                    "progress_ms": data.get("progress_ms"),
+                    "duration_ms": item.get("duration_ms"),
+                    "is_playing": data.get("is_playing", False),
+                    "album_art": images[0].get("url", ""),
+                },
+                connected=True,
+                authoritative=True,
+            )
+        except Exception as exc:
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": f"Spotify request failed: {exc}", "track": None, "artist": "", "album": "", "album_art": ""},
+                connected=True,
+                authoritative=False,
+                fallback_reason="connector_error",
+            )
     source = "mock" if mode == "mock" else "scaffold"
-    return {"ok": True, "source": source, **MOCK_SPOTIFY_NOW_PLAYING}
+    return with_scene_contract(
+        {"ok": True, "source": source, **MOCK_SPOTIFY_NOW_PLAYING},
+        connected=False,
+        authoritative=False,
+        fallback_reason=f"{source}_data",
+    )
 
 
 def gmail_list_snapshot(max_results: int = 10) -> dict[str, Any]:
@@ -2826,9 +3899,14 @@ def gmail_list_snapshot(max_results: int = 10) -> dict[str, Any]:
     mode = _effective_mode("gmail", GMAIL_PROVIDER_MODE)
     capped = max(1, min(int(max_results or 10), 20))
     if mode == "live":
-        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        token = _get_token("gmail")
         if not token:
-            return {"ok": False, "source": "live", "error": "Gmail not connected", "messages": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Gmail not connected", "messages": [], "unread_count": 0},
+                connected=False,
+                authoritative=False,
+                fallback_reason="connector_not_connected",
+            )
         try:
             with httpx.Client(timeout=10.0) as client:
                 hdrs = {"Authorization": f"Bearer {token}"}
@@ -2837,6 +3915,21 @@ def gmail_list_snapshot(max_results: int = 10) -> dict[str, Any]:
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={capped}&q=in:inbox",
                     headers=hdrs,
                 )
+                if resp.status_code == 401:
+                    return with_scene_contract(
+                        {"ok": False, "source": "live", "error": "Gmail token expired — reconnect", "messages": [], "unread_count": 0},
+                        connected=False,
+                        authoritative=False,
+                        fallback_reason="token_expired",
+                    )
+                if resp.status_code != 200:
+                    err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+                    return with_scene_contract(
+                        {"ok": False, "source": "live", "error": err_msg, "messages": [], "unread_count": 0},
+                        connected=True,
+                        authoritative=False,
+                        fallback_reason="connector_error",
+                    )
                 ids = [m["id"] for m in resp.json().get("messages", [])][:capped]
 
                 # 2. Fetch metadata for each message in parallel
@@ -2878,26 +3971,112 @@ def gmail_list_snapshot(max_results: int = 10) -> dict[str, Any]:
                     date_str = date_raw[:10] if date_raw else ""
                 messages.append({
                     "id": meta.get("id", ""),
+                    "threadId": meta.get("threadId", ""),
                     "from": from_name or from_raw,
                     "subject": _hdr(payload_headers, "Subject"),
                     "snippet": meta.get("snippet", ""),
                     "date": date_str,
+                    "dateRaw": date_raw,
                     "unread": is_unread,
                 })
-            return {"ok": True, "source": "live", "messages": messages, "unread_count": unread_count}
+            return with_scene_contract(
+                {"ok": True, "source": "live", "messages": messages, "unread_count": unread_count},
+                connected=True,
+                authoritative=True,
+            )
         except Exception as exc:
-            return {"ok": False, "source": "live", "error": f"Gmail request failed: {exc}", "messages": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": f"Gmail request failed: {exc}", "messages": [], "unread_count": 0},
+                connected=True,
+                authoritative=False,
+                fallback_reason="connector_error",
+            )
     source = "mock" if mode == "mock" else "scaffold"
-    return {"ok": True, "source": source, "messages": copy.deepcopy(MOCK_GMAIL_MESSAGES[:capped]), "unread_count": 3}
+    return with_scene_contract(
+        {"ok": True, "source": source, "messages": copy.deepcopy(MOCK_GMAIL_MESSAGES[:capped]), "unread_count": 3},
+        connected=False,
+        authoritative=False,
+        fallback_reason=f"{source}_data",
+    )
+
+
+def _imap_list_snapshot_sync(email_addr: str, creds: dict, max_results: int = 10) -> dict:
+    import imaplib as _imaplib
+    import email as _email_lib
+    import ssl as _ssl
+    host = str(creds.get("imap_host", ""))
+    port = int(creds.get("imap_port", 993))
+    password = str(creds.get("password", ""))
+    capped = max(1, min(int(max_results or 10), 20))
+    try:
+        ctx = _ssl.create_default_context()
+        M = _imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+        M.login(email_addr, password)
+        M.select("INBOX")
+        _, data = M.search(None, "ALL")
+        uids = data[0].split() if data and data[0] else []
+        recent = list(reversed(uids[-capped:] if len(uids) > capped else uids))
+        messages = []
+        for uid in recent:
+            _, msg_data = M.fetch(uid, "(RFC822.HEADER FLAGS)")
+            if not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else b""
+            msg = _email_lib.message_from_bytes(raw)
+            flags_str = msg_data[0][0].decode(errors="replace") if isinstance(msg_data[0][0], bytes) else ""
+            messages.append({
+                "id": uid.decode(errors="replace"),
+                "from": msg.get("From", ""),
+                "subject": msg.get("Subject", "(no subject)"),
+                "date": msg.get("Date", ""),
+                "snippet": "",
+                "unread": "\\Seen" not in flags_str,
+            })
+        M.logout()
+        unread_count = sum(1 for m in messages if m["unread"])
+        return {"ok": True, "source": "live", "messages": messages, "unread_count": unread_count}
+    except Exception as exc:
+        return {"ok": False, "source": "live", "error": str(exc), "messages": [], "unread_count": 0}
+
+
+async def imap_list_snapshot_async(email_addr: str, creds: dict, max_results: int = 10) -> dict:
+    return await asyncio.to_thread(_imap_list_snapshot_sync, email_addr, creds, max_results)
+
+
+def _smtp_send_sync(from_addr: str, creds: dict, to: str, subject: str, body: str) -> dict:
+    import smtplib as _smtplib
+    import ssl as _ssl
+    from email.mime.text import MIMEText
+    host = str(creds.get("smtp_host", ""))
+    port = int(creds.get("smtp_port", 587))
+    password = str(creds.get("password", ""))
+    msg = MIMEText(body)
+    msg["From"] = from_addr
+    msg["To"] = to
+    msg["Subject"] = subject
+    try:
+        ctx = _ssl.create_default_context()
+        with _smtplib.SMTP(host, port) as s:
+            s.starttls(context=ctx)
+            s.login(from_addr, password)
+            s.sendmail(from_addr, [to], msg.as_string())
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def gcal_events_snapshot(days: int = 7) -> dict[str, Any]:
     mode = _effective_mode("gcal", GCAL_PROVIDER_MODE)
     d = max(1, min(int(days or 7), 90))
     if mode == "live":
-        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        token = _get_token("gcal")
         if not token:
-            return {"ok": False, "source": "live", "error": "Google Calendar not connected", "events": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Google Calendar not connected", "events": []},
+                connected=False,
+                authoritative=False,
+                fallback_reason="connector_not_connected",
+            )
         try:
             from datetime import timedelta
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2915,23 +4094,69 @@ def gcal_events_snapshot(days: int = 7) -> dict[str, Any]:
                 start = start_obj.get("dateTime") or start_obj.get("date") or ""
                 end_obj = e.get("end", {})
                 end = end_obj.get("dateTime") or end_obj.get("date") or ""
+                # Parse start_ms so the scheduler can detect events starting soon
+                start_ms = 0
+                if start:
+                    try:
+                        from datetime import timezone as _tz
+                        # dateTime is ISO-8601 with offset; date is YYYY-MM-DD (treat as midnight UTC)
+                        if "T" in start:
+                            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                        else:
+                            dt = datetime.fromisoformat(start).replace(tzinfo=_tz.utc)
+                        start_ms = int(dt.timestamp() * 1000)
+                    except Exception:
+                        pass
+                start_local = ""
+                end_local = ""
+                try:
+                    if start:
+                        start_local = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).astimezone().isoformat()
+                    if end:
+                        if "T" in end:
+                            end_local = datetime.fromisoformat(end.replace("Z", "+00:00")).astimezone().isoformat()
+                        else:
+                            end_local = datetime.fromisoformat(end).replace(tzinfo=timezone.utc).astimezone().isoformat()
+                except Exception:
+                    pass
                 return {"id": e.get("id", ""), "summary": e.get("summary", ""),
-                        "start": start, "end": end, "location": e.get("location", "")}
+                        "start": start, "end": end, "location": e.get("location", ""),
+                        "start_ms": start_ms, "start_local": start_local, "end_local": end_local,
+                        "attendees": e.get("attendees", [])}
             events = [_norm_event(e) for e in data.get("items", [])]
-            return {"ok": True, "source": "live", "events": events}
+            return with_scene_contract(
+                {"ok": True, "source": "live", "events": events},
+                connected=True,
+                authoritative=True,
+            )
         except Exception as exc:
-            return {"ok": False, "source": "live", "error": f"Google Calendar request failed: {exc}", "events": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": f"Google Calendar request failed: {exc}", "events": []},
+                connected=True,
+                authoritative=False,
+                fallback_reason="connector_error",
+            )
     source = "mock" if mode == "mock" else "scaffold"
-    return {"ok": True, "source": source, "events": copy.deepcopy(MOCK_GCAL_EVENTS)}
+    return with_scene_contract(
+        {"ok": True, "source": source, "events": copy.deepcopy(MOCK_GCAL_EVENTS)},
+        connected=False,
+        authoritative=False,
+        fallback_reason=f"{source}_data",
+    )
 
 
 def gdrive_list_snapshot(query: str = "") -> dict[str, Any]:
     mode = _effective_mode("gdrive", GDRIVE_PROVIDER_MODE)
     q = str(query or "").strip()
     if mode == "live":
-        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        token = _get_token("gdrive")
         if not token:
-            return {"ok": False, "source": "live", "error": "Google Drive not connected", "files": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Google Drive not connected", "files": []},
+                connected=False,
+                authoritative=False,
+                fallback_reason="connector_not_connected",
+            )
         try:
             q_param = f"&q={quote_plus(q)}" if q else ""
             with httpx.Client(timeout=8.0) as client:
@@ -2941,23 +4166,41 @@ def gdrive_list_snapshot(query: str = "") -> dict[str, Any]:
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 data = resp.json()
-            return {"ok": True, "source": "live", "files": data.get("files", [])}
+            return with_scene_contract(
+                {"ok": True, "source": "live", "files": data.get("files", [])},
+                connected=True,
+                authoritative=True,
+            )
         except Exception:
-            return {"ok": False, "source": "live", "error": "Google Drive request failed", "files": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Google Drive request failed", "files": []},
+                connected=True,
+                authoritative=False,
+                fallback_reason="connector_error",
+            )
     source = "mock" if mode == "mock" else "scaffold"
     files = copy.deepcopy(MOCK_GDRIVE_FILES)
     if q:
         files = [f for f in files if q.lower() in f["name"].lower()]
-    return {"ok": True, "source": source, "files": files}
+    return with_scene_contract(
+        {"ok": True, "source": source, "files": files},
+        connected=False,
+        authoritative=False,
+        fallback_reason=f"{source}_data",
+    )
 
 
 def slack_channels_snapshot() -> dict[str, Any]:
     mode = _effective_mode("slack", SLACK_PROVIDER_MODE)
     if mode == "live":
-        # Slack user tokens don't expire; no refresh needed
-        token = _get_live_token("slack", None, None, None)
+        token = _get_slack_token()
         if not token:
-            return {"ok": False, "source": "live", "error": "Slack not connected", "channels": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Slack not connected", "channels": []},
+                connected=False,
+                authoritative=False,
+                fallback_reason="connector_not_connected",
+            )
         try:
             with httpx.Client(timeout=8.0) as client:
                 resp = client.get(
@@ -2965,11 +4208,347 @@ def slack_channels_snapshot() -> dict[str, Any]:
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 data = resp.json()
-            return {"ok": bool(data.get("ok")), "source": "live", "channels": data.get("channels", [])}
+            ok = bool(data.get("ok"))
+            return with_scene_contract(
+                {"ok": ok, "source": "live", "channels": data.get("channels", []), "error": "" if ok else str(data.get("error", "Slack request failed"))},
+                connected=ok,
+                authoritative=ok,
+                fallback_reason="" if ok else "connector_error",
+            )
         except Exception:
-            return {"ok": False, "source": "live", "error": "Slack request failed", "channels": []}
+            return with_scene_contract(
+                {"ok": False, "source": "live", "error": "Slack request failed", "channels": []},
+                connected=True,
+                authoritative=False,
+                fallback_reason="connector_error",
+            )
     source = "mock" if mode == "mock" else "scaffold"
-    return {"ok": True, "source": source, "channels": copy.deepcopy(MOCK_SLACK_CHANNELS)}
+    return with_scene_contract(
+        {"ok": True, "source": source, "channels": copy.deepcopy(MOCK_SLACK_CHANNELS)},
+        connected=False,
+        authoritative=False,
+        fallback_reason=f"{source}_data",
+    )
+
+
+def build_connections_status_payload(target_service: str | None = None) -> dict[str, Any]:
+    service_modes = {
+        "spotify": SPOTIFY_PROVIDER_MODE,
+        "gmail": GMAIL_PROVIDER_MODE,
+        "gcal": GCAL_PROVIDER_MODE,
+        "gdrive": GDRIVE_PROVIDER_MODE,
+        "slack": SLACK_PROVIDER_MODE,
+        "plaid": PLAID_PROVIDER_MODE,
+    }
+    service_labels = {
+        "spotify": "Spotify",
+        "gmail": "Gmail",
+        "gcal": "Google Calendar",
+        "gdrive": "Google Drive",
+        "slack": "Slack",
+        "plaid": "Plaid (Banking)",
+    }
+    services: dict[str, Any] = {}
+    manifest_by_service = {
+        str(item.get("id", "") or "").strip(): item
+        for item in CONNECTOR_MANIFESTS
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    snapshot_by_service = {
+        "gmail": lambda: gmail_list_snapshot(max_results=5),
+        "gcal": lambda: gcal_events_snapshot(days=3),
+        "gdrive": lambda: gdrive_list_snapshot(query=""),
+        "slack": lambda: slack_channels_snapshot(),
+    }
+    for svc, provider_mode in service_modes.items():
+        token = _auth.vault_retrieve(svc)
+        connected = bool(token)
+        effective_mode = _effective_mode(svc, provider_mode)
+        env_id, env_secret = _OAUTH_CLIENT_PAIRS.get(svc, ("", ""))
+        configured = _is_service_configured(svc, env_id, env_secret)
+        status = "connected" if connected else ("ready_to_connect" if configured else "credentials_required")
+        detail = "Token present in vault" if connected else ("OAuth credentials configured" if configured else "Client credentials required")
+        fallback_reason = ""
+        last_error = ""
+        authoritative = True
+        sample_count = 0
+        manifest = manifest_by_service.get(svc, {}) if isinstance(manifest_by_service.get(svc), dict) else {}
+        scopes = [str(scope).strip() for scope in (manifest.get("scopes", []) if isinstance(manifest.get("scopes"), list) else []) if str(scope).strip()]
+        risk_map = manifest.get("riskMap", {}) if isinstance(manifest.get("riskMap"), dict) else {}
+        risk_values = sorted({str(value).strip() for value in risk_map.values() if str(value).strip()})
+        if svc in snapshot_by_service:
+            try:
+                snap = snapshot_by_service[svc]()
+            except Exception:
+                snap = {"ok": False, "connected": connected, "authoritative": False, "fallbackReason": "connector_error", "error": "Snapshot failed"}
+            if isinstance(snap, dict):
+                fallback_reason = str(snap.get("fallbackReason", "") or "")
+                last_error = str(snap.get("error", "") or "")
+                authoritative = bool(snap.get("authoritative", True))
+                if "messages" in snap and isinstance(snap.get("messages"), list):
+                    sample_count = len(snap.get("messages", []))
+                elif "events" in snap and isinstance(snap.get("events"), list):
+                    sample_count = len(snap.get("events", []))
+                elif "files" in snap and isinstance(snap.get("files"), list):
+                    sample_count = len(snap.get("files", []))
+                elif "channels" in snap and isinstance(snap.get("channels"), list):
+                    sample_count = len(snap.get("channels", []))
+                if connected and not authoritative:
+                    status = "connector_error"
+                    detail = last_error or fallback_reason.replace("_", " ") or "Connector request failed"
+                elif not connected and fallback_reason:
+                    detail = last_error or fallback_reason.replace("_", " ") or detail
+        services[svc] = {
+            "label": service_labels[svc],
+            "connected": connected,
+            "configured": configured,
+            "mode": effective_mode,
+            "status": status,
+            "detail": detail,
+            "authoritative": authoritative,
+            "fallbackReason": fallback_reason,
+            "lastError": last_error,
+            "sampleCount": int(sample_count),
+            "domain": str(manifest.get("domain", "") or ""),
+            "providerId": str(manifest.get("provider", "") or ""),
+            "requiredScopes": scopes,
+            "riskLevels": risk_values,
+            "authUrl": f"/api/connectors/oauth/{svc}/begin" if svc != "plaid" else "/api/connectors/plaid/link_token",
+        }
+    lines = [
+        f"{row['label']}: {'connected' if row['connected'] else 'not connected'} ({row['mode']})"
+        for row in services.values()
+    ]
+    grants_report = connector_grants_report()
+    return {
+        "ok": True,
+        "message": "Connections panel ready.",
+        "previewLines": lines,
+        "data": {
+            "op": "connections_status",
+            "services": services,
+            "grants": grants_report.get("items", []),
+            "grantsSummary": {
+                "count": int(grants_report.get("count", 0) or 0),
+                "granted": int(grants_report.get("granted", 0) or 0),
+            },
+            "targetService": str(target_service or "").strip() or None,
+        },
+    }
+
+
+def _connector_sample_items_from_snapshot(service: str, snap: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    if not isinstance(snap, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    svc = str(service or "").strip().lower()
+    if svc == "gmail":
+        for row in (snap.get("messages") if isinstance(snap.get("messages"), list) else [])[: max(1, min(int(limit), 10))]:
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                {
+                    "label": str(row.get("from", "") or "message")[:80],
+                    "type": str(row.get("subject", "") or "email")[:120],
+                    "detail": str(row.get("snippet", "") or "")[:180],
+                    "time": str(row.get("ts", "") or ""),
+                }
+            )
+    elif svc == "gcal":
+        for row in (snap.get("events") if isinstance(snap.get("events"), list) else [])[: max(1, min(int(limit), 10))]:
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                {
+                    "label": str(row.get("title", "") or "event")[:80],
+                    "type": str(row.get("start", "") or "calendar")[:80],
+                    "detail": str(row.get("location", "") or row.get("calendar", "") or "")[:180],
+                    "time": str(row.get("start", "") or ""),
+                }
+            )
+    elif svc == "gdrive":
+        for row in (snap.get("files") if isinstance(snap.get("files"), list) else [])[: max(1, min(int(limit), 10))]:
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                {
+                    "label": str(row.get("name", "") or "file")[:80],
+                    "type": str(row.get("mimeType", "") or "file")[:120],
+                    "detail": str(row.get("id", "") or "")[:180],
+                    "time": str(row.get("modifiedTime", "") or ""),
+                }
+            )
+    elif svc == "slack":
+        for row in (snap.get("channels") if isinstance(snap.get("channels"), list) else [])[: max(1, min(int(limit), 10))]:
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                {
+                    "label": str(row.get("name", "") or "channel")[:80],
+                    "type": f"{int(row.get('unread_count', 0) or 0)} unread",
+                    "detail": str(row.get("topic", "") or row.get("purpose", "") or "")[:180],
+                    "time": "",
+                }
+            )
+    return items
+
+
+def build_connector_service_diagnostics(service: str) -> dict[str, Any]:
+    svc = str(service or "").strip().lower()
+    payload = build_connections_status_payload(svc)
+    info = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+    services = info.get("services", {}) if isinstance(info.get("services"), dict) else {}
+    service_info = services.get(svc, {}) if isinstance(services.get(svc), dict) else {}
+    if not service_info:
+        return {
+            "ok": False,
+            "message": "Unknown connector service.",
+            "data": {"service": svc, "error": "unknown_service"},
+        }
+    snapshot_by_service = {
+        "gmail": lambda: gmail_list_snapshot(max_results=5),
+        "gcal": lambda: gcal_events_snapshot(days=3),
+        "gdrive": lambda: gdrive_list_snapshot(query=""),
+        "slack": lambda: slack_channels_snapshot(),
+    }
+    try:
+        snap = snapshot_by_service.get(svc, lambda: {"ok": False, "source": "live", "error": "No snapshot available"})()
+    except Exception as exc:
+        snap = {"ok": False, "source": "live", "error": str(exc)}
+    grants_report = connector_grants_report()
+    grant_items = grants_report.get("items", []) if isinstance(grants_report.get("items"), list) else []
+    relevant_grants = []
+    service_domain = str(service_info.get("domain", "") or "").strip()
+    service_provider = str(service_info.get("providerId", "") or "").strip()
+    for item in grant_items:
+        if not isinstance(item, dict):
+            continue
+        domains = [str(v).strip() for v in item.get("domains", [])] if isinstance(item.get("domains"), list) else []
+        providers = [str(v).strip() for v in item.get("providers", [])] if isinstance(item.get("providers"), list) else []
+        if (service_domain and service_domain in domains) or (service_provider and service_provider in providers):
+            relevant_grants.append(item)
+    connected = bool(service_info.get("connected", False))
+    sample_items = _connector_sample_items_from_snapshot(svc, snap, limit=5)
+    actions: list[dict[str, Any]] = []
+    live_surface = {"gmail": "email", "gcal": "calendar", "gdrive": "drive", "slack": "messaging", "spotify": "music"}.get(svc, "connections")
+    if connected:
+        actions.append({"id": "open", "label": "open", "surface": live_surface})
+        actions.append({"id": "disconnect", "label": "disconnect"})
+    else:
+        actions.append({"id": "connect", "label": "connect"})
+    if not bool(service_info.get("authoritative", True)):
+        actions.append({"id": "inspect_connections", "label": "review connections", "surface": "connectors"})
+    return {
+        "ok": True,
+        "message": f"{str(service_info.get('label', svc) or svc)} diagnostics ready.",
+        "data": {
+            "service": svc,
+            "serviceInfo": service_info,
+            "snapshot": {
+                "ok": bool(snap.get("ok", False)),
+                "source": str(snap.get("source", service_info.get("mode", "live")) or "live"),
+                "error": str(snap.get("error", "") or ""),
+                "sampleItems": sample_items,
+            },
+            "relevantGrants": relevant_grants[:10],
+            "actions": actions,
+        },
+    }
+
+
+def open_shell_object(session: SessionState, payload: dict[str, Any]) -> dict[str, Any]:
+    kind = str(payload.get("kind", "") or "").strip().lower()
+    if not kind:
+        return {"ok": False, "message": "Object kind is required.", "data": {"error": "missing_kind"}}
+
+    service_surface_map = {
+        "gmail": "email",
+        "gcal": "calendar",
+        "gdrive": "drive",
+        "slack": "messaging",
+        "spotify": "music",
+        "plaid": "connectors",
+    }
+
+    if kind in {"scene", "surface"}:
+        scene = str(payload.get("scene", "") or payload.get("name", "") or "").strip().lower()
+        if not scene:
+            return {"ok": False, "message": "Scene target is required.", "data": {"error": "missing_scene"}}
+        return {
+            "ok": True,
+            "message": f"Scene ready: {scene}",
+            "data": {
+                "kind": kind,
+                "target": {"type": "scene", "scene": scene},
+            },
+        }
+
+    if kind in {"service", "connector"}:
+        service = str(payload.get("service", "") or payload.get("name", "") or "").strip().lower()
+        if not service:
+            return {"ok": False, "message": "Service target is required.", "data": {"error": "missing_service"}}
+        scene = service_surface_map.get(service, "connectors")
+        return {
+            "ok": True,
+            "message": f"Service ready: {service}",
+            "data": {
+                "kind": kind,
+                "target": {"type": "scene", "scene": scene, "service": service},
+            },
+        }
+
+    if kind in {"repo", "content", "worktree"}:
+        domain = str(payload.get("domain", "") or "").strip().lower()
+        name = str(payload.get("name", "") or "").strip()
+        branch = str(payload.get("branch", session.workspace.get("branch", "main")) or "main").strip() or "main"
+        item_id = str(payload.get("itemId", "") or "").strip()
+        if item_id and (not domain or not name):
+            worktrees = session.workspace.get("worktrees", {}) if isinstance(session.workspace.get("worktrees"), dict) else {}
+            target = next((item for item in worktrees.values() if isinstance(item, dict) and str(item.get("itemId", "") or "") == item_id), None)
+            if isinstance(target, dict):
+                domain = str(target.get("domain", "") or domain).strip().lower()
+                name = str(target.get("name", "") or name).strip()
+                branch = str(target.get("branch", "") or branch).strip() or branch
+        if not domain or not name:
+            return {"ok": False, "message": "Repo target is incomplete.", "data": {"error": "missing_repo_target"}}
+        loaded = content_load(domain, name, branch=branch)
+        if not loaded:
+            return {"ok": False, "message": "Repo object not found.", "data": {"error": "repo_not_found"}}
+        content_attach_session(
+            session.id,
+            str(loaded.get("itemId", "") or ""),
+            str(loaded.get("name", "") or name),
+            str(loaded.get("domain", "") or domain),
+            str(loaded.get("branch", "") or branch),
+            str(loaded.get("hash", "") or ""),
+            int(float(loaded.get("updated_at", _time.time())) * 1000),
+        )
+        session.workspace["branch"] = str(loaded.get("branch", branch) or branch)
+        session.workspace["activeContent"] = {
+            "itemId": str(loaded.get("itemId", "") or ""),
+            "name": str(loaded.get("name", "") or name),
+            "domain": str(loaded.get("domain", "") or domain),
+            "branch": str(loaded.get("branch", "") or branch),
+            "hash": str(loaded.get("hash", "") or ""),
+            "updatedAt": int(float(loaded.get("updated_at", _time.time())) * 1000),
+        }
+        return {
+            "ok": True,
+            "message": f"Repo object ready: {name}",
+            "data": {
+                "kind": kind,
+                "target": {
+                    "type": "repo",
+                    "domain": str(loaded.get("domain", "") or domain),
+                    "name": str(loaded.get("name", "") or name),
+                    "branch": str(loaded.get("branch", "") or branch),
+                    "itemId": str(loaded.get("itemId", "") or ""),
+                },
+                "workspace": ensure_workspace_state(session.workspace),
+            },
+        }
+
+    return {"ok": False, "message": "Unsupported shell object kind.", "data": {"error": "unsupported_kind", "kind": kind}}
 
 
 def github_snapshot(repo: str = "", kind: str = "prs") -> dict[str, Any]:
@@ -3729,7 +5308,9 @@ _COORD_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$")
 # ESPN unofficial API helpers
 # ---------------------------------------------------------------------------
 _ESPN_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_ESPN_CACHE_TTL = 60.0  # seconds
+_ESPN_CACHE_TTL_SCOREBOARD_S = max(1.0, float(os.getenv("GENOMEUI_SPORTS_CACHE_TTL_SCOREBOARD_S", "15")))
+_ESPN_CACHE_TTL_STANDINGS_S = max(1.0, float(os.getenv("GENOMEUI_SPORTS_CACHE_TTL_STANDINGS_S", "300")))
+_ESPN_CACHE_TTL_DEFAULT_S = max(1.0, float(os.getenv("GENOMEUI_SPORTS_CACHE_TTL_DEFAULT_S", "60")))
 
 _ESPN_LEAGUES: dict[str, tuple[str, str]] = {
     "nfl": ("football", "nfl"),
@@ -3744,11 +5325,11 @@ _ESPN_LEAGUES: dict[str, tuple[str, str]] = {
 
 
 def espn_fetch(league: str, endpoint: str = "scoreboard") -> dict[str, Any]:
-    """Fetch from ESPN unofficial API with a 60-second in-process cache."""
+    """Fetch from ESPN unofficial API with endpoint-specific in-process cache TTLs."""
     import time as _time
     key = f"{league}:{endpoint}"
     ts, cached = _ESPN_CACHE.get(key, (0.0, {}))
-    if cached and (_time.monotonic() - ts) < _ESPN_CACHE_TTL:
+    if cached and (_time.monotonic() - ts) < _espn_cache_ttl_for(endpoint):
         return cached
     sport_pair = _ESPN_LEAGUES.get(league.lower())
     if not sport_pair:
@@ -3765,6 +5346,15 @@ def espn_fetch(league: str, endpoint: str = "scoreboard") -> dict[str, Any]:
             return data
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
+
+
+def _espn_cache_ttl_for(endpoint: str) -> float:
+    endpoint_text = str(endpoint or "scoreboard").strip().lower()
+    if "scoreboard" in endpoint_text:
+        return _ESPN_CACHE_TTL_SCOREBOARD_S
+    if "standings" in endpoint_text:
+        return _ESPN_CACHE_TTL_STANDINGS_S
+    return _ESPN_CACHE_TTL_DEFAULT_S
 
 
 _ESPN_VENUE_CACHE: dict[str, tuple[float, str]] = {}
@@ -4126,6 +5716,12 @@ def ensure_presence_state(presence: dict[str, Any] | None) -> dict[str, Any]:
             "label": str(value.get("label", "") or "")[:48],
             "platform": str(value.get("platform", "") or "")[:32],
             "userAgent": str(value.get("userAgent", "") or "")[:140],
+            "did": str(value.get("did", "") or "")[:160],
+            "relayUrl": str(value.get("relayUrl", "") or "")[:512],
+            "pushTokens": {
+                "apns": str(((value.get("pushTokens") or {}).get("apns") if isinstance(value.get("pushTokens"), dict) else value.get("apns")) or "")[:512],
+                "fcm": str(((value.get("pushTokens") or {}).get("fcm") if isinstance(value.get("pushTokens"), dict) else value.get("fcm")) or "")[:4096],
+            },
             "lastSeenAt": int(value.get("lastSeenAt", 0) or 0),
         }
     stats_raw = current.get("stats") if isinstance(current.get("stats"), dict) else {}
@@ -4267,6 +5863,7 @@ def ensure_session(session_id: str) -> SessionState:
         SESSIONS[session_id] = SessionState()
     session = SESSIONS[session_id]
     session.presence = ensure_presence_state(session.presence)
+    session.workspace = ensure_workspace_state(session.workspace)
     session.handoff = ensure_handoff_state(session.handoff)
     session.idempotency = ensure_idempotency_state(session.idempotency)
     session.continuity_autopilot = ensure_continuity_autopilot_state(session.continuity_autopilot)
@@ -4290,6 +5887,7 @@ def ensure_session(session_id: str) -> SessionState:
     session.continuity_autopilot_posture_action_policy_history = [
         item for item in session.continuity_autopilot_posture_action_policy_history if isinstance(item, dict)
     ][-int(CONTINUITY_AUTOPILOT_POSTURE_ACTION_POLICY_HISTORY_MAX) :]
+    session.notifications = ensure_notifications_state(getattr(session, "notifications", []))
     prune_checkpoints(session)
     # Backward-compatible migration path: seed graph from memory if needed.
     if not session.graph.get("entities"):
@@ -4303,10 +5901,100 @@ def ensure_session(session_id: str) -> SessionState:
     return session
 
 
+def ensure_workspace_state(payload: Any) -> dict[str, Any]:
+    state = payload if isinstance(payload, dict) else {}
+    worktrees_raw = state.get("worktrees", {}) if isinstance(state.get("worktrees"), dict) else {}
+    worktrees: dict[str, Any] = {}
+    for key, item in worktrees_raw.items():
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("itemId", "") or "").strip()
+        if not item_id:
+            continue
+        worktrees[str(key)] = {
+            "itemId": item_id,
+            "name": str(item.get("name", "") or "").strip(),
+            "domain": str(item.get("domain", "") or "").strip(),
+            "branch": str(item.get("branch", "main") or "main").strip() or "main",
+            "updatedAt": int(item.get("updatedAt", 0) or 0),
+        }
+    active = state.get("activeContent") if isinstance(state.get("activeContent"), dict) else None
+    if active:
+        active = {
+            "itemId": str(active.get("itemId", "") or "").strip(),
+            "name": str(active.get("name", "") or "").strip(),
+            "domain": str(active.get("domain", "") or "").strip(),
+            "branch": str(active.get("branch", "main") or "main").strip() or "main",
+            "hash": str(active.get("hash", "") or "").strip(),
+            "updatedAt": int(active.get("updatedAt", 0) or 0),
+        }
+    return {
+        "repoId": str(state.get("repoId", "user-global") or "user-global").strip() or "user-global",
+        "branch": str(state.get("branch", "main") or "main").strip() or "main",
+        "worktrees": worktrees,
+        "activeContent": active,
+    }
+
+
+def ensure_notifications_state(payload: Any, limit: int = 40) -> list[dict[str, Any]]:
+    items = payload if isinstance(payload, list) else []
+    normalized: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item_id = str(raw.get("id", "") or "").strip()
+        title = str(raw.get("title", "Notification") or "Notification").strip() or "Notification"
+        created_at = int(raw.get("createdAt", raw.get("ts", 0)) or 0)
+        if not item_id:
+            item_id = f"{title.lower().replace(' ', '-')}-{created_at or now_ms()}"
+        normalized.append({
+            "id": item_id,
+            "type": str(raw.get("type", "event") or "event").strip() or "event",
+            "title": title,
+            "message": str(raw.get("message", "") or "").strip(),
+            "createdAt": created_at,
+            "severity": str(raw.get("severity", "info") or "info").strip() or "info",
+            "read": bool(raw.get("read", False)),
+            "source": str(raw.get("source", "runtime") or "runtime").strip() or "runtime",
+            "route": str(raw.get("route", raw.get("intent", "")) or "").strip(),
+        })
+    return normalized[-int(limit or 40):]
+
+
+def record_runtime_notification(
+    session: SessionState,
+    *,
+    notif_type: str,
+    title: str,
+    message: str = "",
+    severity: str = "info",
+    route: str = "",
+    created_at: int | None = None,
+    source: str = "runtime",
+) -> dict[str, Any]:
+    created = int(created_at or now_ms())
+    entry = {
+        "id": f"{str(notif_type or 'event').strip() or 'event'}:{created}",
+        "type": str(notif_type or "event").strip() or "event",
+        "title": str(title or "Notification").strip() or "Notification",
+        "message": str(message or "").strip(),
+        "createdAt": created,
+        "severity": str(severity or "info").strip() or "info",
+        "read": False,
+        "source": str(source or "runtime").strip() or "runtime",
+        "route": str(route or "").strip(),
+    }
+    notifications = ensure_notifications_state(getattr(session, "notifications", []))
+    notifications.append(entry)
+    session.notifications = notifications[-40:]
+    return entry
+
+
 def serialize_session_state(session: SessionState) -> dict[str, Any]:
     return {
         "memory": session.memory,
         "graph": session.graph,
+        "workspace": session.workspace,
         "jobs": session.jobs,
         "presence": session.presence,
         "handoff": session.handoff,
@@ -4328,6 +6016,7 @@ def serialize_session_state(session: SessionState) -> dict[str, Any]:
         "journal": session.journal,
         "undo_stack": session.undo_stack,
         "checkpoints": session.checkpoints,
+        "notifications": ensure_notifications_state(session.notifications),
     }
 
 
@@ -4335,6 +6024,7 @@ def deserialize_session_state(payload: dict[str, Any]) -> SessionState:
     return SessionState(
         memory=payload.get("memory") or {"tasks": [], "expenses": [], "notes": []},
         graph=payload.get("graph") or {"entities": [], "relations": [], "events": []},
+        workspace=ensure_workspace_state(payload.get("workspace")),
         jobs=payload.get("jobs") or [],
         presence=ensure_presence_state(payload.get("presence")),
         handoff=ensure_handoff_state(payload.get("handoff")),
@@ -4343,7 +6033,7 @@ def deserialize_session_state(payload: dict[str, Any]) -> SessionState:
         restore=payload.get("restore") or {"last": None},
         faults=payload.get("faults") or {"persist": {"degraded": False, "lastError": "", "lastFailureAt": 0, "lastSuccessAt": 0, "pendingWrites": 0}},
         revision=int(payload.get("revision", 0) or 0),
-        last_turn=payload.get("last_turn"),
+        last_turn=None,  # OS always boots to Latent Surface — never restore stale last_turn
         turn_history=payload.get("turn_history") or [],
         continuity_history=payload.get("continuity_history") or [],
         continuity_autopilot=ensure_continuity_autopilot_state(payload.get("continuity_autopilot")),
@@ -4356,6 +6046,7 @@ def deserialize_session_state(payload: dict[str, Any]) -> SessionState:
         journal=payload.get("journal") or [],
         undo_stack=payload.get("undo_stack") or [],
         checkpoints=payload.get("checkpoints") or [],
+        notifications=ensure_notifications_state(payload.get("notifications")),
     )
 
 
@@ -4363,12 +6054,9 @@ async def persist_sessions_to_disk() -> None:
     if SIMULATE_PERSIST_FAILURE:
         raise OSError("simulated persist failure")
     async with STORE_LOCK:
-        STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "version": 1,
-            "sessions": {sid: serialize_session_state(session) for sid, session in SESSIONS.items()},
-        }
-        STORE_PATH.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        await _db.save_all(
+            {sid: serialize_session_state(session) for sid, session in SESSIONS.items()}
+        )
 
 
 def mark_persist_fault(session: SessionState, error: str) -> None:
@@ -4399,26 +6087,65 @@ async def persist_sessions_to_disk_safe(context: str = "") -> bool:
     return True
 
 
+async def _migrate_json_to_sqlite() -> None:
+    """One-time migration: import sessions.json into SQLite, then retire the file."""
+    if not LEGACY_SESSION_JSON_PATH.exists():
+        return
+    try:
+        raw = json.loads(LEGACY_SESSION_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    sessions = raw.get("sessions", {})
+    if not isinstance(sessions, dict) or not sessions:
+        return
+    _log.info("Migrating %d sessions from legacy JSON %s to SQLite…", len(sessions), LEGACY_SESSION_JSON_PATH)
+    await _db.save_all({str(k): v for k, v in sessions.items() if isinstance(v, dict)})
+    migrated = LEGACY_SESSION_JSON_PATH.with_suffix(".json.migrated")
+    LEGACY_SESSION_JSON_PATH.rename(migrated)
+    _log.info("Migration complete. Old file saved as %s", migrated)
+
+
 async def load_sessions_from_disk() -> None:
     async with STORE_LOCK:
-        if not STORE_PATH.exists():
-            return
-        try:
-            raw = json.loads(STORE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        sessions = raw.get("sessions", {})
-        if not isinstance(sessions, dict):
-            return
-        for sid, payload in sessions.items():
+        await _migrate_json_to_sqlite()
+        data = await _db.load_all()
+        for sid, payload in data.items():
             norm = normalize_session_id(str(sid))
             if not norm or not isinstance(payload, dict):
                 continue
             SESSIONS[norm] = deserialize_session_state(payload)
 
 
+def _install_crash_hook() -> None:
+    """Override sys.excepthook to write unhandled Python exceptions to backend.crash.log."""
+    import sys as _sys
+    import traceback as _tb
+
+    _orig_hook = _sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            stack = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            line = json.dumps({
+                "ts": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "process": "backend",
+                "message": str(exc_value)[:512],
+                "stack": stack[:4096],
+                "version": "",
+            }, ensure_ascii=False)
+            with _CRASH_LOG.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        _orig_hook(exc_type, exc_value, exc_tb)
+
+    _sys.excepthook = _hook
+
+
 @app.on_event("startup")
 async def startup_scheduler() -> None:
+    _install_crash_hook()
+    await _db.init()
     await load_sessions_from_disk()
     _content_db().close()  # ensure content store schema is initialised
     async with CONNECTOR_VAULT_LOCK:
@@ -4463,6 +6190,16 @@ async def startup_scheduler() -> None:
     global SCHEDULER_TASK
     if SCHEDULER_TASK is None or SCHEDULER_TASK.done():
         SCHEDULER_TASK = asyncio.create_task(run_scheduler_loop())
+    # Start APScheduler background tasks (gmail sync, gcal sync, relay heartbeat, session persist)
+    _sched_ctx = _sched._AppContext(
+        get_token=_get_token,
+        gmail_list_snapshot=gmail_list_snapshot,
+        gcal_list_snapshot=gcal_events_snapshot,
+        persist_sessions=lambda: persist_sessions_to_disk_safe("scheduler"),
+        relay_ping=None,  # no explicit ping API — mesh bridge manages its own keepalive
+        push_notification=_sched_push_notification,
+    )
+    await _sched.start(_sched_ctx)
 
 
 @app.on_event("shutdown")
@@ -4475,10 +6212,12 @@ async def shutdown_scheduler() -> None:
         except asyncio.CancelledError:
             pass
     SCHEDULER_TASK = None
+    await _sched.stop()
     await shutdown_mcp_stdio_servers()
     async with CONNECTOR_VAULT_LOCK:
         persist_connector_vault_to_disk_sync()
     await persist_sessions_to_disk_safe("shutdown")
+    await _db.close()
 
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
@@ -5297,6 +7036,193 @@ async def health() -> dict[str, Any]:
     }
 
 
+# ── Crash reporting ───────────────────────────────────────────────────────────
+_CRASH_LOG = pathlib.Path(__file__).parent.parent / "backend.crash.log"
+
+
+class _CrashReport(BaseModel):
+    process: str = "unknown"   # "electron" | "renderer" | "backend" | "nous"
+    message: str = ""
+    stack: str = ""
+    version: str = ""
+    ts: int = 0
+
+
+@app.post("/api/crash")
+async def report_crash(report: _CrashReport) -> dict[str, Any]:
+    """Append a crash report to backend.crash.log. Called by Electron/renderer on uncaught error."""
+    ts = report.ts or int(datetime.now(timezone.utc).timestamp() * 1000)
+    line = json.dumps({
+        "ts": ts,
+        "process": report.process[:64],
+        "message": report.message[:512],
+        "stack": report.stack[:4096],
+        "version": report.version[:64],
+    }, ensure_ascii=False)
+    try:
+        with _CRASH_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as exc:
+        _log.error("Failed to write crash log: %s", exc)
+    _log.error("CRASH [%s] %s", report.process, report.message[:200])
+    return {"ok": True, "ts": ts}
+
+
+async def _sched_push_notification(title: str, body: str, route: str) -> None:
+    """Broadcast a desktop notification event to all active WebSocket sessions."""
+    msg = json.dumps({"type": "notification", "title": title, "body": body, "route": route})
+    for sid, session in list(SESSIONS.items()):
+        record_runtime_notification(
+            session,
+            notif_type="notification",
+            title=str(title or "Notification"),
+            message=str(body or ""),
+            route=str(route or ""),
+            source="scheduler",
+        )
+        session.revision += 1
+        for ws in list(session.sockets):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                pass
+        await broadcast_session(session, session_sync_payload(sid, session))
+    await persist_sessions_to_disk_safe("scheduler_push_notification")
+
+
+async def _dispatch_handoff_wakeup(session_id: str, session: SessionState, from_device_id: str, token: str, backend_url: str) -> None:
+    devices = session.presence.get("devices") if isinstance(session.presence.get("devices"), dict) else {}
+    from_did = _genome_identity.did if _genome_identity else "genome-local"
+    tasks: list[asyncio.Task] = []
+    for device_id, item in devices.items():
+        if str(device_id) == str(from_device_id):
+            continue
+        if not isinstance(item, dict):
+            continue
+        push_tokens = item.get("pushTokens") if isinstance(item.get("pushTokens"), dict) else {}
+        if not isinstance(push_tokens, dict):
+            continue
+        apns = str(push_tokens.get("apns", "") or "").strip()
+        fcm = str(push_tokens.get("fcm", "") or "").strip()
+        if not apns and not fcm:
+            continue
+        tasks.append(
+            asyncio.create_task(
+                _push_dispatch.dispatch(
+                    {"apns": apns, "fcm": fcm},
+                    msg_id=f"handoff:{token}:{device_id}",
+                    from_did=from_did,
+                    data={
+                        "type": "genome_handoff",
+                        "sessionId": session_id,
+                        "token": token,
+                        "backendUrl": backend_url,
+                    },
+                ),
+                name=f"push-dispatch:{device_id}",
+            )
+        )
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@app.get("/handoff/open", response_class=HTMLResponse)
+async def handoff_open_bridge(
+    session: str = Query(""),
+    token: str = Query(""),
+    backend: str = Query(""),
+) -> HTMLResponse:
+    session_id = str(session or "").strip()
+    handoff_token = str(token or "").strip()
+    backend_url = _rewrite_loopback_url(str(backend or "").strip(), fallback_port=8787) or _derive_handoff_backend_url(None)
+    nous_url = f"nous://handoff?session={quote_plus(session_id)}&token={quote_plus(handoff_token)}&backend={quote_plus(backend_url)}"
+    escaped_nous = html.escape(nous_url, quote=True)
+    escaped_backend = html.escape(backend_url, quote=True)
+    escaped_session = html.escape(session_id, quote=True)
+    escaped_token = html.escape(handoff_token, quote=True)
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Open In Nous</title>
+  <style>
+    body {{ margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background:#0b1020; color:#eef2ff; display:flex; min-height:100vh; align-items:center; justify-content:center; }}
+    .card {{ width:min(560px, calc(100% - 32px)); padding:28px; border-radius:24px; background:linear-gradient(180deg, rgba(24,32,56,0.98), rgba(13,18,32,0.98)); border:1px solid rgba(140,170,255,0.18); box-shadow:0 24px 80px rgba(0,0,0,0.35); }}
+    h1 {{ margin:0 0 8px; font-size:28px; }}
+    p {{ color:rgba(226,232,255,0.78); line-height:1.55; }}
+    a.btn {{ display:inline-block; margin-top:12px; padding:12px 18px; border-radius:12px; background:#edf2ff; color:#10182e; text-decoration:none; font-weight:700; }}
+    button.btn {{ display:inline-block; margin-top:12px; padding:12px 18px; border:none; border-radius:12px; background:#5eead4; color:#082f2a; font-weight:700; cursor:pointer; }}
+    .meta {{ margin-top:16px; font-size:12px; color:rgba(198,208,235,0.62); word-break:break-all; }}
+    .hint {{ margin-top:14px; padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.06); color:rgba(232,238,255,0.86); font-size:13px; line-height:1.5; }}
+    .field {{ margin-top:12px; }}
+    .label {{ font-size:11px; color:rgba(198,208,235,0.62); text-transform:uppercase; letter-spacing:0.08em; }}
+    textarea {{ width:100%; min-height:88px; margin-top:6px; border-radius:12px; border:1px solid rgba(140,170,255,0.18); background:#0a1325; color:#eef2ff; padding:12px; font-size:12px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Open In Nous</h1>
+    <p>GenomeOS is ready to hand this session to your phone. Open Nous with the button below. If the phone says the address is invalid, use the copy fallback and paste it into the handoff field in Nous.</p>
+    <a class="btn" href="{escaped_nous}">Open Nous</a>
+    <div>
+      <button class="btn" type="button" id="copy-link-btn">Copy Handoff Link</button>
+    </div>
+    <div class="hint" id="status-hint">If Nous is installed with the latest build, tapping "Open Nous" should switch into the app.</div>
+    <div class="field">
+      <div class="label">Paste This Into Nous If Needed</div>
+      <textarea id="handoff-link" readonly>{escaped_nous}</textarea>
+    </div>
+    <div class="meta">session={escaped_session}<br/>token={escaped_token}<br/>backend={escaped_backend}</div>
+  </div>
+  <script>
+    document.getElementById('copy-link-btn')?.addEventListener('click', async function () {{
+      const value = {json.dumps(nous_url)};
+      try {{
+        await navigator.clipboard.writeText(value);
+        const hint = document.getElementById('status-hint');
+        if (hint) hint.textContent = 'Handoff link copied. Open Nous and paste it into the GenomeOS handoff field.';
+      }} catch (_err) {{
+        const box = document.getElementById('handoff-link');
+        if (box) {{
+          box.focus();
+          box.select();
+        }}
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(page)
+
+
+@app.get("/api/scheduler")
+async def scheduler_status() -> dict[str, Any]:
+    """Return current APScheduler status and recent task run history."""
+    return await _sched.get_status_async()
+
+
+class _SchedulerAction(BaseModel):
+    action: str  # "pause" | "resume" | "trigger"
+
+
+@app.post("/api/scheduler/{task_id}")
+async def scheduler_control(task_id: str, body: _SchedulerAction) -> dict[str, Any]:
+    """Pause, resume, or immediately trigger a background task."""
+    action = body.action.strip().lower()
+    if action == "pause":
+        ok = _sched.pause_task(task_id)
+    elif action == "resume":
+        ok = _sched.resume_task(task_id)
+    elif action == "trigger":
+        ok = _sched.trigger_now(task_id)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action!r}")
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id!r}")
+    return {"ok": True, "task_id": task_id, "action": action}
+
+
 @app.get("/api/intent-taxonomy")
 async def get_intent_taxonomy() -> dict[str, Any]:
     """Return the full intent taxonomy grouped by domain, for frontend suggestion chips."""
@@ -5326,6 +7252,16 @@ async def get_connectors(device: str | None = Query(default=None)) -> dict[str, 
         "summary": summary,
         "items": manifests,
     }
+
+
+@app.get("/api/connectors/status")
+async def get_connectors_status(targetService: str = Query(default="")) -> dict[str, Any]:
+    return build_connections_status_payload(targetService)
+
+
+@app.get("/api/connectors/status/{service}")
+async def get_connector_service_status(service: str) -> dict[str, Any]:
+    return build_connector_service_diagnostics(service)
 
 
 @app.get("/api/connectors/providers")
@@ -5541,7 +7477,7 @@ _OAUTH_SERVICE_CONFIGS: dict[str, tuple[str, str, str]] = {
     "slack": (
         "https://slack.com/oauth/v2/authorize",
         "https://slack.com/api/oauth.v2.access",
-        "channels:read channels:history chat:write users:read",
+        "channels:read groups:read channels:history groups:history chat:write reactions:write",
     ),
     "github": (
         "https://github.com/login/oauth/authorize",
@@ -5563,6 +7499,16 @@ _OAUTH_SERVICE_CONFIGS: dict[str, tuple[str, str, str]] = {
         "https://app.asana.com/-/oauth_token",
         "default",
     ),
+    "outlook": (
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send offline_access",
+    ),
+    "yahoo": (
+        "https://api.login.yahoo.com/oauth2/request_auth",
+        "https://api.login.yahoo.com/oauth2/get_token",
+        "mail-r mail-w",
+    ),
 }
 
 _OAUTH_CLIENT_PAIRS: dict[str, tuple[str, str]] = {
@@ -5575,6 +7521,8 @@ _OAUTH_CLIENT_PAIRS: dict[str, tuple[str, str]] = {
     "jira":    (JIRA_CLIENT_ID,    JIRA_CLIENT_SECRET),
     "notion":  (NOTION_CLIENT_ID,  NOTION_CLIENT_SECRET),
     "asana":   (ASANA_CLIENT_ID,   ASANA_CLIENT_SECRET),
+    "outlook": (OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET),
+    "yahoo":   (YAHOO_CLIENT_ID,   YAHOO_CLIENT_SECRET),
 }
 
 
@@ -5596,11 +7544,55 @@ def _is_service_configured(service: str, env_id: str, env_secret: str) -> bool:
     stored = _auth.vault_retrieve(f"{service}_creds")
     return bool(stored and stored.get("client_id") and stored.get("client_secret"))
 
+class ConnectorAuthError(Exception):
+    """Raised when a connector has no valid token and requires re-authentication."""
+    def __init__(self, service: str) -> None:
+        super().__init__(f"Connector '{service}' is not connected — complete OAuth flow first.")
+        self.service = service
+
+
+def _get_token(service: str) -> str | None:
+    """Return a valid access token for a named service, refreshing if near expiry.
+
+    Uses _OAUTH_SERVICE_CONFIGS and _OAUTH_CLIENT_PAIRS so callers don't need
+    to pass token_url / client_id / client_secret on every invocation.
+    Returns None if the service has no vault token (not connected).
+    """
+    _, token_url, _ = _OAUTH_SERVICE_CONFIGS.get(service, ("", "", ""))
+    client_id, client_secret = _get_oauth_client_pair(service)
+    return _get_live_token(
+        service,
+        token_url or None,
+        client_id or None,
+        client_secret or None,
+    )
+
+
+def _require_token(service: str) -> str:
+    """Return a valid access token or raise ConnectorAuthError."""
+    token = _get_token(service)
+    if not token:
+        raise ConnectorAuthError(service)
+    return token
+
+
+def _get_slack_token(*, prefer_user: bool = False) -> str | None:
+    stored = _auth.vault_retrieve("slack") or {}
+    if not isinstance(stored, dict):
+        stored = {}
+    user_token = str(stored.get("user_access_token", "") or "").strip()
+    bot_token = str(stored.get("access_token", "") or "").strip()
+    if prefer_user and user_token:
+        return user_token
+    return bot_token or user_token or None
+
+
 # Extra OAuth params per service (e.g. Google needs access_type + prompt for refresh tokens)
 _OAUTH_EXTRA_PARAMS: dict[str, dict[str, str]] = {
     "gmail":  {"access_type": "offline", "prompt": "consent"},
     "gcal":   {"access_type": "offline", "prompt": "consent"},
     "gdrive": {"access_type": "offline", "prompt": "consent"},
+    "slack":  {"user_scope": "search:read,users.profile:write"},
 }
 
 
@@ -5743,16 +7735,26 @@ async def oauth_callback(
             _log.warning("OAuth token exchange failed for %s: %s", service, resp.text[:200])
             return RedirectResponse(f"/?oauth_error=token_exchange_failed&service={service}")
         data = resp.json()
-        # Slack v2 nests token differently
         if service == "slack":
-            access_token = data.get("authed_user", {}).get("access_token") or data.get("access_token", "")
+            authed_user = data.get("authed_user", {}) if isinstance(data.get("authed_user", {}), dict) else {}
+            _auth.vault_store(service, {
+                "access_token": data.get("access_token", ""),
+                "user_access_token": authed_user.get("access_token", ""),
+                "refresh_token": data.get("refresh_token", ""),
+                "expires_at": _time.time() + float(data.get("expires_in", 315360000)),
+                "scope": data.get("scope", ""),
+                "user_scope": authed_user.get("scope", ""),
+                "team_id": (data.get("team", {}) if isinstance(data.get("team", {}), dict) else {}).get("id", ""),
+                "team_name": (data.get("team", {}) if isinstance(data.get("team", {}), dict) else {}).get("name", ""),
+                "authed_user_id": authed_user.get("id", ""),
+                "bot_user_id": data.get("bot_user_id", ""),
+            })
         else:
-            access_token = data.get("access_token", "")
-        _auth.vault_store(service, {
-            "access_token": access_token,
-            "refresh_token": data.get("refresh_token", ""),
-            "expires_at": _time.time() + float(data.get("expires_in", 315360000)),  # Slack tokens don't expire
-        })
+            _auth.vault_store(service, {
+                "access_token": data.get("access_token", ""),
+                "refresh_token": data.get("refresh_token", ""),
+                "expires_at": _time.time() + float(data.get("expires_in", 315360000)),
+            })
         return RedirectResponse(f"/?oauth_success={service}")
     except Exception as exc:
         _log.error("OAuth callback error for %s: %s", service, exc)
@@ -5828,8 +7830,55 @@ async def get_mock_gmail(limit: int = Query(default=10)) -> JSONResponse:
     return JSONResponse({"ok": True, "item": snap})
 
 
+@app.get("/api/connectors/gmail/messages")
+async def get_gmail_messages(limit: int = Query(default=10)) -> JSONResponse:
+    snap = gmail_list_snapshot(max_results=limit)
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/email/domain")
+async def email_domain_info(domain: str = Query(...)) -> JSONResponse:
+    """Tell the frontend whether an email domain needs OAuth or IMAP credentials."""
+    domain = domain.lower().strip()
+    oauth = _oauth_provider_for_domain(domain)
+    if oauth:
+        return JSONResponse({"protocol": "oauth", "provider": oauth})
+    return JSONResponse({"protocol": "imap", "domain": domain})
+
+
+@app.post("/api/connectors/imap/connect")
+async def imap_connect(request: Request) -> JSONResponse:
+    """Test IMAP credentials and store them in the vault if successful."""
+    body = await request.json()
+    email_addr = str(body.get("email", "")).strip().lower()
+    password   = str(body.get("password", "")).strip()
+    if not email_addr or "@" not in email_addr or not password:
+        return JSONResponse({"ok": False, "error": "email and password required"}, status_code=400)
+    domain = email_addr.split("@")[1]
+    oauth_prov = _oauth_provider_for_domain(domain)
+    if oauth_prov:
+        return JSONResponse({"ok": False, "error": f"Use OAuth for {domain}", "useOAuth": oauth_prov}, status_code=400)
+    imap_host, imap_port, smtp_host, smtp_port = _imap_server_for_domain(domain)
+    creds = {
+        "password": password,
+        "imap_host": imap_host, "imap_port": imap_port,
+        "smtp_host": smtp_host, "smtp_port": smtp_port,
+    }
+    result = await imap_list_snapshot_async(email_addr, creds, max_results=1)
+    if not result.get("ok"):
+        return JSONResponse({"ok": False, "error": result.get("error", "Connection failed")}, status_code=400)
+    _auth.vault_store(f"imap_{email_addr}", creds)
+    return JSONResponse({"ok": True, "email": email_addr, "imap_host": imap_host})
+
+
 @app.get("/api/connectors/mock/gcal")
 async def get_mock_gcal(days: int = Query(default=7)) -> JSONResponse:
+    snap = gcal_events_snapshot(days=days)
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/gcal/events")
+async def get_gcal_events(days: int = Query(default=7)) -> JSONResponse:
     snap = gcal_events_snapshot(days=days)
     return JSONResponse({"ok": True, "item": snap})
 
@@ -5840,8 +7889,20 @@ async def get_mock_gdrive(query: str = Query(default="")) -> JSONResponse:
     return JSONResponse({"ok": True, "item": snap})
 
 
+@app.get("/api/connectors/gdrive/files")
+async def get_gdrive_files(query: str = Query(default="")) -> JSONResponse:
+    snap = gdrive_list_snapshot(query=query)
+    return JSONResponse({"ok": True, "item": snap})
+
+
 @app.get("/api/connectors/mock/slack")
 async def get_mock_slack() -> JSONResponse:
+    snap = slack_channels_snapshot()
+    return JSONResponse({"ok": True, "item": snap})
+
+
+@app.get("/api/connectors/slack/channels")
+async def get_slack_channels() -> JSONResponse:
     snap = slack_channels_snapshot()
     return JSONResponse({"ok": True, "item": snap})
 
@@ -5851,23 +7912,112 @@ async def get_mock_slack() -> JSONResponse:
 @app.get("/api/content/{domain}")
 async def api_content_list(
     domain: str,
+    query: str = Query(default=""),
+    contentType: str = Query(default=""),
     x_genome_auth: str | None = Header(default=None),
 ) -> JSONResponse:
     if not _auth.session_valid(x_genome_auth):
         raise HTTPException(status_code=401, detail="Authentication required")
-    items = content_list(domain)
+    items = content_list(domain, query=query, content_type=contentType)
     return JSONResponse({"ok": True, "items": items})
 
 
-@app.get("/api/content/{domain}/{name}")
-async def api_content_load(
+@app.get("/api/content/{domain}/{name}/history")
+async def api_content_history(
+    domain: str,
+    name: str,
+    branch: str = Query(default="main"),
+    limit: int = Query(default=20, ge=1, le=100),
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    items = content_history(domain, name, branch=branch, limit=limit)
+    return JSONResponse({"ok": True, "items": items})
+
+
+@app.get("/api/content/{domain}/{name}/branches")
+async def api_content_branches(
     domain: str,
     name: str,
     x_genome_auth: str | None = Header(default=None),
 ) -> JSONResponse:
     if not _auth.session_valid(x_genome_auth):
         raise HTTPException(status_code=401, detail="Authentication required")
-    item = content_load(domain, name)
+    items = content_branches(domain, name)
+    return JSONResponse({"ok": True, "items": items})
+
+
+@app.post("/api/content/{domain}/{name}/branch")
+async def api_content_branch_create(
+    domain: str,
+    name: str,
+    req: Request,
+    branch: str = Query(default="main"),
+    sessionId: str = Query(default=""),
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body = await req.json()
+    target_branch = str(body.get("targetBranch", body.get("branch", "")) or "").strip()
+    item = content_branch_create(domain, name, target_branch, from_branch=branch)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Cannot branch: {domain}/{name}")
+    if sessionId:
+        content_attach_session(sessionId, item["itemId"], item["name"], item["domain"], item["branch"], item["hash"], int(float(item.get("updated_at", _time.time())) * 1000))
+    return JSONResponse({"ok": True, "item": item})
+
+
+@app.post("/api/content/{domain}/{name}/revert")
+async def api_content_revert(
+    domain: str,
+    name: str,
+    req: Request,
+    branch: str = Query(default="main"),
+    sessionId: str = Query(default=""),
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body = await req.json()
+    target_hash = str(body.get("hash", body.get("revision", "")) or "").strip()
+    item = content_revert(domain, name, target_hash, branch=branch, session_id=sessionId)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Cannot revert: {domain}/{name}")
+    return JSONResponse({"ok": True, "item": item})
+
+
+@app.post("/api/content/{domain}/{name}/merge")
+async def api_content_merge(
+    domain: str,
+    name: str,
+    req: Request,
+    branch: str = Query(default="main"),
+    sessionId: str = Query(default=""),
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body = await req.json()
+    source_branch = str(body.get("sourceBranch", body.get("branch", "")) or "").strip()
+    item = content_merge(domain, name, source_branch, target_branch=branch, session_id=sessionId)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Cannot merge: {domain}/{name}")
+    return JSONResponse({"ok": True, "item": item})
+
+
+@app.get("/api/content/{domain}/{name}")
+async def api_content_load(
+    domain: str,
+    name: str,
+    branch: str = Query(default="main"),
+    sessionId: str = Query(default=""),
+    x_genome_auth: str | None = Header(default=None),
+) -> JSONResponse:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    item = content_load(domain, name, branch=branch, session_id=sessionId)
     if not item:
         raise HTTPException(status_code=404, detail=f"Not found: {domain}/{name}")
     return JSONResponse({"ok": True, "item": item})
@@ -5878,14 +8028,17 @@ async def api_content_commit(
     domain: str,
     name: str,
     req: Request,
+    branch: str = Query(default="main"),
+    sessionId: str = Query(default=""),
     x_genome_auth: str | None = Header(default=None),
 ) -> JSONResponse:
     if not _auth.session_valid(x_genome_auth):
         raise HTTPException(status_code=401, detail="Authentication required")
     body = await req.json()
     data = body.get("data", "")
-    h = content_commit(domain, name, data)
-    return JSONResponse({"ok": True, "hash": h})
+    message = str(body.get("message", "") or "").strip()
+    item = content_commit(domain, name, data, branch=branch, message=message, session_id=sessionId)
+    return JSONResponse({"ok": True, "item": item})
 
 
 @app.delete("/api/content/{domain}/{name}")
@@ -5909,9 +8062,13 @@ async def init_session(body: SessionInitBody) -> dict[str, Any]:
         "sessionId": session_id,
         "revision": session.revision,
         "memory": session.memory,
+        "workspace": session.workspace,
+        "notifications": ensure_notifications_state(session.notifications),
         "presence": session.presence,
         "handoff": session.handoff,
         "continuityAutopilot": ensure_continuity_autopilot_state(session.continuity_autopilot),
+        "turnHistory": session.turn_history[-10:],
+        "lastTurn": session.last_turn,
         "planner": "session-sync-v2",
     }
 
@@ -5927,6 +8084,8 @@ async def get_session(session_id: str) -> dict[str, Any]:
         "sessionId": sid,
         "revision": session.revision,
         "memory": session.memory,
+        "workspace": session.workspace,
+        "notifications": ensure_notifications_state(session.notifications),
         "presence": session.presence,
         "handoff": session.handoff,
         "continuityAutopilot": ensure_continuity_autopilot_state(session.continuity_autopilot),
@@ -5934,8 +8093,260 @@ async def get_session(session_id: str) -> dict[str, Any]:
         "restore": session.restore,
         "faults": session.faults,
         "checkpointCount": len(session.checkpoints),
+        "turnHistory": session.turn_history[-10:],
         "lastTurn": session.last_turn,
     }
+
+
+@app.post("/api/session/{session_id}/objects/open")
+async def open_session_object(session_id: str, body: ShellObjectOpenBody) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    report = open_shell_object(session, body.model_dump())
+    if bool(report.get("ok", False)):
+        session.revision += 1
+        await broadcast_session(session, session_sync_payload(sid, session))
+        await persist_sessions_to_disk_safe("session_object_open")
+        report["sessionId"] = sid
+        report["revision"] = int(session.revision)
+    return report
+
+
+def _run_terminal_command(command: str, timeout_s: float = 8.0) -> dict[str, Any]:
+    cmd = str(command or "").strip()
+    if not cmd:
+        return {"ok": True, "command": "", "output": "", "exitCode": 0, "shell": ""}
+
+    if os.name == "nt":
+        shell_cmd = ["powershell", "-NoProfile", "-Command", cmd]
+        shell_name = "powershell"
+    else:
+        shell_path = "/bin/bash" if pathlib.Path("/bin/bash").exists() else "/bin/sh"
+        shell_cmd = [shell_path, "-lc", cmd]
+        shell_name = pathlib.Path(shell_path).name
+
+    try:
+        proc = subprocess.run(
+            shell_cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(timeout_s)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = ((exc.stdout or "") + (exc.stderr or "")).strip()
+        output = partial or f"Command timed out after {int(max(1.0, float(timeout_s)))}s."
+        return {
+            "ok": False,
+            "command": cmd,
+            "output": output,
+            "exitCode": -1,
+            "shell": shell_name,
+            "timedOut": True,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "command": cmd,
+            "output": str(exc),
+            "exitCode": -1,
+            "shell": shell_name,
+            "timedOut": False,
+        }
+
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if not output:
+        output = "(command completed with no output)"
+    return {
+        "ok": proc.returncode == 0,
+        "command": cmd,
+        "output": output,
+        "exitCode": int(proc.returncode),
+        "shell": shell_name,
+        "timedOut": False,
+    }
+
+
+def _normalize_calc_expression(raw: str) -> str:
+    expr = str(raw or "").strip().lower()
+    expr = re.sub(r"\b(\d+(?:\.\d+)?)\s*percent\s+of\s+(\d+(?:\.\d+)?)\b", r"(\1 / 100) * \2", expr)
+    expr = expr.replace("^", "**")
+    return expr
+
+
+def _evaluate_calc_expression(raw: str) -> dict[str, Any]:
+    expr = _normalize_calc_expression(raw)
+    if not expr:
+        return {"ok": False, "message": "No calculation provided."}
+    if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.%]+", expr):
+        return {"ok": False, "message": "Unsupported calculation."}
+
+    def _eval_node(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = _eval_node(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp):
+            left = _eval_node(node.left)
+            right = _eval_node(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                if abs(right) < 1e-12:
+                    raise ZeroDivisionError
+                return left / right
+            if isinstance(node.op, ast.Mod):
+                if abs(right) < 1e-12:
+                    raise ZeroDivisionError
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                return left ** right
+        raise ValueError("unsupported")
+
+    try:
+        parsed = ast.parse(expr, mode="eval")
+        value = _eval_node(parsed)
+    except ZeroDivisionError:
+        return {"ok": False, "message": "Cannot divide by zero."}
+    except Exception:
+        return {"ok": False, "message": "Could not evaluate calculation."}
+
+    if not math.isfinite(value):
+        return {"ok": False, "message": "Calculation result is not finite."}
+    rounded = round(value, 6)
+    display = str(int(rounded)) if float(rounded).is_integer() else f"{rounded:.6f}".rstrip("0").rstrip(".")
+    return {"ok": True, "expression": expr, "value": rounded, "display": display}
+
+
+@app.get("/api/session/{session_id}/notifications")
+async def get_session_notifications(session_id: str) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "notifications": ensure_notifications_state(session.notifications),
+    }
+
+
+@app.post("/api/session/{session_id}/notifications/read")
+async def mark_session_notifications_read(session_id: str, body: NotificationActionBody) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    target = str(body.app or "").strip().lower()
+    updated = []
+    for item in ensure_notifications_state(session.notifications):
+        title = str(item.get("title", "")).lower()
+        notif_type = str(item.get("type", "")).lower()
+        if (not target) or target in title or target in notif_type:
+            item["read"] = True
+        updated.append(item)
+    session.notifications = ensure_notifications_state(updated)
+    session.revision += 1
+    await broadcast_session(session, session_sync_payload(sid, session))
+    await persist_sessions_to_disk_safe("notifications_read")
+    return {"ok": True, "notifications": ensure_notifications_state(session.notifications)}
+
+
+@app.delete("/api/session/{session_id}/notifications")
+async def clear_session_notifications(session_id: str, app: str = Query(default="")) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    target = str(app or "").strip().lower()
+    current = ensure_notifications_state(session.notifications)
+    if target:
+        current = [
+            item for item in current
+            if target not in str(item.get("title", "")).lower() and target not in str(item.get("type", "")).lower()
+        ]
+    else:
+        current = []
+    session.notifications = ensure_notifications_state(current)
+    session.revision += 1
+    await broadcast_session(session, session_sync_payload(sid, session))
+    await persist_sessions_to_disk_safe("notifications_clear")
+    return {"ok": True, "notifications": ensure_notifications_state(session.notifications)}
+
+
+@app.get("/api/session/{session_id}/workspace")
+async def get_session_workspace(session_id: str, x_genome_auth: str | None = Header(default=None)) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "workspace": session.workspace,
+    }
+
+
+@app.get("/api/session/{session_id}/workspace/worktrees")
+async def get_session_worktrees(session_id: str, x_genome_auth: str | None = Header(default=None)) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    return {"ok": True, "sessionId": sid, "items": content_session_worktrees(sid)}
+
+
+@app.post("/api/session/{session_id}/workspace/worktrees/{item_id}/activate")
+async def activate_session_worktree(session_id: str, item_id: str, x_genome_auth: str | None = Header(default=None)) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    item = content_activate_session_worktree(sid, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="worktree not found")
+    return {"ok": True, "sessionId": sid, "item": item, "workspace": ensure_session(sid).workspace}
+
+
+@app.delete("/api/session/{session_id}/workspace/worktrees/{item_id}")
+async def detach_session_worktree(session_id: str, item_id: str, x_genome_auth: str | None = Header(default=None)) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    ok = content_detach_session_worktree(sid, item_id)
+    return {"ok": ok, "sessionId": sid, "workspace": ensure_session(sid).workspace}
+
+
+@app.post("/api/session/{session_id}/workspace/attach")
+async def attach_session_worktree(session_id: str, req: Request, x_genome_auth: str | None = Header(default=None)) -> dict[str, Any]:
+    if not _auth.session_valid(x_genome_auth):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    body = await req.json()
+    domain = str(body.get("domain", "") or "").strip().lower()
+    name = str(body.get("name", "") or "").strip()
+    branch = str(body.get("branch", "main") or "main").strip() or "main"
+    item = content_attach_existing_to_session(sid, domain, name, branch=branch)
+    if not item:
+        raise HTTPException(status_code=404, detail="content not found")
+    return {"ok": True, "sessionId": sid, "item": item, "workspace": ensure_session(sid).workspace}
 
 
 @app.post("/api/session/{session_id}/presence")
@@ -5950,20 +8361,28 @@ async def upsert_session_presence(session_id: str, body: PresenceBody) -> dict[s
     devices = session.presence.get("devices") if isinstance(session.presence.get("devices"), dict) else {}
     stats = session.presence.get("stats") if isinstance(session.presence.get("stats"), dict) else default_presence_state()["stats"]
     now = now_ms()
+    prior = devices.get(device_id) if isinstance(devices.get(device_id), dict) else None
     next_item = {
         "deviceId": device_id,
         "label": str(body.label or "")[:48],
         "platform": str(body.platform or "")[:32],
         "userAgent": str(body.userAgent or "")[:140],
+        "did": str(body.did or (prior or {}).get("did", "") or "")[:160],
+        "relayUrl": str(body.relayUrl or (prior or {}).get("relayUrl", "") or "")[:512],
+        "pushTokens": {
+            "apns": str((((prior or {}).get("pushTokens") or {}).get("apns") if isinstance((prior or {}).get("pushTokens"), dict) else (prior or {}).get("apns")) or "")[:512],
+            "fcm": str((((prior or {}).get("pushTokens") or {}).get("fcm") if isinstance((prior or {}).get("pushTokens"), dict) else (prior or {}).get("fcm")) or "")[:4096],
+        },
         "lastSeenAt": now,
     }
-    prior = devices.get(device_id) if isinstance(devices.get(device_id), dict) else None
     coalesced = False
     if prior:
         same_shape = (
             str(prior.get("label", "")) == str(next_item.get("label", ""))
             and str(prior.get("platform", "")) == str(next_item.get("platform", ""))
             and str(prior.get("userAgent", "")) == str(next_item.get("userAgent", ""))
+            and str(prior.get("did", "")) == str(next_item.get("did", ""))
+            and str(prior.get("relayUrl", "")) == str(next_item.get("relayUrl", ""))
         )
         last_seen = int(prior.get("lastSeenAt", 0) or 0)
         if same_shape and (now - last_seen) < int(PRESENCE_WRITE_MIN_INTERVAL_MS):
@@ -5980,6 +8399,18 @@ async def upsert_session_presence(session_id: str, body: PresenceBody) -> dict[s
         stats["heartbeatWrites"] = int(stats.get("heartbeatWrites", 0) or 0) + 1
         session.presence["updatedAt"] = now
     session.presence["stats"] = stats
+    await _register_paired_surface_from_fields(
+        surface_id=device_id,
+        label=str(next_item.get("label", "") or ""),
+        platform=str(next_item.get("platform", "") or ""),
+        role="mobile" if str(next_item.get("platform", "") or "").lower() in {"ios", "android", "mobile"} else "desktop",
+        did=str(next_item.get("did", "") or ""),
+        relay_url=str(next_item.get("relayUrl", "") or ""),
+        apns=str((((next_item.get("pushTokens") or {}) if isinstance(next_item.get("pushTokens"), dict) else {}).get("apns", "")) or ""),
+        fcm=str((((next_item.get("pushTokens") or {}) if isinstance(next_item.get("pushTokens"), dict) else {}).get("fcm", "")) or ""),
+        session_id=sid,
+        capabilities=["presence", "takeover"],
+    )
     if coalesced:
         payload = build_presence_payload(session, sid)
         payload["coalesced"] = True
@@ -6002,6 +8433,90 @@ async def get_session_presence(session_id: str, timeout_ms: int = Query(120000, 
         raise HTTPException(status_code=400, detail="invalid session")
     session = ensure_session(sid)
     return build_presence_payload(session, sid, timeout_ms=timeout_ms)
+
+
+@app.post("/api/surfaces/register")
+async def register_paired_surface(body: SurfaceRegisterBody) -> dict[str, Any]:
+    surface = await _register_paired_surface_from_fields(
+        surface_id=body.surfaceId,
+        label=str(body.label or ""),
+        platform=str(body.platform or ""),
+        role=str(body.role or "mobile"),
+        did=str(body.did or ""),
+        relay_url=str(body.relayUrl or ""),
+        apns=str(body.apns or ""),
+        fcm=str(body.fcm or ""),
+        session_id=str(body.sessionId or ""),
+        capabilities=body.capabilities if isinstance(body.capabilities, list) else [],
+        preferred=bool(body.preferred),
+    )
+    return {"ok": True, "surface": surface}
+
+
+@app.get("/api/surfaces")
+async def list_paired_surfaces(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    items = await _list_paired_surfaces(limit=limit)
+    return {"ok": True, "count": len(items), "items": items}
+
+
+@app.post("/api/surfaces/{surface_id}/prefer")
+async def prefer_paired_surface(surface_id: str) -> dict[str, Any]:
+    target = await _set_preferred_surface(surface_id)
+    if not isinstance(target, dict):
+        raise HTTPException(status_code=404, detail="surface not found")
+    return {"ok": True, "surface": target}
+
+
+@app.post("/api/session/{session_id}/push-tokens")
+async def register_session_push_tokens(session_id: str, body: PushTokenBody) -> dict[str, Any]:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid session")
+    session = ensure_session(sid)
+    device_id = normalize_device_id(body.deviceId)
+    if not device_id:
+        raise HTTPException(status_code=400, detail="invalid device id")
+    devices = session.presence.get("devices") if isinstance(session.presence.get("devices"), dict) else {}
+    prior = devices.get(device_id) if isinstance(devices.get(device_id), dict) else {}
+    push_tokens = {
+        "apns": str(body.apns or "")[:512],
+        "fcm": str(body.fcm or "")[:4096],
+    }
+    devices[device_id] = {
+        **(prior or {}),
+        "deviceId": device_id,
+        "label": str((prior or {}).get("label", "") or "")[:48],
+        "platform": str((prior or {}).get("platform", "") or "")[:32],
+        "userAgent": str((prior or {}).get("userAgent", "") or "")[:140],
+        "did": str(body.did or (prior or {}).get("did", "") or "")[:160],
+        "relayUrl": str(body.relayUrl or (prior or {}).get("relayUrl", "") or "")[:512],
+        "pushTokens": push_tokens,
+        "lastSeenAt": int((prior or {}).get("lastSeenAt", now_ms()) or now_ms()),
+    }
+    session.presence["devices"] = devices
+    session.presence["updatedAt"] = now_ms()
+    await _register_paired_surface_from_fields(
+        surface_id=device_id,
+        label=str((devices[device_id] or {}).get("label", "") or ""),
+        platform=str((devices[device_id] or {}).get("platform", "") or ""),
+        role="mobile",
+        did=str((devices[device_id] or {}).get("did", "") or ""),
+        relay_url=str((devices[device_id] or {}).get("relayUrl", "") or ""),
+        apns=str(push_tokens.get("apns", "") or ""),
+        fcm=str(push_tokens.get("fcm", "") or ""),
+        session_id=sid,
+        capabilities=["takeover", "relay", "push"],
+    )
+    session.revision += 1
+    await broadcast_session(session, session_sync_payload(sid, session))
+    await persist_sessions_to_disk_safe("push_tokens")
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "deviceId": device_id,
+        "pushTokens": push_tokens,
+        "revision": session.revision,
+    }
 
 
 @app.post("/api/session/{session_id}/presence/prune")
@@ -8436,6 +10951,11 @@ async def get_session_runtime_profile(session_id: str, limit: int = Query(200, g
     return build_runtime_profile_payload(session, sid, limit=limit)
 
 
+@app.get("/api/runtime/services")
+async def get_runtime_services() -> dict[str, Any]:
+    return build_runtime_services_payload()
+
+
 @app.post("/api/session/{session_id}/intent/preview")
 async def preview_session_intent(session_id: str, body: IntentPreviewBody) -> dict[str, Any]:
     sid = normalize_session_id(session_id)
@@ -8466,6 +10986,14 @@ async def get_session_diagnostics(session_id: str) -> dict[str, Any]:
     continuity_autopilot_guardrails = evaluate_continuity_autopilot_guardrails(session)
     continuity_autopilot_mode = build_continuity_autopilot_mode_recommendation(session, sid)
     continuity_autopilot_drift = build_continuity_autopilot_mode_drift(session, sid)
+    continuity_autopilot_alignment = build_continuity_autopilot_mode_alignment(session, sid, limit=8)
+    continuity_autopilot_policy_matrix = build_continuity_autopilot_mode_policy_matrix(session, sid)
+    continuity_autopilot_posture = build_continuity_autopilot_posture(session, sid)
+    continuity_autopilot_posture_history = build_continuity_autopilot_posture_history(session, sid, limit=8)
+    continuity_autopilot_posture_anomalies = detect_continuity_autopilot_posture_anomalies(session, sid, limit=8)
+    continuity_autopilot_posture_actions = build_continuity_autopilot_posture_actions(session, sid, limit=5)
+    continuity_autopilot_posture_action_metrics = build_continuity_autopilot_posture_action_metrics(session, sid, window_ms=3600000)
+    continuity_autopilot_posture_policy_matrix = build_continuity_autopilot_posture_action_policy_matrix(session, sid, limit=5)
     self_check = build_runtime_self_check_report(session, sid)
     trace_summary = summarize_turn_history(session.turn_history[-200:])
     return {
@@ -8506,6 +11034,23 @@ async def get_session_diagnostics(session_id: str) -> dict[str, Any]:
             "modeDrifted": bool(continuity_autopilot_drift.get("drifted", False)),
             "alignedCount": int(continuity_autopilot.get("aligned", 0) or 0),
         },
+        "continuityAutopilotPreview": continuity_autopilot_preview,
+        "continuityAutopilotGuardrails": {
+            "blockerCount": int(continuity_autopilot_guardrails.get("blockerCount", 0) or 0),
+            "codes": list(continuity_autopilot_guardrails.get("codes", []))[:8]
+            if isinstance(continuity_autopilot_guardrails.get("codes"), list)
+            else [],
+        },
+        "continuityAutopilotMode": continuity_autopilot_mode,
+        "continuityAutopilotDrift": continuity_autopilot_drift,
+        "continuityAutopilotAlignment": continuity_autopilot_alignment,
+        "continuityAutopilotPolicyMatrix": continuity_autopilot_policy_matrix,
+        "continuityAutopilotPosture": continuity_autopilot_posture,
+        "continuityAutopilotPostureHistory": continuity_autopilot_posture_history,
+        "continuityAutopilotPostureAnomalies": continuity_autopilot_posture_anomalies,
+        "continuityAutopilotPostureActions": continuity_autopilot_posture_actions,
+        "continuityAutopilotPostureActionMetrics": continuity_autopilot_posture_action_metrics,
+        "continuityAutopilotPosturePolicyMatrix": continuity_autopilot_posture_policy_matrix,
         "selfCheck": self_check,
         "traceSummary": trace_summary,
         "journal": {
@@ -10223,8 +12768,7 @@ async def tick_session_jobs(session_id: str, force: bool = Query(False)) -> dict
     }
 
 
-@app.post("/api/session/{session_id}/handoff/start")
-async def handoff_start(session_id: str, body: HandoffStartBody) -> dict[str, Any]:
+async def _handoff_start_impl(session_id: str, body: HandoffStartBody, request: Request | None = None) -> dict[str, Any]:
     sid = normalize_session_id(session_id)
     if not sid:
         raise HTTPException(status_code=400, detail="invalid session")
@@ -10236,16 +12780,35 @@ async def handoff_start(session_id: str, body: HandoffStartBody) -> dict[str, An
     token = str(uuid.uuid4())[:12]
     expires_at = now_ms() + 60_000
     created_at = now_ms()
+    backend_url = _derive_handoff_backend_url(request)
+    bridge_url = _build_handoff_bridge_url(request, sid, token, backend_url)
+    relay_routed = await _dispatch_handoff_relay_takeover(sid, session, from_device_id=device_id, token=token, backend_url=backend_url)
+    paired_report = {"routed": False, "woke": False, "targetSurfaceId": "", "targetLabel": "", "targetRole": ""}
+    if not relay_routed:
+        paired_report = await _dispatch_handoff_to_paired_surfaces(
+            sid,
+            from_device_id=device_id,
+            token=token,
+            backend_url=backend_url,
+            preferred_role="mobile",
+            target_surface_id=str(body.targetSurfaceId or ""),
+        )
     session.handoff["pending"] = {
         "token": token,
         "fromDeviceId": device_id,
         "createdAt": created_at,
         "expiresAt": expires_at,
+        "backendUrl": backend_url,
+        "bridgeUrl": bridge_url,
+        "relayRouted": bool(relay_routed),
+        "pairedSurface": paired_report,
+        "targetSurfaceId": normalize_device_id(str(body.targetSurfaceId or "")),
     }
     stats["starts"] = int(stats.get("starts", 0) or 0) + 1
     session.handoff["stats"] = stats
     if not session.handoff.get("activeDeviceId"):
         session.handoff["activeDeviceId"] = device_id
+    asyncio.create_task(_dispatch_handoff_wakeup(sid, session, from_device_id=device_id, token=token, backend_url=backend_url), name="handoff-push-dispatch")
     append_continuity_history_snapshot(session, sid, "handoff_start")
     session.revision += 1
     await broadcast_session(session, session_sync_payload(sid, session))
@@ -10255,9 +12818,18 @@ async def handoff_start(session_id: str, body: HandoffStartBody) -> dict[str, An
         "sessionId": sid,
         "token": token,
         "expiresAt": expires_at,
+        "backendUrl": backend_url,
+        "bridgeUrl": bridge_url,
+        "relayRouted": bool(relay_routed),
+        "pairedSurface": paired_report,
         "revision": session.revision,
         "handoff": session.handoff,
     }
+
+
+@app.post("/api/session/{session_id}/handoff/start")
+async def handoff_start(session_id: str, body: HandoffStartBody, request: Request) -> dict[str, Any]:
+    return await _handoff_start_impl(session_id, body, request)
 
 
 @app.post("/api/session/{session_id}/handoff/claim")
@@ -10320,6 +12892,7 @@ async def handoff_claim(session_id: str, body: HandoffClaimBody) -> dict[str, An
     session.handoff["activeDeviceId"] = device_id
     session.handoff["lastClaimAt"] = now_ms()
     session.handoff["pending"] = None
+    await _set_preferred_surface(device_id)
     append_continuity_history_snapshot(session, sid, "handoff_claim")
     session.revision += 1
     await broadcast_session(session, session_sync_payload(sid, session))
@@ -10358,9 +12931,10 @@ async def stream_session(sessionId: str = Query(...)):
         "sessionId": sid,
         "revision": session.revision,
         "memory": session.memory,
+        "workspace": session.workspace,
         "presence": session.presence,
         "handoff": session.handoff,
-        "lastTurn": session.last_turn,
+        # lastTurn intentionally omitted — OS always boots to Latent Surface
     }
 
     async def event_gen():
@@ -10426,7 +13000,7 @@ async def ws_session(websocket: WebSocket):
             "memory": session.memory,
             "presence": session.presence,
             "handoff": session.handoff,
-            "lastTurn": session.last_turn,
+            # lastTurn intentionally omitted — OS always boots to Latent Surface
         }
     )
 
@@ -10495,10 +13069,36 @@ def _build_confirm_summary(op_type: str, payload: dict[str, Any]) -> str:
     return f'"{label}" is a high-risk action that cannot be undone. Confirm to proceed.'
 
 
+def _connector_scope_denial_from_turn_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    execution = payload.get("execution")
+    tool_results = execution.get("toolResults") if isinstance(execution, dict) else []
+    if not isinstance(tool_results, list):
+        return None
+    for item in tool_results:
+        if not isinstance(item, dict) or item.get("ok") is not False:
+            continue
+        policy = item.get("policy") if isinstance(item.get("policy"), dict) else {}
+        if str(policy.get("code", "")) != "connector_scope_required":
+            continue
+        missing = policy.get("missingConnectorScopes")
+        missing_scopes = missing if isinstance(missing, list) else []
+        message = str(item.get("message") or policy.get("reason") or "Connector permission required").strip()
+        return {
+            "code": "connector_scope_required",
+            "message": message,
+            "missingConnectorScopes": missing_scopes,
+            "blockedOp": str(item.get("op") or ""),
+        }
+    return None
+
+
 @app.post("/api/turn")
 async def turn(
     request: Request,
     body: TurnBody,
+    http_response: Response,
     x_genome_auth: str | None = Header(default=None),
 ) -> dict[str, Any]:
     if not _auth.session_valid(x_genome_auth):
@@ -10519,6 +13119,10 @@ async def turn(
         reused = find_idempotent_response(session, idem_key, intent)
         if reused is not None:
             reused["idempotency"] = {"reused": True, "key": idem_key}
+            denial = _connector_scope_denial_from_turn_payload(reused)
+            if denial:
+                http_response.status_code = 403
+                reused.update(denial)
             return reused
 
     # Nous gateway sits above this backend and pre-classifies every turn.
@@ -10526,28 +13130,44 @@ async def turn(
     # Validate the op against CAPABILITY_REGISTRY before trusting it —
     # an unknown op string must not reach run_operation().
     nous_hint: dict[str, Any] | None = None
+    _classify_ms: int = 0
+    _nous_ms: int = 0
+    _classify_source: str = "none"
+    _schedule_deferred_nous = False
     if body.nousIntent and body.nousIntent.get("op"):
         raw_op = str(body.nousIntent["op"]).strip().lower()
         if raw_op in CAPABILITY_REGISTRY:
             nous_hint = {**body.nousIntent, "op": raw_op}
+            _classify_source = "nous_gateway"
+            _classify_ms = int(body.nousIntent.get("_nousMs") or 0)
+            _nous_ms = _classify_ms
         # Unknown op from gateway: fall through to local classifier
     else:
+        _fast_t0 = now_ms()
+        fast_match = classify_fast(intent)
+        if fast_match is not None:
+            _classify_ms = now_ms() - _fast_t0
+            _classify_source = "rule_fast_path"
+            nous_hint = {"op": fast_match.op, "slots": fast_match.payload, "confidence": fast_match.confidence}
         # Prefer embedded Nous model; fall back to rule-based classifier
-        if _nous.is_loaded():
-            nous_result = await _nous.classify(intent)
-            if nous_result and nous_result.get("ops"):
-                ops = nous_result["ops"]
-                first_op = str(ops[0]["type"]).strip().lower()
-                if first_op in CAPABILITY_REGISTRY:
-                    nous_hint = {
-                        "op": first_op,
-                        "slots": ops[0].get("slots") or {},
-                        "confidence": 0.95,
-                        "_extra_ops": ops[1:],
-                        "_nous_response": nous_result.get("response") or "",
-                    }
+        elif _nous.is_loaded():
+            _nous_t0 = now_ms()
+            try:
+                nous_result = await asyncio.wait_for(_nous.classify(intent), timeout=NOUS_CLASSIFY_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                _log.warning("Nous classify timed out (>1000ms) — falling back to rule-based")
+                nous_result = None
+                _schedule_deferred_nous = True
+            _nous_ms = now_ms() - _nous_t0
+            _classify_ms = _nous_ms
+            nous_hint = _build_nous_hint_from_result(nous_result, _nous_ms, "nous_embedded")
+            if nous_hint:
+                _classify_source = "nous_embedded"
         if nous_hint is None:
-            nous_match = await classify_async(intent)
+            _rb_t0 = now_ms()
+            nous_match = await classify_async(intent, timeout_s=NOUS_CLASSIFY_TIMEOUT_S)
+            _classify_ms = now_ms() - _rb_t0
+            _classify_source = "rule_based" if nous_match else "rule_based_none"
             if nous_match:
                 nous_hint = {"op": nous_match.op, "slots": nous_match.payload, "confidence": nous_match.confidence}
 
@@ -10562,10 +13182,14 @@ async def turn(
                     "domain": _op_to_domain(op_type),
                     "payload": extra.get("slots") or {},
                 })
+    action_plan = build_execution_plan(
+        envelope["stateIntent"]["writeOperations"],
+        raw_plan=(nous_hint or {}).get("_plan_steps"),
+    )
     clarification = envelope.get("clarification") or {}
     clarification_required = bool(clarification.get("required", False))
     parse_done_ms = now_ms()
-    has_writes = bool(envelope["stateIntent"]["writeOperations"])
+    has_writes = bool(action_plan)
     merge_info = {"rebased": False, "fromRevision": None, "toRevision": None}
     if has_writes and body.baseRevision is not None and int(body.baseRevision) != int(session.revision):
         op_types = {str(op.get("type", "")).strip() for op in envelope["stateIntent"]["writeOperations"]}
@@ -10625,14 +13249,14 @@ async def turn(
         # render the confirm surface. On re-submit with confirmed=True, inject the
         # flag into op payloads so evaluate_policy passes the high-risk checks.
         _risky_op = None if body.confirmed else next(
-            (op for op in write_ops
-             if str(CAPABILITY_REGISTRY.get(str(op.get("type", "")), {}).get("risk", "low")) == "high"),
+            (step for step in action_plan
+             if str(CAPABILITY_REGISTRY.get(str(step.get("op", "")), {}).get("risk", "low")) == "high"),
             None,
         )
         if _risky_op is not None:
-            _risky_type = str(_risky_op.get("type", "unknown"))
+            _risky_type = str(_risky_op.get("op", "unknown"))
             _risky_domain = str(CAPABILITY_REGISTRY.get(_risky_type, {}).get("domain", "system"))
-            _risky_payload = _risky_op.get("payload", {}) if isinstance(_risky_op.get("payload"), dict) else {}
+            _risky_payload = _risky_op.get("slots", {}) if isinstance(_risky_op.get("slots"), dict) else {}
             _risky_summary = _build_confirm_summary(_risky_type, _risky_payload)
             execution = {
                 "ok": False,
@@ -10646,11 +13270,11 @@ async def turn(
             }
         else:
             if body.confirmed:
-                for op in write_ops:
-                    if not isinstance(op.get("payload"), dict):
-                        op["payload"] = {}
-                    op["payload"]["confirmed"] = True
-            execution = await execute_operations(session, sid, write_ops)
+                for step in action_plan:
+                    if not isinstance(step.get("slots"), dict):
+                        step["slots"] = {}
+                    step["slots"]["confirmed"] = True
+            execution = await run_plan(session, sid, action_plan)
             # MCP fallback: if no connector produced results and MCP servers are registered,
             # try matching the user intent to a registered MCP tool (fires at most once per turn).
             if MCP_SERVER_REGISTRY and not execution.get("toolResults") and not execution.get("needsClarification"):
@@ -10722,6 +13346,9 @@ async def turn(
     plan_done_ms = now_ms()
 
     perf_trace = {
+        "classifyMs": max(0, _classify_ms),
+        "nousMs": max(0, _nous_ms),
+        "classifySource": _classify_source,
         "parseMs": max(0, int(parse_done_ms - started_ms)),
         "executeMs": max(0, int(execute_done_ms - parse_done_ms)),
         "planMs": max(0, int(plan_done_ms - execute_done_ms)),
@@ -10729,7 +13356,26 @@ async def turn(
         "budgetMs": int(TURN_LATENCY_BUDGET_MS),
     }
     perf_trace["withinBudget"] = bool(perf_trace["totalMs"] <= perf_trace["budgetMs"])
+    _resolved_op = (nous_hint or {}).get("op") or "none"
+    _log.info(
+        "turn_metrics classify_ms=%d nous_ms=%d total_ms=%d classify_source=%s parse_ms=%d execute_ms=%d plan_ms=%d op=%s session=%s",
+        perf_trace["classifyMs"], perf_trace["nousMs"], perf_trace["totalMs"], _classify_source,
+        perf_trace["parseMs"], perf_trace["executeMs"], perf_trace["planMs"],
+        _resolved_op, sid[:12],
+    )
     slo_trace = update_slo_state(session, perf_trace)
+    slo_alert = slo_trace.get("newAlert") if isinstance(slo_trace.get("newAlert"), dict) else None
+    if slo_alert:
+        record_runtime_notification(
+            session,
+            notif_type="runtime_slo",
+            title="Runtime throttled",
+            message=f"Turn latency {int(slo_alert.get('totalMs', 0) or 0)}ms over {int(slo_alert.get('budgetMs', TURN_LATENCY_BUDGET_MS) or TURN_LATENCY_BUDGET_MS)}ms budget",
+            severity="warn",
+            created_at=int(slo_alert.get("ts", now_ms()) or now_ms()),
+            source="runtime",
+            route="show runtime health",
+        )
     kernel_trace = build_kernel_trace(route, execution, session, perf_trace, slo_trace)
 
     assert_memory_unchanged(
@@ -10745,6 +13391,7 @@ async def turn(
         "intent": intent,
         "envelope": envelope,
         "execution": execution,
+        "actionPlan": action_plan,
         "kernelTrace": kernel_trace,
         "plan": plan,
         "planner": planner,
@@ -10764,6 +13411,7 @@ async def turn(
     response = {
         "envelope": envelope,
         "execution": execution,
+        "actionPlan": action_plan,
         "kernelTrace": kernel_trace,
         "plan": plan,
         "memory": session.memory,
@@ -10778,6 +13426,29 @@ async def turn(
     }
     if idem_key:
         store_idempotent_response(session, idem_key, intent, response, session.revision)
+    denial = _connector_scope_denial_from_turn_payload(response)
+    if denial:
+        http_response.status_code = 403
+        response.update(denial)
+    http_response.headers["X-Genome-Classify-Ms"] = str(int(perf_trace["classifyMs"]))
+    http_response.headers["X-Genome-Nous-Ms"] = str(int(perf_trace["nousMs"]))
+    http_response.headers["X-Genome-Classify-Source"] = str(_classify_source)
+    http_response.headers["X-Genome-Parse-Ms"] = str(int(perf_trace["parseMs"]))
+    http_response.headers["X-Genome-Total-Ms"] = str(int(perf_trace["totalMs"]))
+    http_response.headers["X-Nous-Parse-Ms"] = str(int(perf_trace["nousMs"]))
+    http_response.headers["X-Nous-Classify-Source"] = str(_classify_source)
+    if _schedule_deferred_nous and not body.nousIntent:
+        asyncio.create_task(
+            _reconcile_delayed_nous_turn(
+                sid,
+                int(session.revision),
+                intent,
+                copy.deepcopy(envelope),
+                copy.deepcopy(execution),
+                copy.deepcopy(merge_info),
+            ),
+            name=f"nous-reconcile:{sid[:10]}",
+        )
     return response
 
 
@@ -10878,6 +13549,16 @@ async def run_due_jobs_for_session(session_id: str, session: SessionState, force
             bg_event = execute_scheduled_job(session, session_id, job)
             if isinstance(bg_event, dict) and bg_event:
                 background_events.append(bg_event)
+                record_runtime_notification(
+                    session,
+                    notif_type=str(bg_event.get("type", "event") or "event"),
+                    title=str(bg_event.get("title", "Background event") or "Background event"),
+                    message=str(bg_event.get("message", "") or ""),
+                    severity=str(bg_event.get("severity", "info") or "info"),
+                    route=str(bg_event.get("intent", "") or ""),
+                    created_at=int(bg_event.get("createdAt", now) or now),
+                    source="scheduler",
+                )
             job["failureCount"] = 0
             job["lastError"] = ""
             interval_ms = int(job.get("intervalMs", 0) or 0)
@@ -10917,6 +13598,15 @@ async def run_due_jobs_for_session(session_id: str, session: SessionState, force
     continuity_alert = maybe_continuity_alert_event(session, session_id)
     if continuity_alert:
         background_events.append(continuity_alert)
+        record_runtime_notification(
+            session,
+            notif_type=str(continuity_alert.get("type", "continuity_alert") or "continuity_alert"),
+            title="Continuity alert",
+            message=str(continuity_alert.get("message", "") or ""),
+            severity=str(continuity_alert.get("severity", "warn") or "warn"),
+            created_at=int(continuity_alert.get("createdAt", now) or now),
+            source="runtime",
+        )
         ran = True
 
     if not ran:
@@ -10967,8 +13657,10 @@ def session_sync_payload(session_id: str, session: SessionState) -> dict[str, An
         "sessionId": session_id,
         "revision": session.revision,
         "memory": session.memory,
+        "workspace": session.workspace,
         "presence": session.presence,
         "handoff": session.handoff,
+        "notifications": ensure_notifications_state(session.notifications),
         "continuityAutopilot": ensure_continuity_autopilot_state(session.continuity_autopilot),
         "lastTurn": session.last_turn,
     }
@@ -11064,10 +13756,23 @@ def summarize_turn_history(items: list[dict[str, Any]]) -> dict[str, Any]:
 def get_runtime_health_payload(session: SessionState, session_id: str) -> dict[str, Any]:
     perf = (((session.last_turn or {}).get("kernelTrace") or {}).get("runtime") or {}).get("performance", {})
     presence = build_presence_payload(session, session_id)
+    workspace = ensure_workspace_state(session.workspace)
+    active = workspace.get("activeContent") if isinstance(workspace.get("activeContent"), dict) else {}
+    worktrees = workspace.get("worktrees") if isinstance(workspace.get("worktrees"), dict) else {}
     return {
         "ok": True,
         "sessionId": session_id,
         "revision": int(session.revision),
+        "workspace": {
+            "branch": str(workspace.get("branch", "main") or "main"),
+            "worktreeCount": int(len(worktrees)),
+            "activeContent": {
+                "itemId": str(active.get("itemId", "") or ""),
+                "name": str(active.get("name", "") or ""),
+                "domain": str(active.get("domain", "") or ""),
+                "branch": str(active.get("branch", workspace.get("branch", "main")) or "main"),
+            },
+        },
         "presence": {
             "activeCount": int(presence.get("activeCount", 0) or 0),
             "count": int(presence.get("count", 0) or 0),
@@ -11085,6 +13790,43 @@ def get_runtime_health_payload(session: SessionState, session_id: str) -> dict[s
             "budgetMs": int(perf.get("budgetMs", TURN_LATENCY_BUDGET_MS) or TURN_LATENCY_BUDGET_MS),
             "withinBudget": bool(perf.get("withinBudget", True)),
         },
+    }
+
+
+def build_runtime_services_payload() -> dict[str, Any]:
+    gateway_ok = False
+    gateway_detail = "unreachable"
+    try:
+        with httpx.Client(timeout=1.5) as client:
+            resp = client.get(NOUS_HEALTH_URL)
+            gateway_ok = bool(resp.status_code == 200)
+            gateway_detail = "healthy" if gateway_ok else f"http {resp.status_code}"
+    except Exception:
+        gateway_ok = False
+        gateway_detail = "unreachable"
+    return {
+        "ok": True,
+        "services": {
+            "backend": {
+                "label": "Backend API",
+                "running": True,
+                "detail": "healthy",
+                "authoritative": True,
+            },
+            "nous_embedded": {
+                "label": "Nous embedded classifier",
+                "running": bool(_nous.is_loaded()),
+                "detail": "loaded" if _nous.is_loaded() else "not loaded",
+                "authoritative": True,
+            },
+            "nous_gateway": {
+                "label": "Nous gateway",
+                "running": gateway_ok,
+                "detail": gateway_detail,
+                "authoritative": gateway_ok,
+            },
+        },
+        "checkedAt": now_ms(),
     }
 
 
@@ -11269,6 +14011,8 @@ def build_presence_payload(session: SessionState, session_id: str, timeout_ms: i
                 "deviceId": device_id,
                 "label": str(item.get("label", "") or ""),
                 "platform": str(item.get("platform", "") or ""),
+                "did": str(item.get("did", "") or ""),
+                "relayUrl": str(item.get("relayUrl", "") or ""),
                 "lastSeenAt": last_seen,
                 "ageMs": age,
                 "active": active,
@@ -11368,6 +14112,10 @@ def build_continuity_payload(session: SessionState, session_id: str) -> dict[str
     presence = build_presence_payload(session, session_id)
     handoff = build_handoff_stats_payload(session, session_id)
     autopilot = ensure_continuity_autopilot_state(session.continuity_autopilot)
+    workspace = ensure_workspace_state(session.workspace)
+    active = workspace.get("activeContent") if isinstance(workspace.get("activeContent"), dict) else {}
+    worktrees = workspace.get("worktrees") if isinstance(workspace.get("worktrees"), dict) else {}
+    notifications = ensure_notifications_state(session.notifications)
     idem_entries = session.idempotency.get("entries", []) if isinstance(session.idempotency.get("entries"), list) else []
     presence_stats = (session.presence.get("stats") if isinstance(session.presence.get("stats"), dict) else {})
     stats = handoff.get("stats", {}) if isinstance(handoff.get("stats"), dict) else {}
@@ -11386,6 +14134,9 @@ def build_continuity_payload(session: SessionState, session_id: str) -> dict[str
         "idempotencyEntries": int(len(idem_entries)),
         "autopilotEnabled": bool(autopilot.get("enabled", False)),
         "autopilotApplied": int(autopilot.get("applied", 0) or 0),
+        "worktreeCount": int(len(worktrees)),
+        "notificationCount": int(len(notifications)),
+        "unreadNotificationCount": int(sum(1 for item in notifications if not bool(item.get("read", False)))),
     }
     health = evaluate_continuity_health(summary)
     return {
@@ -11397,6 +14148,21 @@ def build_continuity_payload(session: SessionState, session_id: str) -> dict[str
         "presence": presence,
         "handoff": handoff,
         "autopilot": autopilot,
+        "workspace": {
+            "repoId": str(workspace.get("repoId", "user-global") or "user-global"),
+            "branch": str(workspace.get("branch", "main") or "main"),
+            "worktreeCount": int(len(worktrees)),
+            "activeContent": {
+                "itemId": str(active.get("itemId", "") or ""),
+                "name": str(active.get("name", "") or ""),
+                "domain": str(active.get("domain", "") or ""),
+                "branch": str(active.get("branch", workspace.get("branch", "main")) or "main"),
+            },
+        },
+        "notifications": {
+            "count": int(len(notifications)),
+            "unread": int(sum(1 for item in notifications if not bool(item.get("read", False)))),
+        },
         "idempotency": {
             "entries": int(len(idem_entries)),
             "maxEntries": int(TURN_IDEMPOTENCY_MAX_ENTRIES),
@@ -11822,6 +14588,7 @@ def build_continuity_autopilot_dry_run(session: SessionState, session_id: str, f
     projected = SessionState(
         memory=copy.deepcopy(session.memory),
         graph=copy.deepcopy(session.graph),
+        workspace=copy.deepcopy(session.workspace),
         jobs=copy.deepcopy(session.jobs),
         presence=copy.deepcopy(session.presence),
         handoff=copy.deepcopy(session.handoff),
@@ -15931,6 +18698,157 @@ def _sanitize_slots(raw: Any) -> "dict[str, Any]":
             clean[k] = None
         # nested dicts/lists are silently dropped
     return clean
+
+
+def _build_nous_hint_from_result(nous_result: dict[str, Any] | None, classify_ms: int, source: str) -> dict[str, Any] | None:
+    if not isinstance(nous_result, dict):
+        return None
+    raw_plan = nous_result.get("plan")
+    if isinstance(raw_plan, list) and raw_plan:
+        normalized_plan = build_execution_plan([], raw_plan=raw_plan)
+        if not normalized_plan:
+            return None
+        first = normalized_plan[0]
+        return {
+            "op": first.get("op", ""),
+            "slots": first.get("slots", {}) or {},
+            "confidence": 0.95,
+            "_extra_ops": [{"type": step.get("op", ""), "slots": step.get("slots", {}) or {}} for step in normalized_plan[1:]],
+            "_plan_steps": normalized_plan,
+            "_nous_response": nous_result.get("response") or "",
+            "_nous_ms": int(classify_ms),
+            "_source": source,
+        }
+    ops = nous_result.get("ops")
+    if not isinstance(ops, list) or not ops:
+        return None
+    first = ops[0] if isinstance(ops[0], dict) else {}
+    first_op = str(first.get("type", "")).strip().lower()
+    if first_op not in CAPABILITY_REGISTRY:
+        return None
+    return {
+        "op": first_op,
+        "slots": first.get("slots") or {},
+        "confidence": 0.95,
+        "_extra_ops": [item for item in ops[1:] if isinstance(item, dict)],
+        "_nous_response": nous_result.get("response") or "",
+        "_nous_ms": int(classify_ms),
+        "_source": source,
+    }
+
+
+def _envelope_signature(envelope: dict[str, Any] | None) -> str:
+    if not isinstance(envelope, dict):
+        return ""
+    state_intent = envelope.get("stateIntent") if isinstance(envelope.get("stateIntent"), dict) else {}
+    clarification = envelope.get("clarification") if isinstance(envelope.get("clarification"), dict) else {}
+    write_ops = state_intent.get("writeOperations") if isinstance(state_intent.get("writeOperations"), list) else []
+    normalized_ops = []
+    for op in write_ops:
+        if not isinstance(op, dict):
+            continue
+        payload = op.get("payload") if isinstance(op.get("payload"), dict) else {}
+        normalized_ops.append(
+            {
+                "type": str(op.get("type", "")).strip().lower(),
+                "domain": str(op.get("domain", "")).strip().lower(),
+                "payload": {str(k): payload[k] for k in sorted(payload.keys(), key=str)},
+            }
+        )
+    marker = {
+        "reads": [str(item) for item in (state_intent.get("readDomains") or [])],
+        "writes": normalized_ops,
+        "summary": str(state_intent.get("summary", "")),
+        "clarification": bool(clarification.get("required", False)),
+    }
+    return to_json(marker)
+
+
+async def _reconcile_delayed_nous_turn(
+    session_id: str,
+    expected_revision: int,
+    intent: str,
+    baseline_envelope: dict[str, Any],
+    baseline_execution: dict[str, Any],
+    merge_info: dict[str, Any] | None = None,
+) -> None:
+    if not _nous.is_loaded():
+        return
+    try:
+        nous_result = await asyncio.wait_for(_nous.classify(intent), timeout=max(2.5, NOUS_CLASSIFY_TIMEOUT_S * 4.0))
+    except Exception:
+        return
+
+    delayed_ms = max(0, int(NOUS_CLASSIFY_TIMEOUT_S * 1000))
+    delayed_hint = _build_nous_hint_from_result(nous_result, delayed_ms, "nous_embedded_deferred")
+    if delayed_hint is None:
+        return
+
+    delayed_envelope = compile_intent_envelope(intent, delayed_hint)
+    if _envelope_signature(delayed_envelope) == _envelope_signature(baseline_envelope):
+        return
+
+    session = SESSIONS.get(session_id)
+    if session is None or int(session.revision) != int(expected_revision):
+        return
+
+    projected = deserialize_session_state(serialize_session_state(session))
+    delayed_action_plan = build_execution_plan(
+        (delayed_envelope.get("stateIntent") or {}).get("writeOperations") or [],
+        raw_plan=(delayed_hint or {}).get("_plan_steps"),
+    )
+    delayed_execution = await run_plan(projected, session_id, delayed_action_plan)
+    projected_changed = (
+        stable_memory_fingerprint(projected.memory) != stable_memory_fingerprint(session.memory)
+        or to_json(projected.graph) != to_json(session.graph)
+        or to_json(projected.jobs) != to_json(session.jobs)
+    )
+    if projected_changed:
+        record_runtime_notification(
+            session,
+            notif_type="nous_reconcile",
+            title="Delayed intent classification differed",
+            message=f"Nous later suggested a different action for: {intent[:96]}",
+            severity="info",
+            created_at=now_ms(),
+            source="runtime",
+            route=intent,
+        )
+        await broadcast_session(session, session_sync_payload(session_id, session))
+        await persist_sessions_to_disk_safe("nous_reconcile_drift")
+        return
+
+    route = planner_route(delayed_envelope, delayed_execution, session.graph)
+    local_plan = build_local_plan(delayed_envelope, session.graph, delayed_execution, session.jobs)
+    plan = enrich_plan_trace(normalize_plan(local_plan), session.graph, route)
+    performance = {
+        "classifyMs": int(delayed_hint.get("_nous_ms", 0) or 0),
+        "classifySource": "nous_embedded_deferred",
+        "parseMs": int(delayed_hint.get("_nous_ms", 0) or 0),
+        "executeMs": 0,
+        "planMs": 0,
+        "totalMs": int(delayed_hint.get("_nous_ms", 0) or 0),
+        "budgetMs": int(TURN_LATENCY_BUDGET_MS),
+        "withinBudget": bool(int(delayed_hint.get("_nous_ms", 0) or 0) <= int(TURN_LATENCY_BUDGET_MS)),
+        "deferred": True,
+    }
+    kernel_trace = build_kernel_trace(route, baseline_execution, session, performance, None)
+    last_turn = session.last_turn if isinstance(session.last_turn, dict) else {}
+    session.last_turn = {
+        **last_turn,
+        "intent": intent,
+        "envelope": delayed_envelope,
+        "execution": delayed_execution,
+        "actionPlan": delayed_action_plan,
+        "kernelTrace": kernel_trace,
+        "plan": plan,
+        "planner": "local-deferred-nous",
+        "route": route,
+        "merge": merge_info if isinstance(merge_info, dict) else last_turn.get("merge"),
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+    }
+    await broadcast_session(session, session_sync_payload(session_id, session))
+    await persist_sessions_to_disk_safe("nous_reconcile_surface")
 
 
 def compile_intent_envelope(text: str, nous_hint: "dict[str, Any] | None" = None) -> dict[str, Any]:
@@ -20386,6 +23304,11 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "location_status": {"domain": "system", "risk": "low"},
     "shop_catalog_search": {"domain": "shopping", "risk": "low"},
     "weather_forecast": {"domain": "weather", "risk": "low"},
+    "weather_hourly": {"domain": "weather", "risk": "low"},
+    "weather_radar": {"domain": "weather", "risk": "low"},
+    "weather_air_quality": {"domain": "weather", "risk": "low"},
+    "weather_astronomy": {"domain": "weather", "risk": "low"},
+    "weather_alert": {"domain": "weather", "risk": "low"},
     "sports_scores": {"domain": "sports", "risk": "low"},
     "sports_schedule": {"domain": "sports", "risk": "low"},
     "sports_standings": {"domain": "sports", "risk": "low"},
@@ -20426,17 +23349,25 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "content_list":         {"domain": "content", "risk": "low"},
     "content_history":      {"domain": "content", "risk": "low"},
     "content_branch":       {"domain": "content", "risk": "low"},
+    "content_merge":        {"domain": "content", "risk": "medium"},
     "content_revert":       {"domain": "content", "risk": "medium"},
+    "content_worktrees":    {"domain": "content", "risk": "low"},
+    "content_attach":       {"domain": "content", "risk": "low"},
+    "content_activate":     {"domain": "content", "risk": "low"},
+    "content_detach":       {"domain": "content", "risk": "low"},
     "content_share":        {"domain": "content", "risk": "low"},
     # Documents
     "document_create":      {"domain": "document", "risk": "low"},
     "document_edit":        {"domain": "document", "risk": "low"},
+    "document_open":        {"domain": "document", "risk": "low"},
     # Spreadsheets
     "spreadsheet_create":   {"domain": "spreadsheet", "risk": "low"},
     "spreadsheet_edit":     {"domain": "spreadsheet", "risk": "low"},
+    "spreadsheet_open":     {"domain": "spreadsheet", "risk": "low"},
     # Presentations
     "presentation_create":  {"domain": "presentation", "risk": "low"},
     "presentation_edit":    {"domain": "presentation", "risk": "low"},
+    "presentation_open":    {"domain": "presentation", "risk": "low"},
     # Code / IDE
     "code_create":          {"domain": "code", "risk": "low"},
     "code_edit":            {"domain": "code", "risk": "low"},
@@ -20449,6 +23380,11 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "calendar_create":      {"domain": "calendar", "risk": "low"},
     "calendar_list":        {"domain": "calendar", "risk": "low"},
     "calendar_cancel":      {"domain": "calendar", "risk": "medium"},
+    "calendar_reschedule":  {"domain": "calendar", "risk": "medium"},
+    "calendar_rsvp":        {"domain": "calendar", "risk": "low"},
+    "calendar_invite":      {"domain": "calendar", "risk": "medium"},
+    "calendar_availability":{"domain": "calendar", "risk": "low"},
+    "calendar_recurring":   {"domain": "calendar", "risk": "medium"},
     # Email
     "email_compose":        {"domain": "email", "risk": "medium"},
     "email_read":           {"domain": "email", "risk": "low"},
@@ -20485,6 +23421,7 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "gdrive.share":         {"domain": "document", "risk": "high"},
     # Slack (dotted connector ops)
     "slack.list_channels":  {"domain": "messaging","risk": "low"},
+    "slack_send":           {"domain": "messaging","risk": "medium"},
     "slack.read":           {"domain": "messaging","risk": "low"},
     "slack.send":           {"domain": "messaging","risk": "medium"},
     # Slack (taxonomy flat ops)
@@ -20521,6 +23458,7 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "currency_rates":       {"domain": "reference",  "risk": "low"},
     "currency_convert":     {"domain": "reference",  "risk": "low"},
     "unit_convert":         {"domain": "reference",  "risk": "low"},
+    "calc_evaluate":        {"domain": "reference",  "risk": "low"},
     # Alarm & Clock
     "alarm_list":           {"domain": "clock",      "risk": "low"},
     "clock_world":          {"domain": "clock",      "risk": "low"},
@@ -20600,6 +23538,7 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "travel_hotel_search":  {"domain": "travel",     "risk": "low"},
     "travel_hotel_book":    {"domain": "travel",     "risk": "high"},
     "travel_boarding_pass": {"domain": "travel",     "risk": "low"},
+    "travel_alert":         {"domain": "travel",     "risk": "low"},
     "travel_checkin":       {"domain": "travel",     "risk": "medium"},
     "travel_itinerary":     {"domain": "travel",     "risk": "low"},
     "travel_car_rental":    {"domain": "travel",     "risk": "medium"},
@@ -20674,6 +23613,10 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "document_export":      {"domain": "document",   "risk": "low"},
     "document_share":       {"domain": "document",   "risk": "medium"},
     "document_template":    {"domain": "document",   "risk": "low"},
+    "code_review":          {"domain": "code",       "risk": "low"},
+    "code_test":            {"domain": "code",       "risk": "low"},
+    "code_refactor":        {"domain": "code",       "risk": "low"},
+    "code_optimize":        {"domain": "code",       "risk": "low"},
     # Spreadsheet extended
     "spreadsheet_delete":   {"domain": "spreadsheet","risk": "high"},
     "spreadsheet_chart":    {"domain": "spreadsheet","risk": "low"},
@@ -20734,6 +23677,12 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "screen_record":        {"domain": "screen",     "risk": "medium"},
     "screen_mirror":        {"domain": "screen",     "risk": "medium"},
     "screen_split":         {"domain": "screen",     "risk": "low"},
+    # Camera
+    "camera_photo":         {"domain": "camera",     "risk": "low"},
+    "camera_video":         {"domain": "camera",     "risk": "medium"},
+    "camera_scan_qr":       {"domain": "camera",     "risk": "low"},
+    "camera_scan_doc":      {"domain": "camera",     "risk": "low"},
+    "camera_ocr":           {"domain": "camera",     "risk": "low"},
     # Handoff & continuity
     "handoff_clipboard":    {"domain": "handoff",    "risk": "low"},
     "handoff_continue":     {"domain": "handoff",    "risk": "low"},
@@ -20745,6 +23694,7 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     # Password manager
     "password_find":        {"domain": "password",   "risk": "low"},
     "password_generate":    {"domain": "password",   "risk": "low"},
+    "password_2fa":         {"domain": "password",   "risk": "low"},
     "password_update":      {"domain": "password",   "risk": "high"},
     # App store
     "app_find":             {"domain": "app",        "risk": "low"},
@@ -20752,6 +23702,7 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "app_update":           {"domain": "app",        "risk": "medium"},
     # Reading list
     "reading_save":         {"domain": "reading",    "risk": "low"},
+    "reading_list":         {"domain": "reading",    "risk": "low"},
     "reading_list_view":    {"domain": "reading",    "risk": "low"},
     "reading_mark_read":    {"domain": "reading",    "risk": "low"},
     # Accessibility & device settings
@@ -20760,16 +23711,24 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "access_voice":         {"domain": "accessibility", "risk": "low"},
     "access_zoom":          {"domain": "accessibility", "risk": "low"},
     "settings_airplane":    {"domain": "accessibility", "risk": "medium"},
+    "settings_battery":     {"domain": "accessibility", "risk": "low"},
     "settings_bluetooth":   {"domain": "accessibility", "risk": "medium"},
     "settings_brightness":  {"domain": "accessibility", "risk": "low"},
     "settings_dnd":         {"domain": "accessibility", "risk": "low"},
+    "settings_notification":{"domain": "accessibility", "risk": "low"},
+    "settings_storage":     {"domain": "accessibility", "risk": "low"},
     "settings_wifi":        {"domain": "accessibility", "risk": "medium"},
+    # Print
+    "print_document":       {"domain": "print",      "risk": "low"},
+    "print_photo":          {"domain": "print",      "risk": "low"},
+    "print_scan":           {"domain": "print",      "risk": "low"},
     # Shortcuts & automations
     "shortcut_list":        {"domain": "shortcuts",  "risk": "low"},
     "shortcut_create":      {"domain": "shortcuts",  "risk": "medium"},
     "shortcut_run":         {"domain": "shortcuts",  "risk": "medium"},
     # Podcasts
     "podcast_find":         {"domain": "podcast",    "risk": "low"},
+    "podcast_play":         {"domain": "podcast",    "risk": "low"},
     "podcast_queue":        {"domain": "podcast",    "risk": "low"},
     "podcast_subscribe":    {"domain": "podcast",    "risk": "low"},
     # Recipes & grocery
@@ -20780,6 +23739,16 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "grocery_list":         {"domain": "grocery",    "risk": "low"},
     "grocery_add":          {"domain": "grocery",    "risk": "low"},
     "grocery_order":        {"domain": "grocery",    "risk": "high"},
+    "news_saved":           {"domain": "news",       "risk": "low"},
+    "news_trending":        {"domain": "news",       "risk": "low"},
+    "news_by_source":       {"domain": "news",       "risk": "low"},
+    "task_priority":        {"domain": "tasks",      "risk": "low"},
+    "task_due":             {"domain": "tasks",      "risk": "low"},
+    "maps_search":          {"domain": "maps",       "risk": "low"},
+    "maps_save_place":      {"domain": "maps",       "risk": "low"},
+    "maps_explore":         {"domain": "maps",       "risk": "low"},
+    "maps_review":          {"domain": "maps",       "risk": "low"},
+    "maps_share_eta":       {"domain": "maps",       "risk": "low"},
     # Books
     "book_library":         {"domain": "books",      "risk": "low"},
     "book_find":            {"domain": "books",      "risk": "low"},
@@ -20819,7 +23788,90 @@ CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
     "dating_profile":       {"domain": "dating",     "risk": "low"},
     "dating_discover":      {"domain": "dating",     "risk": "low"},
 }
+
+_CAPABILITY_SCOPE_MAP: dict[str, list[str]] = {
+    "fetch_url": ["web.page.read"],
+    "web_summarize": ["web.page.read"],
+    "web_search": ["web.page.read"],
+    "contacts_lookup": ["contacts.read"],
+    "telephony_call_start": ["telephony.call.start"],
+    "banking_balance_read": ["bank.account.balance.read"],
+    "banking_transactions_read": ["bank.transaction.read"],
+    "social_feed_read": ["social.feed.read"],
+    "social_notifications": ["social.feed.read"],
+    "social_trending": ["social.feed.read"],
+    "social_message_send": ["social.message.send"],
+    "social_dm_send": ["social.message.send"],
+    "social_react": ["social.message.send"],
+    "social_comment": ["social.message.send"],
+    "social_follow": ["social.message.send"],
+    "calendar_list": ["https://www.googleapis.com/auth/calendar.readonly"],
+    "calendar_availability": ["https://www.googleapis.com/auth/calendar.readonly"],
+    "calendar_create": ["https://www.googleapis.com/auth/calendar.events"],
+    "calendar_cancel": ["https://www.googleapis.com/auth/calendar.events"],
+    "calendar_reschedule": ["https://www.googleapis.com/auth/calendar.events"],
+    "calendar_rsvp": ["https://www.googleapis.com/auth/calendar.events"],
+    "calendar_invite": ["https://www.googleapis.com/auth/calendar.events"],
+    "calendar_recurring": ["https://www.googleapis.com/auth/calendar.events"],
+    "music_play": ["user-modify-playback-state"],
+    "music_pause": ["user-modify-playback-state"],
+    "music_skip": ["user-modify-playback-state"],
+    "music_volume": ["user-modify-playback-state"],
+    "music_queue": ["user-modify-playback-state"],
+    "music_playlist_add": ["user-modify-playback-state"],
+    "music_playlist_create": ["playlist-read-private"],
+    "music_discover": ["user-read-playback-state"],
+    "music_radio": ["user-read-playback-state"],
+    "music_like": ["user-read-recently-played"],
+}
+
+for _capability_name, _scopes in _CAPABILITY_SCOPE_MAP.items():
+    if _capability_name in CAPABILITY_REGISTRY:
+        CAPABILITY_REGISTRY[_capability_name]["connector_scopes"] = list(_scopes)
+
 COMMUTATIVE_MERGE_OPS = {"add_task", "add_note", "add_expense"}
+
+
+def _resolve_op_refs(op: dict[str, Any], step_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Replace slot values of the form {"_ref": "step_N.data.field"} with the
+    actual value from a previous step's result. This enables Nous to produce
+    compound plans where later steps use earlier steps' outputs.
+
+    Examples:
+      {"_ref": "step_0.data.track"}   → result[0]["data"]["track"]
+      {"_ref": "step_1.message"}      → result[1]["message"]
+      {"_ref": "step_0.data.uri"}     → result[0]["data"]["uri"]
+    """
+    payload = op.get("payload") or {}
+    if not isinstance(payload, dict):
+        return op
+
+    resolved_payload = {}
+    for key, val in payload.items():
+        if isinstance(val, dict) and "_ref" in val:
+            path = str(val["_ref"])
+            parts = path.split(".")
+            # parts[0] must be "step_N"
+            if parts and parts[0].startswith("step_"):
+                try:
+                    idx = int(parts[0][5:])
+                    obj: Any = step_results[idx] if idx < len(step_results) else None
+                    for p in parts[1:]:
+                        if isinstance(obj, dict):
+                            obj = obj.get(p)
+                        else:
+                            obj = None
+                            break
+                    resolved_payload[key] = obj
+                except (ValueError, IndexError):
+                    resolved_payload[key] = None
+            else:
+                resolved_payload[key] = val
+        else:
+            resolved_payload[key] = val
+
+    return {**op, "payload": resolved_payload}
 
 
 async def execute_operations(session: SessionState, session_id: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -20829,8 +23881,11 @@ async def execute_operations(session: SessionState, session_id: str, operations:
     results = []
     ok = True
     message = ""
+    is_plan = len(operations) > 1  # flag for callers — multi-step plan execution
 
-    for op in operations:
+    for step_idx, op in enumerate(operations):
+        # Resolve inter-step references before policy check or execution
+        op = _resolve_op_refs(op, results)
         capability = resolve_capability(op)
         policy = evaluate_policy(op, capability)
         before = memory_counts(session.memory)
@@ -20882,11 +23937,140 @@ async def execute_operations(session: SessionState, session_id: str, operations:
             }
 
         record_journal_entry(session, session_id, op, result)
-        results.append({"op": op["type"], **result})
+        results.append({"op": op["type"], "step": step_idx, **result})
         ok = ok and result["ok"]
         message = result["message"]
 
-    return {"ok": ok, "message": message, "toolResults": results, "journalTail": session.journal[-20:]}
+    return {
+        "ok": ok,
+        "message": message,
+        "toolResults": results,
+        "isPlan": is_plan,
+        "planSteps": len(results) if is_plan else 0,
+        "journalTail": session.journal[-20:],
+    }
+
+
+def _normalize_plan_step(raw_step: Any, idx: int) -> dict[str, Any] | None:
+    if not isinstance(raw_step, dict):
+        return None
+    raw_op = str(raw_step.get("op", raw_step.get("type", "")) or "").strip().lower()
+    if raw_op not in CAPABILITY_REGISTRY:
+        return None
+    step_id = str(raw_step.get("id", "") or f"step_{idx + 1}").strip().lower()
+    if not step_id:
+        step_id = f"step_{idx + 1}"
+    raw_slots = raw_step.get("slots", raw_step.get("payload", {}))
+    slots = _sanitize_slots(raw_slots if isinstance(raw_slots, dict) else {})
+    if raw_op == "schedule_remind_once" and "delayMs" not in slots and "durationMs" in slots:
+        slots["delayMs"] = slots["durationMs"]
+    depends = raw_step.get("depends_on", raw_step.get("dependsOn", []))
+    depends_on = [str(item).strip().lower() for item in (depends if isinstance(depends, list) else [depends]) if str(item).strip()]
+    return {
+        "id": step_id,
+        "op": raw_op,
+        "slots": slots,
+        "depends_on": depends_on,
+    }
+
+
+def build_execution_plan(operations: list[dict[str, Any]], raw_plan: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    if isinstance(raw_plan, list) and raw_plan:
+        out: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for idx, item in enumerate(raw_plan):
+            normalized = _normalize_plan_step(item, idx)
+            if not normalized:
+                continue
+            if normalized["id"] in seen_ids:
+                normalized["id"] = f"{normalized['id']}_{idx + 1}"
+            seen_ids.add(normalized["id"])
+            out.append(normalized)
+        if out:
+            valid_ids = {step["id"] for step in out}
+            for idx, step in enumerate(out):
+                filtered = [dep for dep in step["depends_on"] if dep in valid_ids and dep != step["id"]]
+                if not filtered and idx > 0:
+                    filtered = [out[idx - 1]["id"]]
+                step["depends_on"] = filtered
+            return out
+    return [
+        {
+            "id": f"step_{idx + 1}",
+            "op": str(op.get("type", "")).strip().lower(),
+            "slots": _sanitize_slots(op.get("payload", {}) if isinstance(op.get("payload"), dict) else {}),
+            "depends_on": [f"step_{idx}"] if idx > 0 else [],
+        }
+        for idx, op in enumerate(operations)
+        if str(op.get("type", "")).strip().lower() in CAPABILITY_REGISTRY
+    ]
+
+
+async def run_plan(session: SessionState, session_id: str, plan_steps: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_steps = []
+    for idx, step in enumerate(plan_steps or []):
+        normalized = _normalize_plan_step(step, idx)
+        if normalized:
+            normalized_steps.append(normalized)
+    plan_steps = normalized_steps
+
+    if not plan_steps:
+        return {"ok": True, "message": "No plan steps requested.", "toolResults": [], "plan": [], "isPlan": False, "planSteps": 0, "journalTail": session.journal[-20:]}
+
+    results: list[dict[str, Any]] = []
+    status_by_id: dict[str, bool] = {}
+    ok = True
+    message = ""
+
+    for idx, step in enumerate(plan_steps):
+        step_id = str(step.get("id", f"step_{idx + 1}") or f"step_{idx + 1}")
+        depends_on = [str(dep).strip().lower() for dep in (step.get("depends_on") or []) if str(dep).strip()]
+        blocked = [dep for dep in depends_on if status_by_id.get(dep) is False]
+        unmet = [dep for dep in depends_on if dep not in status_by_id]
+        if blocked or unmet:
+            missing = blocked or unmet
+            result = {
+                "op": str(step.get("op", "")).strip().lower(),
+                "step": idx,
+                "stepId": step_id,
+                "dependsOn": depends_on,
+                "ok": False,
+                "message": f"Skipped because dependency failed: {', '.join(missing[:3])}",
+                "previewLines": [f"depends on: {', '.join(depends_on) or 'none'}", f"skipped: {', '.join(missing[:3])}"],
+                "policy": {"allowed": True, "reason": "dependency_skip", "code": "dependency_skip"},
+                "capability": resolve_capability({"type": str(step.get('op', '')).strip().lower()}),
+                "diff": zero_diff(),
+                "skipped": True,
+            }
+        else:
+            exec_result = await execute_operations(
+                session,
+                session_id,
+                [{"type": str(step.get("op", "")).strip().lower(), "payload": dict(step.get("slots", {}) or {})}],
+            )
+            op_result = dict((exec_result.get("toolResults") or [{}])[-1] if exec_result.get("toolResults") else {})
+            result = {
+                **op_result,
+                "op": str(step.get("op", "")).strip().lower(),
+                "step": idx,
+                "stepId": step_id,
+                "dependsOn": depends_on,
+                "skipped": False,
+            }
+        status_by_id[step_id] = bool(result.get("ok", False))
+        results.append(result)
+        ok = ok and bool(result.get("ok", False))
+        message = str(result.get("message", message))
+
+    return {
+        "ok": ok,
+        "message": message,
+        "toolResults": results,
+        "plan": [{"id": str(step.get("id", "")), "op": str(step.get("op", "")), "slots": dict(step.get("slots", {}) or {}), "depends_on": list(step.get("depends_on", []) or [])} for step in plan_steps],
+        "isPlan": len(plan_steps) > 1,
+        "planSteps": len(plan_steps),
+        "journalTail": session.journal[-20:],
+    }
 
 
 def resolve_capability(op: dict[str, Any]) -> dict[str, Any]:
@@ -20894,7 +24078,29 @@ def resolve_capability(op: dict[str, Any]) -> dict[str, Any]:
     spec = CAPABILITY_REGISTRY.get(kind)
     if not spec:
         return {"name": kind, "domain": "unknown", "risk": "high", "known": False}
-    return {"name": kind, "domain": spec["domain"], "risk": spec["risk"], "known": True}
+    connector_scopes = list(spec.get("connector_scopes", [])) if isinstance(spec.get("connector_scopes"), list) else []
+    return {"name": kind, "domain": spec["domain"], "risk": spec["risk"], "known": True, "connector_scopes": connector_scopes}
+
+
+def required_connector_scopes_for_capability(capability_name: str, payload: dict[str, Any] | None = None) -> list[str]:
+    spec = CAPABILITY_REGISTRY.get(str(capability_name), {})
+    scopes = list(spec.get("connector_scopes", [])) if isinstance(spec.get("connector_scopes"), list) else []
+    payload_map = payload if isinstance(payload, dict) else {}
+    target = str(payload_map.get("target") or "").strip()
+    if capability_name == "telephony_call_start" and target and not looks_like_phone_target(target):
+        scopes.append("contacts.read")
+    if capability_name.startswith("calendar_") and _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
+        return []
+    if capability_name.startswith("music_") and _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for scope in scopes:
+        scope_norm = normalize_connector_scope(str(scope))
+        if scope_norm and scope_norm not in seen:
+            seen.add(scope_norm)
+            normalized.append(scope_norm)
+    return normalized
 
 
 def build_policy_preview_lines(op: dict[str, Any], policy: dict[str, Any]) -> list[str]:
@@ -20911,17 +24117,11 @@ def build_policy_preview_lines(op: dict[str, Any], policy: dict[str, Any]) -> li
             lines.append(f"next: {cmd}")
     op_type = str(op.get("type", "")).strip()
     if code == "connector_scope_required":
-        scope_hints = {
-            "fetch_url": "grant connector scope web.page.read",
-            "contacts_lookup": "grant connector scope contacts.read",
-            "weather_forecast": "grant weather forecast",
-            "telephony_call_start": "grant connector scope telephony.call.start",
-            "banking_balance_read": "grant connector scope bank.account.balance.read",
-            "banking_transactions_read": "grant connector scope bank.transaction.read",
-            "social_feed_read": "grant connector scope social.feed.read",
-            "social_message_send": "grant connector scope social.message.send",
-        }
-        hint = scope_hints.get(op_type, "")
+        required_scopes = required_connector_scopes_for_capability(
+            op_type,
+            op.get("payload") if isinstance(op.get("payload"), dict) else {},
+        )
+        hint = f"grant connector scope {required_scopes[0]}" if required_scopes else ""
         if hint:
             lines.append(f"grant: {hint}")
         lines.append("inspect: show connector grants")
@@ -20934,6 +24134,16 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
 
     risk = capability.get("risk", "low")
     payload = op.get("payload", {}) if isinstance(op.get("payload", {}), dict) else {}
+    required_scopes = required_connector_scopes_for_capability(str(capability.get("name", "")), payload)
+    missing_scopes = [scope for scope in required_scopes if not connector_scope_granted(scope)]
+    if missing_scopes:
+        first_scope = missing_scopes[0]
+        return {
+            "allowed": False,
+            "reason": f"Connector scope missing. Try: grant connector scope {first_scope}",
+            "code": "connector_scope_required",
+            "missingConnectorScopes": missing_scopes,
+        }
 
     if capability["name"] == "restore_apply" and not bool(payload.get("confirmed")):
         return {
@@ -20955,7 +24165,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
             "code": "confirmation_required",
         }
     if capability["name"] == "telephony_call_start":
-        target = str(payload.get("target", "")).strip()
+        target = str(payload.get("target") or "").strip()
         if not target:
             return {
                 "allowed": False,
@@ -20997,7 +24207,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "code": "path_outside_workspace",
             }
     if capability["name"] in {"fetch_url", "web_summarize"}:
-        url = str(payload.get("url", "")).strip()
+        url = str(payload.get("url") or "").strip()
         if not is_allowed_web_url(url):
             return {
                 "allowed": False,
@@ -21011,7 +24221,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "code": "connector_scope_required",
             }
     if capability["name"] == "web_search":
-        query = str(payload.get("query", "")).strip()
+        query = str(payload.get("query") or "").strip()
         if not query:
             return {
                 "allowed": False,
@@ -21025,7 +24235,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "code": "connector_scope_required",
             }
     if capability["name"] == "grant_connector_scope":
-        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        scope = normalize_connector_scope(str(payload.get("scope") or ""))
         if scope not in connector_scope_catalog():
             return {
                 "allowed": False,
@@ -21033,7 +24243,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "code": "unknown_connector_scope",
             }
     if capability["name"] == "revoke_connector_scope":
-        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        scope = normalize_connector_scope(str(payload.get("scope") or ""))
         if scope not in connector_scope_catalog():
             return {
                 "allowed": False,
@@ -21079,7 +24289,7 @@ def evaluate_policy(op: dict[str, Any], capability: dict[str, Any]) -> dict[str,
                 "reason": "Connector scope missing. Try: grant connector scope social.message.send",
                 "code": "connector_scope_required",
             }
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         if not text:
             return {
                 "allowed": False,
@@ -21225,9 +24435,11 @@ def update_slo_state(session: SessionState, performance: dict[str, Any]) -> dict
     next_streak = current_streak + 1 if breach else 0
     throttle_until = int(session.slo.get("throttleUntil", 0) or 0)
     alerts = list(session.slo.get("alerts", []))
+    new_alert: dict[str, Any] | None = None
     if next_streak >= int(SLO_BREACH_STREAK_FOR_THROTTLE):
         throttle_until = now_ms() + int(SLO_THROTTLE_MS)
-        alerts.append({"ts": now_ms(), "type": "throttle", "totalMs": total_ms, "budgetMs": budget_ms, "streak": next_streak})
+        new_alert = {"ts": now_ms(), "type": "throttle", "totalMs": total_ms, "budgetMs": budget_ms, "streak": next_streak}
+        alerts.append(new_alert)
     session.slo["breachStreak"] = next_streak
     session.slo["throttleUntil"] = throttle_until
     session.slo["lastTotalMs"] = total_ms
@@ -21238,6 +24450,7 @@ def update_slo_state(session: SessionState, performance: dict[str, Any]) -> dict
         "throttled": bool(throttle_until > now_ms()),
         "lastTotalMs": total_ms,
         "alerts": alerts[-3:],
+        "newAlert": new_alert,
     }
 
 
@@ -28381,13 +31594,52 @@ def format_jobs(jobs: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _detect_connected_email_provider() -> str:
+    """Return the first connected email provider key, falling back to 'gmail'."""
+    for p in ["gmail", "outlook", "yahoo"]:
+        if _get_token(p):
+            return p
+    for svc in _auth.vault_list():
+        if svc.startswith("imap_"):
+            return svc  # e.g. "imap_user@fastmail.com"
+    return "gmail"
+
+
+def _email_list_snapshot_sync(provider: str, max_results: int = 10) -> dict:
+    """Route email read to the correct provider connector (sync, for use inside run_operation)."""
+    if provider == "gmail":
+        return gmail_list_snapshot(max_results=max_results)
+    if provider in ("outlook", "yahoo"):
+        return {"messages": [], "unread_count": 0, "source": "scaffold", "provider": provider}
+    if provider.startswith("imap_"):
+        email_addr = provider[5:]
+        creds = _auth.vault_retrieve(provider)
+        if creds:
+            return _imap_list_snapshot_sync(email_addr, creds, max_results)
+    return {"messages": [], "unread_count": 0, "source": "scaffold", "provider": provider}
+
+
+async def _email_list_snapshot_async(provider: str, max_results: int = 10) -> dict:
+    """Route email read to the correct provider connector (async, for use in async handlers)."""
+    if provider == "gmail":
+        return gmail_list_snapshot(max_results=max_results)
+    if provider in ("outlook", "yahoo"):
+        return {"messages": [], "unread_count": 0, "source": "scaffold", "provider": provider}
+    if provider.startswith("imap_"):
+        email_addr = provider[5:]
+        creds = _auth.vault_retrieve(provider)
+        if creds:
+            return await imap_list_snapshot_async(email_addr, creds, max_results)
+    return {"messages": [], "unread_count": 0, "source": "scaffold", "provider": provider}
+
+
 def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     kind = op["type"]
     payload = op.get("payload", {})
     graph = session.graph
 
     if kind == "explain_intent":
-        raw = str(payload.get("text", "")).strip()
+        raw = str(payload.get("text") or "").strip()
         if not raw:
             return {"ok": False, "message": "Intent text is empty. Use: explain intent <text>"}
         envelope = compile_intent_envelope(raw)
@@ -28407,7 +31659,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": "Intent explanation ready.", "previewLines": preview[:10]}
 
     if kind == "preview_intent":
-        raw = str(payload.get("text", "")).strip()
+        raw = str(payload.get("text") or "").strip()
         if not raw:
             return {"ok": False, "message": "Intent text is empty. Use: preview intent <text>"}
         report = build_intent_preview_report(session, "local", raw)
@@ -30206,7 +33458,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
 
     if kind == "graph_neighborhood":
         kind_norm = normalize_entity_kind(str(payload.get("kind", "") or ""))
-        selector = str(payload.get("selector", "")).strip()
+        selector = str(payload.get("selector") or "").strip()
         if not kind_norm or not selector:
             return {"ok": False, "message": "Graph neighborhood requires kind and selector."}
         source = find_entity_by_kind_selector(graph, kind_norm, selector)
@@ -30234,8 +33486,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     if kind == "graph_path":
         source_kind = normalize_entity_kind(str(payload.get("sourceKind", "") or ""))
         target_kind = normalize_entity_kind(str(payload.get("targetKind", "") or ""))
-        source_selector = str(payload.get("sourceSelector", "")).strip()
-        target_selector = str(payload.get("targetSelector", "")).strip()
+        source_selector = str(payload.get("sourceSelector") or "").strip()
+        target_selector = str(payload.get("targetSelector") or "").strip()
         if not source_kind or not source_selector or not target_kind or not target_selector:
             return {"ok": False, "message": "Graph path requires source/target kinds and selectors."}
         source = find_entity_by_kind_selector(graph, source_kind, source_selector)
@@ -30284,7 +33536,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "add_task":
-        title = str(payload.get("title", "")).strip()
+        title = str(payload.get("title") or "").strip()
         if not title:
             return {"ok": False, "message": "Task title is empty."}
         graph_add_entity(
@@ -30300,7 +33552,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Added task: {title}"}
 
     if kind == "toggle_task":
-        task_entity = find_task_entity(graph, str(payload.get("selector", "")))
+        task_entity = find_task_entity(graph, str(payload.get("selector") or ""))
         if not task_entity:
             return {"ok": False, "message": "Task not found."}
         task_entity["done"] = not bool(task_entity.get("done", False))
@@ -30308,7 +33560,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": ("Completed" if task_entity["done"] else "Reopened") + f": {task_entity.get('title', '')}"}
 
     if kind == "delete_task":
-        task_entity = find_task_entity(graph, str(payload.get("selector", "")))
+        task_entity = find_task_entity(graph, str(payload.get("selector") or ""))
         if not task_entity:
             return {"ok": False, "message": "Task not found."}
         graph_delete_entity(graph, task_entity["id"])
@@ -30330,7 +33582,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "kind": "expense",
                 "amount": amount,
                 "category": str(payload.get("category", "general")).lower(),
-                "note": str(payload.get("note", "")),
+                "note": str(payload.get("note") or ""),
                 "createdAt": now_ms(),
             },
         )
@@ -30338,7 +33590,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Added expense: ${amount:.2f}"}
 
     if kind == "add_note":
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         if not text:
             return {"ok": False, "message": "Note is empty."}
         graph_add_entity(graph, {"kind": "note", "text": text, "createdAt": now_ms()})
@@ -30430,7 +33682,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Linked {source.get('kind')} -> {target.get('kind')} ({relation})"}
 
     if kind == "schedule_watch_task":
-        selector = str(payload.get("selector", "")).strip()
+        selector = str(payload.get("selector") or "").strip()
         minutes = int(payload.get("intervalMinutes", 0) or 0)
         if not selector:
             return {"ok": False, "message": "Watch selector is required."}
@@ -30444,7 +33696,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Scheduled watch for task {selector} every {minutes}m"}
 
     if kind == "schedule_remind_note":
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         minutes = int(payload.get("intervalMinutes", 0) or 0)
         if not text:
             return {"ok": False, "message": "Reminder text is empty."}
@@ -30464,7 +33716,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Scheduled reminder every {minutes}m"}
 
     if kind == "schedule_remind_once":
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         delay_ms = int(payload.get("delayMs", 0) or 0)
         if not text:
             return {"ok": False, "message": "Reminder text is empty."}
@@ -30559,7 +33811,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": "Reminder status ready.", "previewLines": lines[:10]}
 
     if kind == "cancel_reminder":
-        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not reminder:
             return {"ok": False, "message": "Reminder not found."}
         session.jobs[:] = [x for x in session.jobs if x.get("id") != reminder.get("id")]
@@ -30567,7 +33819,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Canceled reminder {str(reminder.get('id', ''))[:8]}"}
 
     if kind == "pause_reminder":
-        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not reminder:
             return {"ok": False, "message": "Reminder not found."}
         reminder["active"] = False
@@ -30575,7 +33827,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Paused reminder {str(reminder.get('id', ''))[:8]}"}
 
     if kind == "resume_reminder":
-        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        reminder = find_reminder_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not reminder:
             return {"ok": False, "message": "Reminder not found."}
         reminder["active"] = True
@@ -30655,7 +33907,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Scheduled failing probe every {minutes}m"}
 
     if kind == "pause_job":
-        job = find_job_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        job = find_job_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not job:
             return {"ok": False, "message": "Job not found."}
         job["active"] = False
@@ -30663,7 +33915,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Paused job {job.get('id')}"}
 
     if kind == "resume_job":
-        job = find_job_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        job = find_job_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not job:
             return {"ok": False, "message": "Job not found."}
         job["active"] = True
@@ -30673,7 +33925,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Resumed job {job.get('id')}"}
 
     if kind == "cancel_job":
-        job = find_job_by_selector(session.jobs, str(payload.get("selector", "")).strip())
+        job = find_job_by_selector(session.jobs, str(payload.get("selector") or "").strip())
         if not job:
             return {"ok": False, "message": "Job not found."}
         session.jobs[:] = [x for x in session.jobs if x.get("id") != job.get("id")]
@@ -32557,7 +35809,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": "Self-check complete.", "previewLines": lines[:10]}
 
     if kind == "retry_dead_letter":
-        selector = str(payload.get("selector", "")).strip()
+        selector = str(payload.get("selector") or "").strip()
         item = find_dead_letter_by_selector(session.dead_letters, selector)
         if not item:
             return {"ok": False, "message": "Dead letter not found."}
@@ -32622,11 +35874,14 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "path": rel,
                 "items": typed_items,
                 "count": len(typed_items),
+                "storage": "workspace",
+                "source": "live",
+                "authoritative": True,
             },
         }
 
     if kind == "read_file":
-        target = resolve_workspace_path(str(payload.get("path", "")).strip())
+        target = resolve_workspace_path(str(payload.get("path") or "").strip())
         if target is None:
             return {"ok": False, "message": "Invalid file path."}
         if not target.exists():
@@ -32646,11 +35901,14 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "lineCount": len(lines),
                 "excerpt": "\n".join(lines),
                 "items": [{"name": rel, "type": "file"}],
+                "storage": "workspace",
+                "source": "live",
+                "authoritative": True,
             },
         }
 
     if kind == "fetch_url":
-        url = str(payload.get("url", "")).strip()
+        url = str(payload.get("url") or "").strip()
         snapshot = web_fetch_snapshot(url)
         if not bool(snapshot.get("ok", False)):
             return {
@@ -32680,7 +35938,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "web_summarize":
-        url = str(payload.get("url", "")).strip()
+        url = str(payload.get("url") or "").strip()
         snapshot = web_fetch_snapshot(url)
         if not bool(snapshot.get("ok", False)):
             return {
@@ -32713,7 +35971,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "web_search":
-        query = str(payload.get("query", "")).strip()
+        query = str(payload.get("query") or "").strip()
         snapshot = web_search_snapshot(query)
         if not bool(snapshot.get("ok", False)):
             return {"ok": False, "op": "web_search", "message": "Web search unavailable.", "previewLines": [str(snapshot.get("error", "query required"))]}
@@ -32805,9 +36063,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "list_audit":
-        domain = str(payload.get("domain", "")).strip().lower() or None
-        op_name = str(payload.get("op", "")).strip().lower() or None
-        policy_code = str(payload.get("policyCode", "")).strip().lower() or None
+        domain = str(payload.get("domain") or "").strip().lower() or None
+        op_name = str(payload.get("op") or "").strip().lower() or None
+        policy_code = str(payload.get("policyCode") or "").strip().lower() or None
         items = filter_journal_entries(
             session.journal,
             domain=domain,
@@ -32835,8 +36093,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         items = filter_turn_history_entries(
             session.turn_history,
             ok=(payload.get("ok") if "ok" in payload else None),
-            intent_class=(str(payload.get("intentClass", "")).strip().lower() or None),
-            route_reason=(str(payload.get("routeReason", "")).strip().lower() or None),
+            intent_class=(str(payload.get("intentClass") or "").strip().lower() or None),
+            route_reason=(str(payload.get("routeReason") or "").strip().lower() or None),
             limit=limit,
         )
         if not items:
@@ -32863,28 +36121,31 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             expires_at = int(item.get("expiresAt", 0) or 0)
             ttl = f" expires {expires_at}" if expires_at > 0 else ""
             lines.append(f"{status} | {scope}{ttl}")
-        return {"ok": True, "message": "Connector grants ready.", "previewLines": lines[:10]}
+        return {"ok": True, "message": "Connector grants ready.", "previewLines": lines[:10], "data": {"op": kind, **report}}
 
     if kind == "grant_connector_scope":
-        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        scope = normalize_connector_scope(str(payload.get("scope") or ""))
         ttl_ms = max(0, int(payload.get("ttlMs", 0) or 0))
         if scope not in connector_scope_catalog():
             return {"ok": False, "message": "Unknown connector scope."}
         item = connector_grant_scope(scope, ttl_ms=ttl_ms)
+        report = connector_grants_report()
         graph_add_event(graph, "grant_connector_scope", {"scope": scope, "ttlMs": ttl_ms})
         suffix = f" for {ttl_ms}ms" if ttl_ms > 0 else ""
-        return {"ok": True, "message": f"Granted scope: {scope}{suffix}", "previewLines": [f"persisted: {'yes' if bool(item.get('persisted', False)) else 'no'}"]}
+        return {"ok": True, "message": f"Granted scope: {scope}{suffix}", "previewLines": [f"persisted: {'yes' if bool(item.get('persisted', False)) else 'no'}"], "data": {"op": kind, "item": item, **report}}
 
     if kind == "revoke_connector_scope":
-        scope = normalize_connector_scope(str(payload.get("scope", "")))
+        scope = normalize_connector_scope(str(payload.get("scope") or ""))
         if scope not in connector_scope_catalog():
             return {"ok": False, "message": "Unknown connector scope."}
         item = connector_revoke_scope(scope)
+        report = connector_grants_report()
         graph_add_event(graph, "revoke_connector_scope", {"scope": scope, "revoked": bool(item.get("revoked", False))})
         return {
             "ok": True,
             "message": f"Revoked scope: {scope}" if bool(item.get("revoked", False)) else f"Scope not granted: {scope}",
             "previewLines": [f"persisted: {'yes' if bool(item.get('persisted', False)) else 'no'}"],
+            "data": {"op": kind, "item": item, **report},
         }
 
     if kind == "location_status":
@@ -32966,8 +36227,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "data": {"op": kind, "route": route, "trafficLevel": "normal", "source": "scaffold"}}
 
     if kind == "shop_catalog_search":
-        query = str(payload.get("query", "")).strip()
-        category = str(payload.get("category", "")).strip().lower()
+        query = str(payload.get("query") or "").strip()
+        category = str(payload.get("category") or "").strip().lower()
         snapshot = shopping_catalog_snapshot(query=query, category=category)
         items = snapshot.get("items", []) if isinstance(snapshot.get("items"), list) else []
         source = str(snapshot.get("source", "scaffold"))
@@ -32995,8 +36256,141 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    if kind in ("news_saved", "news_trending", "news_by_source"):
+        source_name = str(payload.get("source", "") or "").strip()
+        items = [
+            {"title": "GenomeUI launches local-first desktop runtime", "source": "Genome Daily"},
+            {"title": "CPU-sized models keep getting faster", "source": "AI Desk"},
+            {"title": "Windows app stacks simplify offline sync", "source": "Platform Weekly"},
+        ]
+        if kind == "news_saved":
+            lines = [f"saved stories: {len(items)}", f"top source: {items[0]['source']}"]
+            return {"ok": True, "message": "Saved news ready", "previewLines": lines,
+                    "data": {"op": kind, "items": items, "source": "scaffold"}}
+        if kind == "news_trending":
+            lines = [f"trending topics: {len(items)}", f"top story: {items[0]['title']}"]
+            return {"ok": True, "message": "Trending news ready", "previewLines": lines,
+                    "data": {"op": kind, "items": items, "source": "scaffold"}}
+        filtered = [item for item in items if not source_name or source_name.lower() in item["source"].lower()]
+        lines = [f"source: {source_name or 'all'}", f"stories: {len(filtered)}"]
+        return {"ok": True, "message": f"News by source: {source_name or 'all'}", "previewLines": lines,
+                "data": {"op": kind, "items": filtered or items, "sourceName": source_name, "source": "scaffold"}}
+
+    if kind == "calc_evaluate":
+        expression = str(payload.get("expression", payload.get("query", "")) or "").strip()
+        result = _evaluate_calc_expression(expression)
+        if not bool(result.get("ok", False)):
+            return {"ok": False, "message": str(result.get("message", "Could not evaluate calculation."))}
+        graph_add_event(graph, "calc_evaluate", {"expression": expression[:120], "value": float(result.get("value", 0.0) or 0.0)})
+        return {
+            "ok": True,
+            "message": f"Calculation result: {str(result.get('display', '0'))}",
+            "previewLines": [f"expression: {expression}", f"result: {str(result.get('display', '0'))}"],
+            "data": {
+                "op": kind,
+                "expression": expression,
+                "normalizedExpression": str(result.get("expression", expression)),
+                "value": float(result.get("value", 0.0) or 0.0),
+                "display": str(result.get("display", "0")),
+            },
+        }
+
+    if kind in ("task_priority", "task_due"):
+        selector = str(payload.get("selector", payload.get("task", "")) or "").strip()
+        if kind == "task_priority":
+            priority = str(payload.get("priority", "medium") or "medium").strip().lower()
+            graph_add_event(graph, kind, {"selector": selector[:120], "priority": priority[:24]})
+            return {"ok": True, "message": f"Task priority set: {selector or '(task)'}",
+                    "previewLines": [f"task: {selector or '(task)'}", f"priority: {priority}"],
+                    "data": {"op": kind, "selector": selector, "priority": priority, "source": "scaffold"}}
+        due_date = str(payload.get("date", payload.get("due", "")) or "").strip()
+        graph_add_event(graph, kind, {"selector": selector[:120], "date": due_date[:80]})
+        return {"ok": True, "message": f"Task due date set: {selector or '(task)'}",
+                "previewLines": [f"task: {selector or '(task)'}", f"due: {due_date or '(unspecified)'}"],
+                "data": {"op": kind, "selector": selector, "date": due_date, "source": "scaffold"}}
+
+    if kind in ("maps_search", "maps_save_place", "maps_explore", "maps_review", "maps_share_eta"):
+        query = str(payload.get("query", payload.get("place", payload.get("location", ""))) or "").strip()
+        if kind == "maps_search":
+            return {"ok": True, "message": f"Map search: {query or 'nearby places'}",
+                    "previewLines": [f"query: {query or '(place)'}", "results: 3 places (scaffold)"],
+                    "data": {"op": kind, "query": query, "results": [{"name": query or "Central Cafe"}], "source": "scaffold"}}
+        if kind == "maps_save_place":
+            return {"ok": True, "message": f"Saved place: {query or 'favorite'}",
+                    "previewLines": [f"place: {query or '(place)'}", "status: saved"],
+                    "data": {"op": kind, "place": query, "source": "scaffold"}}
+        if kind == "maps_explore":
+            category = str(payload.get("category", query) or "").strip()
+            return {"ok": True, "message": f"Exploring: {category or 'nearby'}",
+                    "previewLines": [f"category: {category or '(all)'}", "results: 5 places (scaffold)"],
+                    "data": {"op": kind, "category": category, "source": "scaffold"}}
+        if kind == "maps_review":
+            place = str(payload.get("place", query) or "").strip()
+            rating = str(payload.get("rating", "5") or "5").strip()
+            return {"ok": True, "message": f"Review queued: {place or '(place)'}",
+                    "previewLines": [f"place: {place or '(place)'}", f"rating: {rating} stars"],
+                    "data": {"op": kind, "place": place, "rating": rating, "source": "scaffold"}}
+        return {"ok": True, "message": "ETA shared",
+                "previewLines": ["recipient: selected contact", "arrival: 12 min"],
+                "data": {"op": kind, "etaMinutes": 12, "source": "scaffold"}}
+
+    if kind in ("weather_hourly", "weather_radar", "weather_air_quality", "weather_astronomy"):
+        alias_payload = dict(payload)
+        alias_payload["window"] = {
+            "weather_hourly": "hourly",
+            "weather_radar": "radar",
+            "weather_air_quality": "air_quality",
+            "weather_astronomy": "astronomy",
+        }.get(kind, "now")
+        return run_operation(session, {**op, "type": "weather_forecast", "payload": alias_payload})
+
+    if kind == "weather_alert":
+        location = normalize_weather_location(str(payload.get("location") or ""))
+        snapshot = weather_read_snapshot(location)
+        if not bool(snapshot.get("ok", False)):
+            return {
+                "ok": False,
+                "message": f"Weather alerts unavailable for {location}.",
+                "previewLines": [f"location: {location}", f"error: {str(snapshot.get('error', 'provider unavailable'))}"],
+            }
+        resolved = str(snapshot.get("location", location))
+        condition = str(snapshot.get("condition", "unknown"))
+        wind = float(snapshot.get("windMph", 0.0) or 0.0)
+        source = str(snapshot.get("source", "fallback"))
+        severity = "none"
+        title = "No active alerts"
+        details = "No severe conditions inferred from the current snapshot."
+        lower_condition = condition.lower()
+        if any(term in lower_condition for term in ("thunderstorm", "hail", "tornado")):
+            severity = "high"
+            title = "Severe storm watch"
+            details = f"Current conditions show {condition}."
+        elif "heavy" in lower_condition or wind >= 30.0:
+            severity = "medium"
+            title = "Weather advisory"
+            details = f"Conditions include {condition} with winds near {round(wind)} mph."
+        alerts = []
+        if severity != "none":
+            alerts.append({"severity": severity, "title": title, "detail": details})
+        graph_add_event(graph, "weather_alert", {"location": resolved[:80], "severity": severity, "source": source})
+        lines = [f"location: {resolved}", f"status: {title}", f"condition: {condition}", f"source: {source}"]
+        return {
+            "ok": True,
+            "message": f"Weather alerts ready for {resolved}",
+            "previewLines": lines,
+            "data": {
+                "op": kind,
+                "location": resolved,
+                "alerts": alerts,
+                "severity": severity,
+                "condition": condition,
+                "windMph": wind,
+                "source": source,
+            },
+        }
+
     if kind == "weather_forecast":
-        location = normalize_weather_location(str(payload.get("location", "")))
+        location = normalize_weather_location(str(payload.get("location") or ""))
         window = str(payload.get("window", "now")).strip() or "now"
         snapshot = weather_read_snapshot(location)
         if not bool(snapshot.get("ok", False)):
@@ -33160,9 +36554,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     # Sports handlers
     # ------------------------------------------------------------------
     if kind in ("sports_scores", "sports_schedule", "sports_standings"):
-        team = str(payload.get("team", "")).strip()
-        abbrev = str(payload.get("abbrev", "")).strip()
-        league = str(payload.get("sport", "")).strip().lower() or "nfl"
+        team = str(payload.get("team") or "").strip()
+        abbrev = str(payload.get("abbrev") or "").strip()
+        league = str(payload.get("sport") or "").strip().lower() or "nfl"
         if league not in _ESPN_LEAGUES:
             # try to map sport nickname
             _sport_map = {
@@ -33227,9 +36621,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             }
 
     if kind == "sports_follow_team":
-        team = str(payload.get("team", "")).strip()
-        abbrev = str(payload.get("abbrev", "")).strip()
-        league = str(payload.get("sport", "")).strip().lower() or ""
+        team = str(payload.get("team") or "").strip()
+        abbrev = str(payload.get("abbrev") or "").strip()
+        league = str(payload.get("sport") or "").strip().lower() or ""
         if not team and not abbrev:
             return {"ok": False, "message": "No team specified.", "previewLines": ["error: team name required"]}
         # Deduplicate: remove existing entity for same team before adding
@@ -33252,8 +36646,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "sports_unfollow_team":
-        team = str(payload.get("team", "")).strip()
-        abbrev = str(payload.get("abbrev", "")).strip()
+        team = str(payload.get("team") or "").strip()
+        abbrev = str(payload.get("abbrev") or "").strip()
         entities = graph.get("entities", [])
         before = len([e for e in entities if e.get("kind") == "followed_team"])
         graph["entities"] = [
@@ -33298,63 +36692,213 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     # ------------------------------------------------------------------
 
     if kind in ("content_find", "content_list", "content_history",
-                "content_branch", "content_revert", "content_share"):
-        action    = str(payload.get("action", kind.replace("content_", ""))).strip()
-        name      = str(payload.get("name", "")).strip()
-        ctype     = str(payload.get("type", "")).strip()
+                "content_branch", "content_revert", "content_worktrees",
+                "content_attach", "content_activate", "content_detach", "content_share", "content_merge"):
+        action    = str(payload.get("action") or kind.replace("content_", "")).strip()
+        name      = str(payload.get("name") or "").strip()
+        ctype     = str(payload.get("type") or "").strip()
         graph_add_event(graph, kind, {"action": action, "name": name, "type": ctype})
-        label = name or ctype or "content"
+        branch = str(payload.get("branch", session.workspace.get("branch", "main")) or "main").strip() or "main"
+        query = str(payload.get("query") or name or "").strip()
+        data: dict[str, Any] = {
+            "op": kind,
+            "action": action,
+            "name": name,
+            "type": ctype,
+            "branch": branch,
+            "source": "live",
+            "connected": True,
+            "authoritative": True,
+        }
+        lines = [f"action: {action}", f"branch: {branch}"]
+        if kind in ("content_find", "content_list"):
+            items = content_list("" if kind == "content_find" else ctype, query=query if kind == "content_find" else "", content_type=ctype if kind == "content_find" else "")
+            data["items"] = items
+            data["query"] = query
+            lines.extend([f"items: {len(items)}", f"query: {query or '(none)'}"])
+            return {
+                "ok": True,
+                "message": f"Content {action}: {len(items)} item(s)",
+                "previewLines": lines[:10],
+                "data": data,
+            }
+        if kind == "content_history":
+            items = content_history(ctype or "document", name, branch=branch, limit=20)
+            data["history"] = items
+            data["branches"] = content_branches(ctype or "document", name) if name else []
+            lines.extend([f"name: {name or '(unspecified)'}", f"history: {len(items)} revision(s)"])
+            return {
+                "ok": True,
+                "message": f"Content history: {name or '(unnamed)'}",
+                "previewLines": lines[:10],
+                "data": data,
+            }
+        if kind == "content_worktrees":
+            items = content_session_worktrees(session.id)
+            data["action"] = "worktrees"
+            data["worktrees"] = items
+            lines.extend([f"session: {session.id}", f"worktrees: {len(items)}"])
+            return {"ok": True, "message": "Content worktrees", "previewLines": lines[:10], "data": data}
+        if kind == "content_branch":
+            target_branch = str(payload.get("targetBranch", payload.get("newBranch", "")) or "").strip()
+            branched = content_branch_create(ctype or "document", name, target_branch, from_branch=branch)
+            if not branched:
+                return {"ok": False, "message": "Content branch failed.", "previewLines": ["error: content or branch invalid"]}
+            data.update(branched)
+            lines.extend([f"name: {name or '(unspecified)'}", f"created: {target_branch}"])
+            return {"ok": True, "message": f"Content branch: {name}", "previewLines": lines[:10], "data": data}
+        if kind == "content_attach":
+            attached = content_attach_existing_to_session(session.id, ctype or "document", name, branch=branch)
+            if not attached:
+                return {"ok": False, "message": "Content attach failed.", "previewLines": ["error: content not found"]}
+            data.update(attached)
+            data["worktrees"] = content_session_worktrees(session.id)
+            lines.extend([f"name: {name or '(unspecified)'}", f"attached: {attached.get('itemId', '')[:8] or '(ok)'}"])
+            return {"ok": True, "message": f"Content attached: {name}", "previewLines": lines[:10], "data": data}
+        if kind == "content_activate":
+            item_id = str(payload.get("itemId", "") or "").strip()
+            activated = content_activate_session_worktree(session.id, item_id)
+            if not activated:
+                return {"ok": False, "message": "Content activate failed.", "previewLines": ["error: worktree not found"]}
+            data.update(activated)
+            data["worktrees"] = content_session_worktrees(session.id)
+            lines.extend([f"item: {item_id[:8] or '(unknown)'}", f"active: {activated.get('name', '') or '(ok)'}"])
+            return {"ok": True, "message": f"Content activated: {activated.get('name', '')}", "previewLines": lines[:10], "data": data}
+        if kind == "content_detach":
+            item_id = str(payload.get("itemId", "") or "").strip()
+            removed = content_detach_session_worktree(session.id, item_id)
+            data["itemId"] = item_id
+            data["detached"] = removed
+            data["action"] = "worktrees"
+            data["worktrees"] = content_session_worktrees(session.id)
+            lines.extend([f"item: {item_id[:8] or '(unknown)'}", f"detached: {'yes' if removed else 'no'}"])
+            return {"ok": removed, "message": "Content detached." if removed else "Content detach failed.", "previewLines": lines[:10], "data": data}
+        if kind == "content_revert":
+            target_hash = str(payload.get("hash", payload.get("revision", "")) or "").strip()
+            reverted = content_revert(ctype or "document", name, target_hash, branch=branch)
+            if not reverted:
+                return {"ok": False, "message": "Content revert failed.", "previewLines": ["error: revision not found"]}
+            data.update(reverted)
+            lines.extend([f"name: {name or '(unspecified)'}", f"reverted: {target_hash[:8] or '(unknown)'}"])
+            session.workspace["activeContent"] = {
+                "itemId": reverted.get("itemId", ""),
+                "name": reverted.get("name", ""),
+                "domain": reverted.get("domain", ""),
+                "branch": reverted.get("branch", branch),
+                "hash": reverted.get("hash", ""),
+                "updatedAt": int(float(reverted.get("updated_at", _time.time())) * 1000),
+            }
+            return {"ok": True, "message": f"Content reverted: {name}", "previewLines": lines[:10], "data": data}
+        if kind == "content_merge":
+            source_branch = str(payload.get("sourceBranch", payload.get("fromBranch", "")) or "").strip()
+            merged = content_merge(ctype or "document", name, source_branch, target_branch=branch, session_id=session.id)
+            if not merged:
+                return {"ok": False, "message": "Content merge failed.", "previewLines": ["error: source branch not found"]}
+            data.update(merged)
+            lines.extend([f"name: {name or '(unspecified)'}", f"merged: {source_branch or '(unknown)'} -> {branch}"])
+            session.workspace["activeContent"] = {
+                "itemId": merged.get("itemId", ""),
+                "name": merged.get("name", ""),
+                "domain": merged.get("domain", ""),
+                "branch": merged.get("branch", branch),
+                "hash": merged.get("hash", ""),
+                "updatedAt": int(float(merged.get("updated_at", _time.time())) * 1000),
+            }
+            return {"ok": True, "message": f"Content merged: {name}", "previewLines": lines[:10], "data": data}
         return {
             "ok": True,
-            "message": f"Content {action}: {label}",
+            "message": f"Content {action}: {name or ctype or 'content'}",
             "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}", f"type: {ctype or 'any'}"],
-            "data": {"op": kind, "action": action, "name": name, "type": ctype},
+            "data": data,
         }
 
     if kind in ("document_create", "document_edit"):
         action = str(payload.get("action", "create")).strip()
-        name   = str(payload.get("name", "")).strip()
-        topic  = str(payload.get("topic", "")).strip()
+        name   = str(payload.get("name") or "").strip()
+        topic  = str(payload.get("topic") or "").strip()
         graph_add_event(graph, kind, {"action": action, "name": name, "topic": topic})
+        content_name = name or topic or "Untitled Document"
+        active = payload.get("activeContent") if isinstance(payload.get("activeContent"), dict) else {}
+        seed = active.get("data") if active else ""
+        if not seed:
+            seed = f"<h1>{content_name}</h1><p></p>"
+        item = content_commit("document", content_name, seed, message="Create document" if action == "create" else "Edit document")
+        session.workspace["activeContent"] = {
+            "itemId": item.get("itemId", ""),
+            "name": item.get("name", ""),
+            "domain": item.get("domain", ""),
+            "branch": item.get("branch", "main"),
+            "hash": item.get("hash", ""),
+            "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+        }
         return {
             "ok": True,
-            "message": f"Document {action}: {name or topic or 'new document'}",
-            "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}", f"topic: {topic or '(unspecified)'}"],
-            "data": {"op": kind, "action": action, "name": name, "topic": topic},
+            "message": f"Document {action}: {content_name}",
+            "previewLines": [f"action: {action}", f"name: {content_name}", f"hash: {str(item.get('hash', ''))[:8]}"],
+            "data": {"op": kind, "action": action, "name": content_name, "topic": topic, **item},
         }
 
     if kind in ("spreadsheet_create", "spreadsheet_edit"):
         action = str(payload.get("action", "create")).strip()
-        name   = str(payload.get("name", "")).strip()
+        name   = str(payload.get("name") or "").strip()
         graph_add_event(graph, kind, {"action": action, "name": name})
+        content_name = name or "Untitled Spreadsheet"
+        active = payload.get("activeContent") if isinstance(payload.get("activeContent"), dict) else {}
+        seed = active.get("data") if active else {}
+        if not isinstance(seed, dict):
+            seed = {}
+        item = content_commit("spreadsheet", content_name, seed, message="Create spreadsheet" if action == "create" else "Edit spreadsheet")
+        session.workspace["activeContent"] = {
+            "itemId": item.get("itemId", ""),
+            "name": item.get("name", ""),
+            "domain": item.get("domain", ""),
+            "branch": item.get("branch", "main"),
+            "hash": item.get("hash", ""),
+            "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+        }
         return {
             "ok": True,
-            "message": f"Spreadsheet {action}: {name or 'new spreadsheet'}",
-            "previewLines": [f"action: {action}", f"name: {name or '(unspecified)'}"],
-            "data": {"op": kind, "action": action, "name": name},
+            "message": f"Spreadsheet {action}: {content_name}",
+            "previewLines": [f"action: {action}", f"name: {content_name}", f"hash: {str(item.get('hash', ''))[:8]}"],
+            "data": {"op": kind, "action": action, "name": content_name, **item},
         }
 
     if kind in ("presentation_create", "presentation_edit"):
         action = str(payload.get("action", "create")).strip()
-        name   = str(payload.get("name", "")).strip()
-        topic  = str(payload.get("topic", "")).strip()
+        name   = str(payload.get("name") or "").strip()
+        topic  = str(payload.get("topic") or "").strip()
         slides = payload.get("slides")
         graph_add_event(graph, kind, {"action": action, "name": name, "topic": topic})
-        lines  = [f"action: {action}", f"name: {name or '(unspecified)'}", f"topic: {topic or '(unspecified)'}"]
+        content_name = name or topic or "Untitled Presentation"
+        active = payload.get("activeContent") if isinstance(payload.get("activeContent"), dict) else {}
+        seed = active.get("data") if active else ""
+        if not seed:
+            seed = f"<section><h1>{content_name}</h1><p></p></section>"
+        item = content_commit("presentation", content_name, seed, message="Create presentation" if action == "create" else "Edit presentation")
+        session.workspace["activeContent"] = {
+            "itemId": item.get("itemId", ""),
+            "name": item.get("name", ""),
+            "domain": item.get("domain", ""),
+            "branch": item.get("branch", "main"),
+            "hash": item.get("hash", ""),
+            "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+        }
+        lines  = [f"action: {action}", f"name: {content_name}", f"topic: {topic or '(unspecified)'}"]
         if slides:
             lines.append(f"slides: {slides}")
         return {
             "ok": True,
-            "message": f"Presentation {action}: {name or topic or 'new presentation'}",
+            "message": f"Presentation {action}: {content_name}",
             "previewLines": lines,
-            "data": {"op": kind, "action": action, "name": name, "topic": topic, "slides": slides},
+            "data": {"op": kind, "action": action, "name": content_name, "topic": topic, "slides": slides, **item},
         }
 
-    if kind in ("code_create", "code_edit", "code_explain", "code_debug", "code_run"):
+    if kind in ("code_create", "code_edit", "code_explain", "code_debug", "code_run",
+                "code_review", "code_test", "code_refactor", "code_optimize"):
         action   = str(payload.get("action", kind.replace("code_", ""))).strip()
-        language = str(payload.get("language", "")).strip()
-        name     = str(payload.get("name", "")).strip()
-        topic    = str(payload.get("topic", "")).strip()
+        language = str(payload.get("language") or "").strip()
+        name     = str(payload.get("name") or "").strip()
+        topic    = str(payload.get("topic") or "").strip()
         graph_add_event(graph, kind, {"action": action, "language": language, "name": name})
         lines = [f"action: {action}"]
         if language:
@@ -33371,8 +36915,26 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "terminal_run":
-        command = str(payload.get("command", "")).strip()
+        command = str(payload.get("command") or "").strip()
         graph_add_event(graph, "terminal_run", {"command": command or "(interactive)"})
+        if command:
+            terminal = _run_terminal_command(command)
+            preview = [f"shell: {terminal.get('shell', '')}", f"exit: {terminal.get('exitCode', -1)}"]
+            for line in str(terminal.get("output", "")).splitlines()[:6]:
+                preview.append(line[:240])
+            return {
+                "ok": bool(terminal.get("ok", False)),
+                "message": "Terminal command completed." if bool(terminal.get("ok", False)) else "Terminal command failed.",
+                "previewLines": preview,
+                "data": {
+                    "op": "terminal_run",
+                    "command": command,
+                    "output": str(terminal.get("output", "")),
+                    "exitCode": int(terminal.get("exitCode", -1)),
+                    "shell": str(terminal.get("shell", "")),
+                    "timedOut": bool(terminal.get("timedOut", False)),
+                },
+            }
         return {
             "ok": True,
             "message": "Terminal" + (f": {command}" if command else " opened"),
@@ -33384,8 +36946,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "calendar_reschedule", "calendar_rsvp", "calendar_invite",
                 "calendar_availability", "calendar_recurring"):
         action = str(payload.get("action", kind.replace("calendar_", ""))).strip()
-        title  = str(payload.get("title", "")).strip()
-        date   = str(payload.get("date", "")).strip()
+        title  = str(payload.get("title") or "").strip()
+        date   = str(payload.get("date") or "").strip()
         graph_add_event(graph, kind, {"action": action, "title": title, "date": date})
         lines  = [f"action: {action}"]
         if title:
@@ -33412,10 +36974,10 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "email_forward", "email_archive", "email_unsubscribe",
                 "email_label", "email_snooze"):
         action  = str(payload.get("action", kind.replace("email_", ""))).strip()
-        to      = str(payload.get("to", "")).strip()
-        subject = str(payload.get("subject", "")).strip()
-        query   = str(payload.get("query", "")).strip()
-        sender  = str(payload.get("from", "")).strip()
+        to      = str(payload.get("to") or "").strip()
+        subject = str(payload.get("subject") or "").strip()
+        query   = str(payload.get("query") or "").strip()
+        sender  = str(payload.get("from") or "").strip()
         graph_add_event(graph, kind, {"action": action, "to": to, "subject": subject})
         lines   = [f"action: {action}"]
         if to:
@@ -33426,29 +36988,38 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"from: {sender}")
         if query:
             lines.append(f"query: {query}")
-        email_data: dict[str, Any] = {"op": kind, "action": action, "to": to, "subject": subject, "query": query, "from": sender}
+        provider = str(payload.get("provider") or "").lower().strip()
+        print(f"[EMAIL] kind={kind!r} payload_provider={provider!r} payload={payload}", flush=True)
+        if not provider:
+            provider = _detect_connected_email_provider()
+        print(f"[EMAIL] resolved_provider={provider!r}", flush=True)
+        email_data: dict[str, Any] = {"op": kind, "action": action, "to": to, "subject": subject, "query": query, "from": sender, "provider": provider}
         # Enrich read/search with live/scaffold messages
         if kind in ("email_read", "email_search"):
-            snap = gmail_list_snapshot(max_results=10)
+            snap = _email_list_snapshot_sync(provider, max_results=10)
+            print(f"[EMAIL] snap ok={snap.get('ok')} source={snap.get('source')!r} msgs={len(snap.get('messages', []))}", flush=True)
             email_data["messages"] = snap.get("messages", [])
             email_data["unread_count"] = snap.get("unread_count", 0)
-            email_data["connector_source"] = snap.get("source", "scaffold")
+            email_data["source"] = snap.get("source", "scaffold")
+            email_data["ok"] = snap.get("ok", True)
+            if "error" in snap:
+                email_data["error"] = snap["error"]
             if snap.get("messages"):
                 first = snap["messages"][0]
                 lines.append(f"inbox: {first.get('subject', '')} from {first.get('from', '')}")
-        # Delegate compose/reply/forward to gmail.send when token present
+        # Delegate compose/reply/forward to provider send when token present
         if kind in ("email_compose", "email_reply", "email_forward") and to and subject:
-            gmail_token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
-            if gmail_token:
+            send_token = _get_token(provider)
+            if send_token and provider == "gmail":
                 return run_operation(session, {**op, "type": "gmail.send",
                                                "payload": {"to": to, "subject": subject,
                                                            "body": str(payload.get("body", "") or "")}})
-        # Delegate archive to gmail.trash when token present
+        # Delegate archive to provider trash when token present
         if kind == "email_archive":
             msg_id = str(payload.get("messageId", payload.get("id", "")) or "")
             if msg_id:
-                gmail_token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
-                if gmail_token:
+                archive_token = _get_token(provider)
+                if archive_token and provider == "gmail":
                     return run_operation(session, {**op, "type": "gmail.trash",
                                                    "payload": {"messageId": msg_id}})
         return {
@@ -33461,8 +37032,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     if kind == "mcp_tool_call":
         # Direct MCP tool invocation (routed explicitly via intent parser).
         # Most MCP calls go through the fallback in /api/turn; this handles explicit ops.
-        server_id = str(payload.get("serverId", "")).strip()
-        tool_name = str(payload.get("toolName", "")).strip()
+        server_id = str(payload.get("serverId") or "").strip()
+        tool_name = str(payload.get("toolName") or "").strip()
         tool_args = payload.get("arguments", {}) if isinstance(payload.get("arguments"), dict) else {}
         server = MCP_SERVER_REGISTRY.get(server_id, {}) if server_id else {}
         server_name = str(server.get("name", server_id)).strip()
@@ -33485,7 +37056,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "contacts_lookup":
-        query = str(payload.get("query", "")).strip()
+        query = str(payload.get("query") or "").strip()
         snapshot = contacts_lookup_snapshot(query=query)
         items = snapshot.get("items", []) if isinstance(snapshot.get("items"), list) else []
         source = str(snapshot.get("source", "scaffold"))
@@ -33609,7 +37180,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "telephony_call_start":
-        input_target = str(payload.get("target", "")).strip()
+        input_target = str(payload.get("target") or "").strip()
         if not input_target:
             return {"ok": False, "message": "Call target is required."}
         resolved_target = input_target
@@ -33635,15 +37206,24 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
 
         if not (acct_sid and auth_tok and from_num):
             return {
-                "ok": False,
-                "message": "Twilio not configured. Enter your Account SID, Auth Token, and phone number to enable calling.",
+                "ok": True,
+                "message": f"Prepared mobile handoff for {display_target}. Twilio is not configured on this desktop runtime.",
                 "previewLines": [
-                    "action: configure Twilio",
-                    "set TWILIO_ACCOUNT_SID in .env",
-                    "set TWILIO_AUTH_TOKEN in .env",
-                    "set TWILIO_PHONE_NUMBER in .env (E.164 format: +1...)",
+                    f"prepared call target: {display_target}",
+                    f"number: {resolved_target}",
+                    "mode: handoff_to_mobile",
+                    "action: configure Twilio for desktop bridge",
                 ],
-                "data": {"action": "setup_twilio"},
+                "data": {
+                    "mode": "handoff_to_mobile",
+                    "target": resolved_target,
+                    "contactName": contact_name,
+                    "next": [
+                        "grant connector scope telephony.call.start",
+                        "configure Twilio to place calls from desktop",
+                    ],
+                    "action": "setup_twilio",
+                },
             }
 
         webhook_base = GENOME_TELEPHONY_WEBHOOK_URL.rstrip("/")
@@ -33877,7 +37457,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "social_message_send":
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         sent = social_send_snapshot(text)
         if not bool(sent.get("ok", False)):
             return {
@@ -33905,8 +37485,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "social_dm_send":
-        recipient = str(payload.get("recipient", "")).strip()
-        text = str(payload.get("text", "")).strip()
+        recipient = str(payload.get("recipient") or "").strip()
+        text = str(payload.get("text") or "").strip()
         if not recipient or not text:
             return {"ok": False, "message": "social_dm_send requires recipient and text.", "previewLines": ["missing: recipient or text"]}
         sent = bluesky_dm_snapshot(recipient, text)
@@ -33925,7 +37505,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "social_profile_read":
-        actor = str(payload.get("actor", "")).strip()
+        actor = str(payload.get("actor") or "").strip()
         if not actor:
             return {"ok": False, "message": "social_profile_read requires actor.", "previewLines": ["missing: actor"]}
         prof = bluesky_profile_snapshot(actor)
@@ -33945,8 +37525,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": f"Profile: {actor}.", "previewLines": lines[:10], "data": prof}
 
     if kind == "social_react":
-        uri = str(payload.get("uri", "")).strip()
-        cid = str(payload.get("cid", "")).strip()
+        uri = str(payload.get("uri") or "").strip()
+        cid = str(payload.get("cid") or "").strip()
         if not uri or not cid:
             return {"ok": False, "message": "social_react requires uri and cid.", "previewLines": ["missing: uri or cid"]}
         result = bluesky_like_snapshot(uri, cid)
@@ -33965,9 +37545,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "social_comment":
-        uri = str(payload.get("uri", "")).strip()
-        cid = str(payload.get("cid", "")).strip()
-        text = str(payload.get("text", "")).strip()
+        uri = str(payload.get("uri") or "").strip()
+        cid = str(payload.get("cid") or "").strip()
+        text = str(payload.get("text") or "").strip()
         if not uri or not cid or not text:
             return {"ok": False, "message": "social_comment requires uri, cid, and text.", "previewLines": ["missing: uri, cid, or text"]}
         result = bluesky_reply_snapshot(uri, cid, text)
@@ -33986,7 +37566,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         }
 
     if kind == "social_follow":
-        actor = str(payload.get("actor", "")).strip()
+        actor = str(payload.get("actor") or "").strip()
         unfollow = bool(payload.get("unfollow", False))
         if not actor:
             return {"ok": False, "message": "social_follow requires actor.", "previewLines": ["missing: actor"]}
@@ -34351,6 +37931,166 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                   "music_playlist_create", "music_radio", "music_discover",
                   "music_lyrics", "music_cast", "music_sleep_timer"}
     if kind in _MUSIC_OPS:
+        _spotify_live = _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) == "live"
+
+        # ── Live Spotify control ops ──────────────────────────────────────────
+        if _spotify_live:
+            _sp_token = _get_token("spotify")
+            if not _sp_token:
+                return {"ok": False, "message": "Spotify not connected — connect via Settings > Connectors",
+                        "data": {"op": kind, "source": "live", "ok": False}}
+
+            _sp_hdrs = {"Authorization": f"Bearer {_sp_token}"}
+
+            if kind == "music_pause":
+                try:
+                    with httpx.Client(timeout=5.0) as _c:
+                        _c.put("https://api.spotify.com/v1/me/player/pause", headers=_sp_hdrs)
+                except Exception:
+                    pass
+                snap = spotify_now_playing_snapshot()
+                return {"ok": True, "message": "Paused",
+                        "previewLines": ["playback: paused", f"source: live"],
+                        "data": {"op": kind, **snap, "is_playing": False}}
+
+            if kind == "music_skip":
+                dir_hint = str(payload.get("direction", "next")).strip().lower()
+                _skip_url = ("https://api.spotify.com/v1/me/player/previous"
+                             if dir_hint in ("prev", "previous", "back") else
+                             "https://api.spotify.com/v1/me/player/next")
+                try:
+                    with httpx.Client(timeout=5.0) as _c:
+                        _c.post(_skip_url, headers=_sp_hdrs)
+                except Exception:
+                    pass
+                import time as _time; _time.sleep(0.4)  # brief pause for Spotify state update
+                snap = spotify_now_playing_snapshot()
+                lbl = "Previous track" if dir_hint in ("prev", "previous", "back") else "Next track"
+                track  = str(snap.get("track") or "")
+                artist = str(snap.get("artist") or "")
+                msg = lbl + (f": {track}" if track else "")
+                if artist: msg += f" by {artist}"
+                return {"ok": True, "message": msg,
+                        "previewLines": [f"track: {track or '(nothing)'}", f"artist: {artist}", "source: live"],
+                        "data": {"op": kind, **snap}}
+
+            if kind == "music_volume":
+                vol = max(0, min(100, int(payload.get("volume", payload.get("level", 50)) or 50)))
+                try:
+                    with httpx.Client(timeout=5.0) as _c:
+                        _c.put(f"https://api.spotify.com/v1/me/player/volume?volume_percent={vol}",
+                               headers=_sp_hdrs)
+                except Exception:
+                    pass
+                return {"ok": True, "message": f"Volume {vol}%",
+                        "previewLines": [f"volume: {vol}%", "source: live"],
+                        "data": {"op": kind, "volume": vol, "source": "live"}}
+
+            if kind == "music_play":
+                query = str(payload.get("query", payload.get("track", payload.get("song", ""))) or "").strip()
+                artist_hint = str(payload.get("artist", "") or "").strip()
+                search_q = f"{query} {artist_hint}".strip() or "top 40"
+                try:
+                    from urllib.parse import quote_plus as _qp
+                    with httpx.Client(timeout=8.0) as _c:
+                        # Search for the track
+                        s_resp = _c.get(
+                            f"https://api.spotify.com/v1/search?q={_qp(search_q)}&type=track&limit=1",
+                            headers=_sp_hdrs,
+                        )
+                        items = s_resp.json().get("tracks", {}).get("items", [])
+                        if items:
+                            uri = items[0]["uri"]
+                            _c.put("https://api.spotify.com/v1/me/player/play",
+                                   json={"uris": [uri]}, headers=_sp_hdrs)
+                        else:
+                            _c.put("https://api.spotify.com/v1/me/player/play",
+                                   headers=_sp_hdrs)
+                    import time as _time; _time.sleep(0.3)
+                    snap = spotify_now_playing_snapshot()
+                    track  = str(snap.get("track") or query)
+                    artist = str(snap.get("artist") or artist_hint)
+                    msg = f"Now playing: {track}"
+                    if artist: msg += f" by {artist}"
+                    return {"ok": True, "message": msg,
+                            "previewLines": [f"track: {track}", f"artist: {artist}", "source: live"],
+                            "data": {"op": kind, **snap}}
+                except Exception:
+                    return {"ok": False, "message": f"Spotify play failed for: {search_q}",
+                            "data": {"op": kind, "source": "live"}}
+
+            if kind == "music_like":
+                # Save current track to Liked Songs
+                snap = spotify_now_playing_snapshot()
+                track_id = None
+                try:
+                    with httpx.Client(timeout=8.0) as _c:
+                        cp = _c.get("https://api.spotify.com/v1/me/player/currently-playing",
+                                    headers=_sp_hdrs)
+                        if cp.status_code == 200:
+                            track_id = (cp.json().get("item") or {}).get("id")
+                        if track_id:
+                            _c.put("https://api.spotify.com/v1/me/tracks",
+                                   json={"ids": [track_id]}, headers=_sp_hdrs)
+                except Exception:
+                    pass
+                track = str(snap.get("track") or "")
+                return {"ok": bool(track_id), "message": f"Liked: {track}" if track else "Liked current track",
+                        "previewLines": [f"track: {track or '(unknown)'}", "source: live"],
+                        "data": {"op": kind, "track_id": track_id, "source": "live"}}
+
+            if kind == "music_queue":
+                query = str(payload.get("query", payload.get("track", payload.get("uri", ""))) or "").strip()
+                try:
+                    from urllib.parse import quote_plus as _qp
+                    with httpx.Client(timeout=8.0) as _c:
+                        uri = query if query.startswith("spotify:") else None
+                        if not uri and query:
+                            s_resp = _c.get(
+                                f"https://api.spotify.com/v1/search?q={_qp(query)}&type=track&limit=1",
+                                headers=_sp_hdrs,
+                            )
+                            items = s_resp.json().get("tracks", {}).get("items", [])
+                            if items:
+                                uri = items[0]["uri"]
+                        if uri:
+                            from urllib.parse import quote as _q
+                            _c.post(f"https://api.spotify.com/v1/me/player/queue?uri={_q(uri)}",
+                                    headers=_sp_hdrs)
+                    return {"ok": bool(uri), "message": f"Added to queue: {query}" if query else "Queued",
+                            "previewLines": [f"track: {query or uri or '(unknown)'}","source: live"],
+                            "data": {"op": kind, "uri": uri, "source": "live"}}
+                except Exception:
+                    return {"ok": False, "message": "Spotify queue failed",
+                            "data": {"op": kind, "source": "live"}}
+
+            if kind == "music_discover":
+                # Get Spotify recommendations based on current track
+                snap = spotify_now_playing_snapshot()
+                try:
+                    with httpx.Client(timeout=8.0) as _c:
+                        cp = _c.get("https://api.spotify.com/v1/me/player/currently-playing",
+                                    headers=_sp_hdrs)
+                        seed_track = None
+                        if cp.status_code == 200:
+                            seed_track = (cp.json().get("item") or {}).get("id")
+                        params = f"limit=5&seed_tracks={seed_track}" if seed_track else "limit=5&seed_genres=pop"
+                        rec = _c.get(f"https://api.spotify.com/v1/recommendations?{params}",
+                                     headers=_sp_hdrs)
+                        tracks = rec.json().get("tracks", [])
+                    suggestions = [f"{t['name']} — {t['artists'][0]['name']}" for t in tracks[:5]]
+                    return {"ok": True, "message": f"Discovered {len(suggestions)} tracks",
+                            "previewLines": suggestions[:3] + ["source: live"],
+                            "data": {"op": kind, "tracks": [{"track": t["name"], "artist": t["artists"][0]["name"],
+                                     "uri": t["uri"]} for t in tracks], "source": "live"}}
+                except Exception:
+                    pass
+                # fallback to snapshot
+                track = str(snap.get("track") or "")
+                return {"ok": snap.get("ok", True), "message": f"Discover: based on {track}" if track else "Discover",
+                        "data": {"op": kind, **snap}}
+
+        # ── Scaffold / mock fallback (not live) ───────────────────────────────
         snap = spotify_now_playing_snapshot()
         track  = str(snap.get("track") or "")
         artist = str(snap.get("artist") or "")
@@ -34360,9 +38100,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             action_label = "Paused"
         elif kind == "music_skip":
             dir_hint = str(payload.get("direction", "next")).strip().lower()
-            action_label = "Previous track" if dir_hint == "previous" else "Next track"
+            action_label = "Previous track" if dir_hint in ("prev", "previous", "back") else "Next track"
         elif kind == "music_volume":
-            vol = int(payload.get("volume", 50) or 50)
+            vol = int(payload.get("volume", payload.get("level", 50)) or 50)
             action_label = f"Volume {vol}%"
         elif kind == "music_lyrics":
             action_label = f"Lyrics: {track}"
@@ -34394,7 +38134,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
                 return {"ok": True, "message": f"Sent to #{channel} (scaffold)", "previewLines": [f"channel: #{channel}", f"text: {text[:80]}"],
                         "data": {"op": kind, "channel": channel, "text": text, "source": "scaffold"}}
-            token = _get_live_token("slack", None, None, None)
+            token = _get_slack_token()
             if not token:
                 return {"ok": False, "message": "Slack not connected", "previewLines": ["error: not connected"], "data": {"op": kind}}
             try:
@@ -34417,7 +38157,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": True, "message": f"Slack search: {query}",
                         "previewLines": [f"query: {query}", "results: 0 (scaffold)"],
                         "data": {"op": kind, "query": query, "messages": [], "source": "scaffold"}}
-            token = _get_live_token("slack", None, None, None)
+            token = _get_slack_token(prefer_user=True)
             if not token:
                 return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
             try:
@@ -34437,7 +38177,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
                 return {"ok": True, "message": f"Status set: {status_text} (scaffold)",
                         "previewLines": [f"status: {status_text}"], "data": {"op": kind, "source": "scaffold"}}
-            token = _get_live_token("slack", None, None, None)
+            token = _get_slack_token(prefer_user=True)
             if not token:
                 return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
             try:
@@ -34458,7 +38198,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
                 return {"ok": True, "message": f"Reacted :{emoji}: (scaffold)",
                         "previewLines": [f"emoji: :{emoji}:"], "data": {"op": kind, "source": "scaffold"}}
-            token = _get_live_token("slack", None, None, None)
+            token = _get_slack_token()
             if not token:
                 return {"ok": False, "message": "Slack not connected", "data": {"op": kind}}
             if not channel or not ts:
@@ -34516,7 +38256,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     if kind in ("spotify.play", "spotify.pause", "spotify.next", "spotify.prev"):
         if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": f"{kind} acknowledged (scaffold)"}
-        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        token = _get_token("spotify")
         if not token:
             return {"ok": False, "message": "Spotify not connected"}
         try:
@@ -34540,7 +38280,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     if kind == "spotify.volume":
         if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Volume set (scaffold)"}
-        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        token = _get_token("spotify")
         if not token:
             return {"ok": False, "message": "Spotify not connected"}
         vol = max(0, min(100, int(body.get("volume", 50))))
@@ -34556,7 +38296,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         uri = str(body.get("uri", "") or "").strip()
         if _effective_mode("spotify", SPOTIFY_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": f"Added to queue (scaffold){': ' + uri if uri else ''}"}
-        token = _get_live_token("spotify", _SPOTIFY_TOKEN_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        token = _get_token("spotify")
         if not token:
             return {"ok": False, "message": "Spotify not connected"}
         if not uri:
@@ -34591,7 +38331,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             filtered = [m for m in MOCK_GMAIL_MESSAGES if q.lower() in m.get("subject", "").lower() or q.lower() in m.get("snippet", "").lower()] if q else MOCK_GMAIL_MESSAGES
             return {"ok": True, "message": f"Gmail search: {q}", "previewLines": [f"query: {q}", f"results: {len(filtered)}"],
                     "data": {"op": kind, "messages": filtered, "source": "scaffold", "query": q}}
-        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        token = _get_token("gmail")
         if not token:
             return {"ok": False, "message": "Gmail not connected", "previewLines": ["error: not connected"], "data": {"op": kind, "messages": []}}
         try:
@@ -34609,7 +38349,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     if kind == "gmail.send":
         if _effective_mode("gmail", GMAIL_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Email sent (scaffold)"}
-        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        token = _get_token("gmail")
         if not token:
             return {"ok": False, "message": "Gmail not connected"}
         to = str(body.get("to", "") or "")
@@ -34633,7 +38373,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         msg_id = str(body.get("messageId", "") or "")
         if _effective_mode("gmail", GMAIL_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Message trashed (scaffold)"}
-        token = _get_live_token("gmail", "https://oauth2.googleapis.com/token", GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+        token = _get_token("gmail")
         if not token:
             return {"ok": False, "message": "Gmail not connected"}
         try:
@@ -34661,7 +38401,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Event created (scaffold)",
                     "event": {"id": "scaffold-evt", "summary": str(body.get("summary", "New Event"))}}
-        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        token = _get_token("gcal")
         if not token:
             return {"ok": False, "message": "Google Calendar not connected"}
         event_body = {
@@ -34687,7 +38427,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Event updated (scaffold)",
                     "event": {"id": event_id or "scaffold-evt", "summary": str(body.get("summary", "Updated Event"))}}
-        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        token = _get_token("gcal")
         if not token:
             return {"ok": False, "message": "Google Calendar not connected"}
         patch: dict[str, Any] = {}
@@ -34716,7 +38456,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         event_id = str(body.get("eventId", "") or "")
         if _effective_mode("gcal", GCAL_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "Event deleted (scaffold)"}
-        token = _get_live_token("gcal", "https://oauth2.googleapis.com/token", GCAL_CLIENT_ID, GCAL_CLIENT_SECRET)
+        token = _get_token("gcal")
         if not token:
             return {"ok": False, "message": "Google Calendar not connected"}
         try:
@@ -34751,7 +38491,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         if _effective_mode("gdrive", GDRIVE_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": "File created (scaffold)",
                     "file": {"id": "scaffold-file", "name": str(body.get("name", "New File"))}}
-        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        token = _get_token("gdrive")
         if not token:
             return {"ok": False, "message": "Google Drive not connected"}
         meta = {"name": str(body.get("name", "Untitled"))}
@@ -34773,7 +38513,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         email = str(body.get("email", "") or "")
         if _effective_mode("gdrive", GDRIVE_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": f"Shared {file_id} with {email} (scaffold)"}
-        token = _get_live_token("gdrive", "https://oauth2.googleapis.com/token", GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET)
+        token = _get_token("gdrive")
         if not token:
             return {"ok": False, "message": "Google Drive not connected"}
         if not file_id:
@@ -34809,7 +38549,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         text = str(body.get("text", "") or "")
         if _effective_mode("slack", SLACK_PROVIDER_MODE) != "live":
             return {"ok": True, "source": "scaffold", "message": f"Message sent to #{channel} (scaffold)"}
-        token = _get_live_token("slack", None, None, None)
+        token = _get_slack_token()
         if not token:
             return {"ok": False, "message": "Slack not connected"}
         try:
@@ -34831,7 +38571,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     {"user": "bob",   "text": "Good morning!", "ts": "1234567891.000002"}]
             return {"ok": True, "message": f"Slack #{channel}", "previewLines": [f"channel: {channel}", f"messages: {len(msgs)}"],
                     "data": {"op": kind, "channel": channel, "messages": msgs, "source": "scaffold"}}
-        token = _get_live_token("slack", None, None, None)
+        token = _get_slack_token()
         if not token:
             return {"ok": False, "message": "Slack not connected", "messages": []}
         try:
@@ -34885,45 +38625,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             return {"ok": False, "message": "Plaid exchange failed"}
 
     if kind == "connections_status":
-        _svc_modes = {
-            "spotify": SPOTIFY_PROVIDER_MODE,
-            "gmail":   GMAIL_PROVIDER_MODE,
-            "gcal":    GCAL_PROVIDER_MODE,
-            "gdrive":  GDRIVE_PROVIDER_MODE,
-            "slack":   SLACK_PROVIDER_MODE,
-            "plaid":   PLAID_PROVIDER_MODE,
-        }
-        _svc_labels = {
-            "spotify": "Spotify",
-            "gmail":   "Gmail",
-            "gcal":    "Google Calendar",
-            "gdrive":  "Google Drive",
-            "slack":   "Slack",
-            "plaid":   "Plaid (Banking)",
-        }
-        services = {}
-        for svc, pm in _svc_modes.items():
-            tok = _auth.vault_retrieve(svc)
-            connected = bool(tok)
-            eff_mode = _effective_mode(svc, pm)
-            _env_id, _env_secret = _OAUTH_CLIENT_PAIRS.get(svc, ("", ""))
-            services[svc] = {
-                "label":      _svc_labels[svc],
-                "connected":  connected,
-                "configured": _is_service_configured(svc, _env_id, _env_secret),
-                "mode":       eff_mode,
-                "authUrl":    f"/api/connectors/oauth/{svc}/begin" if svc != "plaid" else "/api/connectors/plaid/link_token",
-            }
-        lines = [
-            f"{v['label']}: {'connected' if v['connected'] else 'not connected'} ({v['mode']})"
-            for v in services.values()
-        ]
-        return {
-            "ok": True,
-            "message": "Connections panel ready.",
-            "previewLines": lines,
-            "data": {"op": kind, "services": services},
-        }
+        target_service = str(payload.get("targetService") or "").strip() or None
+        return build_connections_status_payload(target_service)
 
     # ── Dictionary & Reference ────────────────────────────────────────────────
     if kind in ("dict_define", "dict_etymology", "dict_thesaurus", "dict_wikipedia"):
@@ -35072,8 +38775,8 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
     # ── Alarm / Clock ─────────────────────────────────────────────────────────
     if kind in ("alarm_set", "alarm_delete", "alarm_list", "alarm_snooze",
                 "clock_timer_start", "clock_timer_stop", "clock_stopwatch"):
-        time_val = str(payload.get("time", "")).strip()
-        label    = str(payload.get("label", "")).strip() or "Alarm"
+        time_val = str(payload.get("time") or "").strip()
+        label    = str(payload.get("label") or "").strip() or "Alarm"
         days     = list(payload.get("days", []))
         action   = "set" if kind == "alarm_set" else "delete" if kind == "alarm_delete" else "list"
         if kind in ("clock_timer_start",):
@@ -35213,6 +38916,12 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": msg,
                 "previewLines": [f"show: {scaffold_pod['show']}", f"episode: {scaffold_pod['episode'][:50]}"],
                 "data": {"op": kind, **scaffold_pod}}
+
+    if kind == "travel_alert":
+        trip = str(payload.get("trip", payload.get("destination", "")) or "").strip()
+        return {"ok": True, "message": f"Travel alerts: {trip or 'trip'}",
+                "previewLines": [f"trip: {trip or '(active itinerary)'}", "alerts: none", "status: monitoring"],
+                "data": {"op": kind, "trip": trip, "alerts": [], "source": "scaffold"}}
 
     if kind == "network_view":
         import time as _nv_time
@@ -35579,12 +39288,27 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "data": {"op": kind, "action": action, "target": thread, "source": "scaffold"}}
 
     # ── Document extended ops scaffold (T-D01) ────────────────────────────────
-    _DOC_OPS = {"document_create", "document_edit", "document_delete", "document_rename",
+    _DOC_OPS = {"document_create", "document_edit", "document_open", "document_delete", "document_rename",
                 "document_export", "document_share", "document_template"}
     if kind in _DOC_OPS:
         name   = str(payload.get("name", payload.get("title", "")) or "").strip()
         action = kind.replace("document_", "")
         graph_add_event(graph, kind, {"name": name, "action": action})
+        if kind == "document_open":
+            item = content_load("document", name)
+            if not item:
+                return {"ok": False, "message": "Document not found.", "previewLines": [f"name: {name or '(document)'}", "error: not found"]}
+            session.workspace["activeContent"] = {
+                "itemId": item.get("itemId", ""),
+                "name": item.get("name", ""),
+                "domain": item.get("domain", ""),
+                "branch": item.get("branch", "main"),
+                "hash": item.get("hash", ""),
+                "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+            }
+            return {"ok": True, "message": f"Document opened: {item.get('name', name)}",
+                    "previewLines": [f"name: {item.get('name', name)}", f"branch: {item.get('branch', 'main')}", f"hash: {str(item.get('hash', ''))[:8]}"],
+                    "data": {"op": kind, "action": "open", **item}}
         if kind == "document_create":
             template = str(payload.get("template", "") or "")
             lines = [f"created: {name or 'Untitled Document'}", f"template: {template or 'blank'}"]
@@ -35592,23 +39316,58 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "previewLines": lines,
                     "data": {"op": kind, "name": name or "Untitled Document",
                              "template": template, "source": "scaffold"}}
+        if kind == "document_delete":
+            removed = content_delete("document", name)
+            return {"ok": removed, "message": f"Document deleted: {name}" if removed else "Document not found",
+                    "previewLines": [f"name: {name or '(document)'}", f"deleted: {'yes' if removed else 'no'}"],
+                    "data": {"op": kind, "name": name, "deleted": removed, "source": "live", "authoritative": True, "connected": True}}
         if kind == "document_export":
             fmt = str(payload.get("format", "pdf") or "pdf")
             lines = [f"exporting: {name}", f"format: {fmt}", "file: ready (scaffold)"]
             return {"ok": True, "message": f"Exported {name} as {fmt}", "previewLines": lines,
                     "data": {"op": kind, "name": name, "format": fmt, "source": "scaffold"}}
+        if kind == "document_rename":
+            target = str(payload.get("target", payload.get("newName", "")) or "").strip()
+            item = content_load("document", name)
+            if not item or not target:
+                return {"ok": False, "message": "Document rename failed.", "previewLines": ["error: document or new name missing"]}
+            content_commit("document", target, item.get("data", ""), message=f"Rename from {name}")
+            removed = content_delete("document", name)
+            return {"ok": True, "message": f"Document renamed: {target}",
+                    "previewLines": [f"from: {name}", f"to: {target}", f"old removed: {'yes' if removed else 'no'}"],
+                    "data": {"op": kind, "name": target, "previousName": name, "source": "live", "authoritative": True, "connected": True}}
         lines = [f"action: {action}", f"name: {name or '(document)'}"]
         return {"ok": True, "message": f"Document {action}: {name or '(done)'}",
                 "previewLines": lines,
                 "data": {"op": kind, "name": name, "action": action, "source": "scaffold"}}
 
     # ── Spreadsheet extended ops scaffold (T-D02) ─────────────────────────────
-    _SHEET_OPS = {"spreadsheet_create", "spreadsheet_edit", "spreadsheet_delete",
+    _SHEET_OPS = {"spreadsheet_create", "spreadsheet_edit", "spreadsheet_open", "spreadsheet_delete",
                   "spreadsheet_chart", "spreadsheet_formula", "spreadsheet_export"}
     if kind in _SHEET_OPS:
         name   = str(payload.get("name", payload.get("title", "")) or "").strip()
         action = kind.replace("spreadsheet_", "")
         graph_add_event(graph, kind, {"name": name, "action": action})
+        if kind == "spreadsheet_open":
+            item = content_load("spreadsheet", name)
+            if not item:
+                return {"ok": False, "message": "Spreadsheet not found.", "previewLines": [f"name: {name or '(spreadsheet)'}", "error: not found"]}
+            session.workspace["activeContent"] = {
+                "itemId": item.get("itemId", ""),
+                "name": item.get("name", ""),
+                "domain": item.get("domain", ""),
+                "branch": item.get("branch", "main"),
+                "hash": item.get("hash", ""),
+                "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+            }
+            return {"ok": True, "message": f"Spreadsheet opened: {item.get('name', name)}",
+                    "previewLines": [f"name: {item.get('name', name)}", f"branch: {item.get('branch', 'main')}", f"hash: {str(item.get('hash', ''))[:8]}"],
+                    "data": {"op": kind, "action": "open", **item}}
+        if kind == "spreadsheet_delete":
+            removed = content_delete("spreadsheet", name)
+            return {"ok": removed, "message": f"Spreadsheet deleted: {name}" if removed else "Spreadsheet not found",
+                    "previewLines": [f"name: {name or '(spreadsheet)'}", f"deleted: {'yes' if removed else 'no'}"],
+                    "data": {"op": kind, "name": name, "deleted": removed, "source": "live", "authoritative": True, "connected": True}}
         if kind == "spreadsheet_chart":
             chart_type = str(payload.get("chartType", "bar") or "bar")
             lines = [f"chart: {chart_type}", f"sheet: {name or '(sheet)'}"]
@@ -35620,13 +39379,33 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                 "data": {"op": kind, "name": name, "action": action, "source": "scaffold"}}
 
     # ── Presentation extended ops scaffold (T-D03) ────────────────────────────
-    _PRES_OPS = {"presentation_create", "presentation_edit", "presentation_delete",
+    _PRES_OPS = {"presentation_create", "presentation_edit", "presentation_open", "presentation_delete",
                  "presentation_export", "presentation_share", "presentation_speaker_notes",
                  "presentation_template"}
     if kind in _PRES_OPS:
         name   = str(payload.get("name", payload.get("title", "")) or "").strip()
         action = kind.replace("presentation_", "")
         graph_add_event(graph, kind, {"name": name, "action": action})
+        if kind == "presentation_open":
+            item = content_load("presentation", name)
+            if not item:
+                return {"ok": False, "message": "Presentation not found.", "previewLines": [f"name: {name or '(presentation)'}", "error: not found"]}
+            session.workspace["activeContent"] = {
+                "itemId": item.get("itemId", ""),
+                "name": item.get("name", ""),
+                "domain": item.get("domain", ""),
+                "branch": item.get("branch", "main"),
+                "hash": item.get("hash", ""),
+                "updatedAt": int(float(item.get("updated_at", _time.time())) * 1000),
+            }
+            return {"ok": True, "message": f"Presentation opened: {item.get('name', name)}",
+                    "previewLines": [f"name: {item.get('name', name)}", f"branch: {item.get('branch', 'main')}", f"hash: {str(item.get('hash', ''))[:8]}"],
+                    "data": {"op": kind, "action": "open", **item}}
+        if kind == "presentation_delete":
+            removed = content_delete("presentation", name)
+            return {"ok": removed, "message": f"Presentation deleted: {name}" if removed else "Presentation not found",
+                    "previewLines": [f"name: {name or '(presentation)'}", f"deleted: {'yes' if removed else 'no'}"],
+                    "data": {"op": kind, "name": name, "deleted": removed, "source": "live", "authoritative": True, "connected": True}}
         lines = [f"action: {action}", f"name: {name or '(presentation)'}"]
         return {"ok": True, "message": f"Presentation {action}: {name or '(done)'}",
                 "previewLines": lines,
@@ -35764,29 +39543,44 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                   "notifications_mark_read", "notifications_settings"}
     if kind in _NOTIF_OPS:
         app = str(payload.get("app", "") or "").strip()
+        notifications = ensure_notifications_state(getattr(session, "notifications", []))
         if kind == "notifications_view":
-            notifs = [{"app": "Mail", "text": "3 new messages", "time": "2m ago"},
-                      {"app": "Slack", "text": "Alice mentioned you", "time": "5m ago"},
-                      {"app": "Calendar", "text": "Meeting in 15 min", "time": "10m ago"}]
-            lines = [f"notifications: {len(notifs)}"] + [f"{n['app']}: {n['text']}" for n in notifs]
+            notifs = sorted(
+                notifications,
+                key=lambda item: int(item.get("createdAt", 0) or 0),
+                reverse=True,
+            )[:20]
+            lines = [f"notifications: {len(notifs)}"] + [
+                f"{str(n.get('title', 'Notification'))}: {str(n.get('message', '') or 'updated')}" for n in notifs[:7]
+            ]
             return {"ok": True, "message": "Notifications", "previewLines": lines[:8],
-                    "data": {"op": kind, "notifications": notifs, "source": "scaffold"}}
+                    "data": {"op": kind, "notifications": notifs, "source": "live", "authoritative": True}}
         if kind == "notifications_clear":
+            session.notifications = []
             return {"ok": True, "message": "All notifications cleared",
                     "previewLines": ["cleared: all notifications"],
-                    "data": {"op": kind, "source": "scaffold"}}
+                    "data": {"op": kind, "notifications": [], "source": "live", "authoritative": True}}
         if kind == "notifications_clear_app":
+            prefix = app.lower()
+            session.notifications = [
+                item for item in notifications
+                if prefix and prefix not in str(item.get("title", "")).lower() and prefix not in str(item.get("type", "")).lower()
+            ] if prefix else notifications
             return {"ok": True, "message": f"Cleared notifications: {app or '(app)'}",
                     "previewLines": [f"cleared: {app or '(app)'}"],
-                    "data": {"op": kind, "app": app, "source": "scaffold"}}
+                    "data": {"op": kind, "app": app, "notifications": ensure_notifications_state(session.notifications), "source": "live", "authoritative": True}}
         if kind == "notifications_mark_read":
+            for item in notifications:
+                if not app or app.lower() in str(item.get("title", "")).lower() or app.lower() in str(item.get("type", "")).lower():
+                    item["read"] = True
+            session.notifications = ensure_notifications_state(notifications)
             return {"ok": True, "message": "Notifications marked read",
                     "previewLines": ["marked read: all"],
-                    "data": {"op": kind, "source": "scaffold"}}
+                    "data": {"op": kind, "notifications": ensure_notifications_state(session.notifications), "source": "live", "authoritative": True}}
         if kind == "notifications_settings":
             return {"ok": True, "message": "Notification settings",
                     "previewLines": ["dnd: off", "banners: on", "badges: on"],
-                    "data": {"op": kind, "dnd": False, "banners": True, "source": "scaffold"}}
+                    "data": {"op": kind, "dnd": False, "banners": True, "source": "live", "authoritative": True}}
 
     # ── Focus & Productivity ops scaffold (T-E02) ─────────────────────────────
     _FOCUS_OPS = {"focus_session", "focus_pomodoro", "focus_block", "focus_stats"}
@@ -35899,7 +39693,7 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "data": {"op": kind, "lastBackup": "2h ago", "status": "Complete", "source": "scaffold"}}
 
     # ── Password Manager ops scaffold (T-E08) ─────────────────────────────────
-    if kind in ("password_find", "password_generate", "password_update"):
+    if kind in ("password_find", "password_generate", "password_2fa", "password_update"):
         service = str(payload.get("service", payload.get("site", "")) or "").strip()
         if kind == "password_find":
             creds = _auth.vault_retrieve(service) if service else None
@@ -35919,6 +39713,13 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "message": "Password generated",
                     "previewLines": [f"password: {pw}", f"length: {length}", "strength: strong"],
                     "data": {"op": kind, "password": pw, "length": length}}
+        if kind == "password_2fa":
+            method = str(payload.get("method", "authenticator") or "authenticator").strip()
+            code = "482913"
+            lines = [f"service: {service or '(service)'}", f"method: {method}", f"code: {code}"]
+            return {"ok": True, "message": f"2FA code ready: {service or 'account'}",
+                    "previewLines": lines,
+                    "data": {"op": kind, "service": service, "method": method, "code": code, "source": "scaffold"}}
         if kind == "password_update":
             if not service:
                 return {"ok": False, "message": "Service name required.",
@@ -35945,6 +39746,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                     "previewLines": lines, "data": {"op": kind, "app": app_name, "source": "scaffold"}}
 
     # ── Reading List ops scaffold (T-E10) ─────────────────────────────────────
+    if kind == "reading_list":
+        return run_operation(session, {**op, "type": "reading_list_view", "payload": payload})
+
     if kind in ("reading_save", "reading_list_view", "reading_mark_read"):
         url   = str(payload.get("url", payload.get("link", "")) or "").strip()
         title = str(payload.get("title", "") or "").strip()
@@ -35968,8 +39772,9 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
 
     # ── Accessibility & Settings ops scaffold (T-E11) ─────────────────────────
     _SETTINGS_OPS = {"access_display", "access_font", "access_voice", "access_zoom",
-                     "settings_airplane", "settings_bluetooth", "settings_brightness",
-                     "settings_dnd", "settings_wifi"}
+                     "settings_airplane", "settings_battery", "settings_bluetooth",
+                     "settings_brightness", "settings_dnd", "settings_notification",
+                     "settings_storage", "settings_wifi"}
     if kind in _SETTINGS_OPS:
         value = payload.get("value", payload.get("level", payload.get("enabled", None)))
         graph_add_event(graph, kind, {"value": str(value or "")})
@@ -35979,6 +39784,41 @@ def run_operation(session: SessionState, op: dict[str, Any]) -> dict[str, Any]:
                  "note: OS-level setting — scaffold confirmation only"]
         return {"ok": True, "message": f"Setting {action}{val_str}",
                 "previewLines": lines, "data": {"op": kind, "setting": action, "value": value, "source": "scaffold"}}
+
+    _CAMERA_OPS = {"camera_photo", "camera_video", "camera_scan_qr", "camera_scan_doc", "camera_ocr"}
+    if kind in _CAMERA_OPS:
+        graph_add_event(graph, kind, {})
+        if kind == "camera_photo":
+            return {"ok": True, "message": "Photo captured",
+                    "previewLines": ["camera: rear", "resolution: 12 MP", "saved: Photos"],
+                    "data": {"op": kind, "mediaType": "photo", "source": "scaffold"}}
+        if kind == "camera_video":
+            duration = int(payload.get("duration", 15) or 15)
+            return {"ok": True, "message": "Video recording started",
+                    "previewLines": [f"duration: {duration}s", "resolution: 1080p", "saved: Videos"],
+                    "data": {"op": kind, "mediaType": "video", "duration": duration, "source": "scaffold"}}
+        if kind == "camera_scan_qr":
+            return {"ok": True, "message": "QR code scanned",
+                    "previewLines": ["content: https://example.com", "action: open link"],
+                    "data": {"op": kind, "content": "https://example.com", "source": "scaffold"}}
+        if kind == "camera_scan_doc":
+            return {"ok": True, "message": "Document scanned",
+                    "previewLines": ["pages: 1", "format: PDF", "saved: Scans"],
+                    "data": {"op": kind, "pages": 1, "format": "pdf", "source": "scaffold"}}
+        return {"ok": True, "message": "Text extracted from image",
+                "previewLines": ["text: Sample extracted text", "confidence: 0.98"],
+                "data": {"op": kind, "text": "Sample extracted text", "confidence": 0.98, "source": "scaffold"}}
+
+    if kind in ("print_document", "print_photo", "print_scan"):
+        target = str(payload.get("document", payload.get("photo", payload.get("target", payload.get("name", "")))) or "").strip()
+        if kind == "print_scan":
+            return {"ok": True, "message": "Scan started",
+                    "previewLines": ["scanner: default", "format: PDF", "destination: Documents/Scans"],
+                    "data": {"op": kind, "format": "pdf", "source": "scaffold"}}
+        job_type = "photo" if kind == "print_photo" else "document"
+        return {"ok": True, "message": f"Print queued: {target or job_type}",
+                "previewLines": [f"type: {job_type}", f"target: {target or '(current selection)'}", "printer: default"],
+                "data": {"op": kind, "jobType": job_type, "target": target, "source": "scaffold"}}
 
     # ── Shortcuts & Automations ops scaffold (T-E12) ──────────────────────────
     if kind in ("shortcut_list", "shortcut_create", "shortcut_run"):
@@ -36742,4 +40582,3 @@ def to_json(value: Any) -> str:
 def json_loads(value: str) -> Any:
     import json
     return json.loads(value)
-

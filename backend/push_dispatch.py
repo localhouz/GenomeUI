@@ -92,7 +92,7 @@ def _apns_jwt_token() -> str:
 
 # ── APNs send ─────────────────────────────────────────────────────────────────
 
-async def send_apns(device_token: str, msg_id: str, from_did: str) -> bool:
+async def send_apns(device_token: str, msg_id: str, from_did: str, data: dict[str, str] | None = None) -> bool:
     """Send a silent APNs push. Returns True on success."""
     if not all([_APNS_KEY_ID, _APNS_TEAM_ID, _APNS_KEY_P8, _APNS_BUNDLE_ID, device_token]):
         return False
@@ -104,12 +104,15 @@ async def send_apns(device_token: str, msg_id: str, from_did: str) -> bool:
     host = "api.sandbox.push.apple.com" if _APNS_SANDBOX else "api.push.apple.com"
     path = f"/3/device/{device_token}"
 
-    push_payload = json.dumps({
+    push_payload_obj = {
         "aps": {"content-available": 1},
         "msgId": msg_id,
         "from": from_did,
         "relayUrl": _RELAY_PUBLIC_URL,
-    }).encode()
+    }
+    if data:
+        push_payload_obj.update({key: value for key, value in data.items() if value})
+    push_payload = json.dumps(push_payload_obj).encode()
 
     headers = {
         "authorization": f"bearer {jwt}",
@@ -144,7 +147,7 @@ async def send_apns(device_token: str, msg_id: str, from_did: str) -> bool:
 
 # ── FCM send ──────────────────────────────────────────────────────────────────
 
-async def send_fcm(fcm_token: str, msg_id: str, from_did: str) -> bool:
+async def send_fcm(fcm_token: str, msg_id: str, from_did: str, data: dict[str, str] | None = None) -> bool:
     """Send a silent FCM data message. Returns True on success."""
     if not _FCM_SERVICE_ACCOUNT or not fcm_token:
         return False
@@ -152,13 +155,13 @@ async def send_fcm(fcm_token: str, msg_id: str, from_did: str) -> bool:
     try:
         # firebase-admin is synchronous — run in thread pool
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _send_fcm_sync, fcm_token, msg_id, from_did)
+        return await loop.run_in_executor(None, _send_fcm_sync, fcm_token, msg_id, from_did, data or {})
     except Exception as exc:
         _log.error("FCM push error: %s", exc)
         return False
 
 
-def _send_fcm_sync(fcm_token: str, msg_id: str, from_did: str) -> bool:
+def _send_fcm_sync(fcm_token: str, msg_id: str, from_did: str, data: dict[str, str] | None = None) -> bool:
     try:
         import firebase_admin  # type: ignore[import]
         from firebase_admin import credentials, messaging
@@ -167,15 +170,18 @@ def _send_fcm_sync(fcm_token: str, msg_id: str, from_did: str) -> bool:
             cred = credentials.Certificate(_FCM_SERVICE_ACCOUNT)
             firebase_admin.initialize_app(cred)
 
+        payload_data = {
+            "type": "genome_wakeup",
+            "msgId": msg_id,
+            "from": from_did,
+            "relayUrl": _RELAY_PUBLIC_URL,
+        }
+        if data:
+            payload_data.update({key: value for key, value in data.items() if value})
         message = messaging.Message(
             token=fcm_token,
             android=messaging.AndroidConfig(priority="high"),
-            data={
-                "type": "genome_wakeup",
-                "msgId": msg_id,
-                "from": from_did,
-                "relayUrl": _RELAY_PUBLIC_URL,
-            },
+            data=payload_data,
         )
         messaging.send(message)
         _log.debug("FCM push sent: %s → %s", msg_id, fcm_token[:8])
@@ -190,16 +196,32 @@ def _send_fcm_sync(fcm_token: str, msg_id: str, from_did: str) -> bool:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def dispatch(tokens: PushTokens, msg_id: str, from_did: str) -> None:
+def _coerce_push_data(extra: dict[str, object] | None) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not isinstance(extra, dict):
+        return data
+    for key, value in extra.items():
+        key_str = str(key or "").strip()
+        if not key_str:
+            continue
+        val_str = str(value or "").strip()
+        if not val_str:
+            continue
+        data[key_str] = val_str
+    return data
+
+
+async def dispatch(tokens: PushTokens, msg_id: str, from_did: str, data: dict[str, object] | None = None) -> None:
     """
     Dispatch a wakeup push to all available device tokens.
     Runs APNs and FCM concurrently. Errors are logged, not raised.
     """
     tasks = []
+    payload_data = _coerce_push_data(data)
     if tokens.get("apns"):
-        tasks.append(send_apns(tokens["apns"], msg_id, from_did))
+        tasks.append(send_apns(tokens["apns"], msg_id, from_did, payload_data))
     if tokens.get("fcm"):
-        tasks.append(send_fcm(tokens["fcm"], msg_id, from_did))
+        tasks.append(send_fcm(tokens["fcm"], msg_id, from_did, payload_data))
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         _log.debug("Push dispatch results for %s: %s", msg_id, results)

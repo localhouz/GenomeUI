@@ -15,12 +15,13 @@ Security model:
     written to disk.
 
 Environment variables:
-  GENOME_AUTH_ENABLED   true | false (default false — dev bypass)
+  GENOME_AUTH_ENABLED   true | false (default true — secure by default)
   GENOME_AUTH_ORIGIN    WebAuthn origin (default http://localhost:5173)
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -47,10 +48,11 @@ from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
 import keyring
 import keyring.errors
+import httpx
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-AUTH_ENABLED = os.getenv("GENOME_AUTH_ENABLED", "false").strip().lower() == "true"
+AUTH_ENABLED = os.getenv("GENOME_AUTH_ENABLED", "true").strip().lower() == "true"
 RP_ID        = "localhost"
 RP_NAME      = "GenomeUI"
 ORIGIN       = os.getenv("GENOME_AUTH_ORIGIN", "http://localhost:5173")
@@ -301,6 +303,111 @@ def vault_list() -> list[str]:
     return _index_read()
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
+
+class ConnectorAuthError(RuntimeError):
+    """Raised when a connector token is missing, expired, or can no longer refresh."""
+
+    def __init__(self, service: str, message: str | None = None) -> None:
+        super().__init__(message or f"Connector '{service}' requires re-authentication.")
+        self.service = service
+
+
+_REFRESH_CONFIGS: dict[str, dict[str, str | bool]] = {
+    "gmail": {
+        "token_url": "https://oauth2.googleapis.com/token",
+        "client_id_env": "GMAIL_CLIENT_ID",
+        "client_secret_env": "GMAIL_CLIENT_SECRET",
+        "include_client_secret": True,
+    },
+    "gcal": {
+        "token_url": "https://oauth2.googleapis.com/token",
+        "client_id_env": "GCAL_CLIENT_ID",
+        "client_secret_env": "GCAL_CLIENT_SECRET",
+        "include_client_secret": True,
+    },
+    "spotify": {
+        "token_url": "https://accounts.spotify.com/api/token",
+        "client_id_env": "SPOTIFY_CLIENT_ID",
+        "client_secret_env": "SPOTIFY_CLIENT_SECRET",
+        "include_client_secret": False,
+    },
+}
+
+
+def _refresh_config_for(service: str) -> dict[str, str | bool] | None:
+    config = _REFRESH_CONFIGS.get(str(service or "").strip().lower())
+    if not config:
+        return None
+    return {
+        "token_url": str(config["token_url"]),
+        "client_id": str(os.getenv(str(config["client_id_env"]), "")).strip(),
+        "client_secret": str(os.getenv(str(config["client_secret_env"]), "")).strip(),
+        "include_client_secret": bool(config.get("include_client_secret", True)),
+    }
+
+
+def refresh_token_if_needed_sync(service: str) -> dict[str, Any]:
+    """
+    Return a valid vault token, refreshing it if expiry is within 60 seconds.
+
+    Raises ConnectorAuthError when the connector is missing, revoked, or cannot
+    be refreshed into a usable state.
+    """
+    service_norm = str(service or "").strip().lower()
+    tok = vault_retrieve(service_norm)
+    if not tok:
+        raise ConnectorAuthError(service_norm)
+
+    access_token = str(tok.get("access_token", "") or "").strip()
+    expires_at = float(tok.get("expires_at", 0) or 0)
+    if access_token and expires_at and time.time() <= expires_at - 60:
+        return tok
+
+    config = _refresh_config_for(service_norm)
+    if not config:
+        if access_token:
+            return tok
+        raise ConnectorAuthError(service_norm)
+
+    refresh_token = str(tok.get("refresh_token", "") or "").strip()
+    client_id = str(config.get("client_id", "") or "").strip()
+    client_secret = str(config.get("client_secret", "") or "").strip()
+    if not refresh_token or not client_id:
+        raise ConnectorAuthError(service_norm)
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if bool(config.get("include_client_secret", True)) and client_secret:
+        data["client_secret"] = client_secret
+
+    try:
+        resp = httpx.post(str(config["token_url"]), data=data, timeout=10)
+    except Exception as exc:
+        raise ConnectorAuthError(service_norm, f"Failed to refresh {service_norm}: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise ConnectorAuthError(service_norm, f"{service_norm} refresh failed: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    next_access = str(payload.get("access_token", "") or "").strip()
+    if not next_access:
+        raise ConnectorAuthError(service_norm, f"{service_norm} refresh returned no access token")
+
+    tok["access_token"] = next_access
+    tok["expires_at"] = time.time() + float(payload.get("expires_in", 3600) or 3600)
+    if payload.get("refresh_token"):
+        tok["refresh_token"] = str(payload.get("refresh_token") or "").strip()
+    vault_store(service_norm, tok)
+    return tok
+
+
+async def refresh_token_if_needed(service: str) -> dict[str, Any]:
+    """Async helper for connector code paths that want a ready-to-use OAuth token record."""
+    return await asyncio.to_thread(refresh_token_if_needed_sync, service)
+
 
 def _b64url(s: str) -> bytes:
     """Decode a base64url string to bytes, tolerating missing padding."""

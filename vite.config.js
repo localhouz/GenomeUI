@@ -8,6 +8,7 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    hmr: { host: 'localhost', port: 5173 },
     headers: {
       // Content-Security-Policy for dev server.
       // 'unsafe-inline' for styles is required because GenomeUI renders dynamic
@@ -15,12 +16,12 @@ export default defineConfig({
       'Content-Security-Policy': [
         "default-src 'self'",
         "script-src 'self'",
-        "style-src 'self' 'unsafe-inline'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
         // ESPN CDN for team logos / venue photos; Simple Icons CDN for brand logos; blob: for canvas exports
         "img-src 'self' data: blob: https://a.espncdn.com https://a1.espncdn.com https://a2.espncdn.com https://a3.espncdn.com https://a4.espncdn.com https://cdn.simpleicons.org",
         // WebSocket + backend ports used in dev
-        "connect-src 'self' ws://localhost:5173 ws://localhost:8787 http://localhost:8787",
-        "font-src 'self'",
+        "connect-src 'self' ws://localhost:5173 ws://localhost:8787 http://localhost:8787 https://fonts.googleapis.com https://fonts.gstatic.com",
+        "font-src 'self' https://fonts.gstatic.com",
         "object-src 'none'",
         "base-uri 'self'",
         "form-action 'self'",

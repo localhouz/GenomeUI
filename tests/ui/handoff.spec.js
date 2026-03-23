@@ -35,3 +35,22 @@ test('handoff start and claim are visible in feed', async ({ page, request }) =>
   const presence = await presenceResp.json();
   expect(Number(presence.activeCount || 0)).toBeGreaterThanOrEqual(1);
 });
+
+test('natural phone handoff phrasing opens the Nous QR flow', async ({ page, request }) => {
+  const sessionId = `handoffphrase${Date.now()}`;
+  const initResp = await request.post('/api/session/init', { data: { sessionId } });
+  expect(initResp.ok()).toBeTruthy();
+
+  await page.goto(`/?session=${sessionId}`);
+
+  const input = page.locator('#intent-input');
+  await expect(input).toBeVisible();
+
+  await input.fill('hand off to my phone');
+  await input.press('Enter');
+
+  const qrOverlay = page.locator('#genome-handoff-qr-overlay');
+  await expect(qrOverlay).toBeVisible();
+  await expect(qrOverlay).toContainText('Scan In Nous');
+  await expect(qrOverlay).toContainText('nous://handoff?session=');
+});

@@ -1,4 +1,4 @@
-﻿const CACHE_NAME = 'genome-os-v1';
+const CACHE_NAME = 'genome-os-v2';
 const APP_SHELL = ['/', '/index.html', '/app.js', '/index.css', '/manifest.json'];
 
 self.addEventListener('install', (event) => {

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python:*)",
+      "Bash(powershell -Command \"Start-Process python -ArgumentList ''backend/main.py'' -WindowStyle Hidden -RedirectStandardOutput backend.out.log -RedirectStandardError backend.err.log\")"
     ]
   }
 }

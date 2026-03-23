@@ -711,6 +711,130 @@ class ConnectorUnitTests(unittest.TestCase):
         self.assertFalse(bool(snap.get("ok", True)))
         self.assertEqual(str(snap.get("source", "")), "live")
 
+    def test_spotify_live_snapshot_reports_not_connected_contract(self) -> None:
+        with mock.patch.object(main, "_effective_mode", return_value="live"), \
+             mock.patch.object(main, "_get_token", return_value=None):
+            snap = main.spotify_now_playing_snapshot()
+
+        self.assertFalse(bool(snap.get("ok", True)))
+        self.assertFalse(bool(snap.get("connected", True)))
+        self.assertEqual(str(snap.get("fallbackReason", "")), "connector_not_connected")
+
+    def test_spotify_live_snapshot_reports_no_active_device_contract(self) -> None:
+        class FakeResponse:
+            status_code = 204
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+        with mock.patch.object(main, "_effective_mode", return_value="live"), \
+             mock.patch.object(main, "_get_token", return_value="spotify-token"), \
+             mock.patch("backend.main.httpx.Client", FakeClient):
+            snap = main.spotify_now_playing_snapshot()
+
+        self.assertFalse(bool(snap.get("ok", True)))
+        self.assertTrue(bool(snap.get("connected", False)))
+        self.assertEqual(str(snap.get("fallbackReason", "")), "no_active_device")
+
+    def test_gmail_live_snapshot_includes_thread_and_raw_date(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self) -> dict:
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url: str, headers=None):
+                if "users/me/messages?" in url:
+                    return FakeResponse(200, {"messages": [{"id": "msg-1"}]})
+                return FakeResponse(200, {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "snippet": "Body preview",
+                    "labelIds": ["INBOX", "UNREAD"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Alice <alice@example.com>"},
+                            {"name": "Subject", "value": "Quarterly Update"},
+                            {"name": "Date", "value": "Fri, 20 Mar 2026 09:30:00 -0500"},
+                        ]
+                    },
+                })
+
+        with mock.patch.object(main, "_effective_mode", return_value="live"), \
+             mock.patch.object(main, "_get_token", return_value="gmail-token"), \
+             mock.patch("backend.main.httpx.Client", FakeClient):
+            snap = main.gmail_list_snapshot(max_results=1)
+
+        self.assertTrue(bool(snap.get("ok", False)))
+        msg = snap.get("messages", [])[0]
+        self.assertEqual(str(msg.get("threadId", "")), "thread-1")
+        self.assertIn("2026", str(msg.get("dateRaw", "")))
+
+    def test_gcal_live_snapshot_includes_localized_time_fields(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json() -> dict:
+                return {
+                    "items": [
+                        {
+                            "id": "evt-1",
+                            "summary": "Design Review",
+                            "location": "HQ",
+                            "start": {"dateTime": "2026-03-21T15:00:00Z"},
+                            "end": {"dateTime": "2026-03-21T16:00:00Z"},
+                            "attendees": [{"email": "a@example.com"}],
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+        with mock.patch.object(main, "_effective_mode", return_value="live"), \
+             mock.patch.object(main, "_get_token", return_value="gcal-token"), \
+             mock.patch("backend.main.httpx.Client", FakeClient):
+            snap = main.gcal_events_snapshot(days=1)
+
+        self.assertTrue(bool(snap.get("ok", False)))
+        event = snap.get("events", [])[0]
+        self.assertTrue(str(event.get("start_local", "")).strip())
+        self.assertTrue(str(event.get("end_local", "")).strip())
+        self.assertEqual(len(event.get("attendees", [])), 1)
+
     def test_connector_secret_status_shape(self) -> None:
         main.CONNECTOR_VAULT = main.default_connector_vault_state()
         main.CONNECTOR_VAULT["secrets"] = {"banking.api.token": "abc"}

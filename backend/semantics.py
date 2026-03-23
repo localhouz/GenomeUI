@@ -88,6 +88,25 @@ class IntentMatch:
         return {"type": self.intent.op, "domain": self.intent.domain, "payload": self.payload}
 
 
+# High-frequency shell intents should bypass Nous entirely.
+# These are deterministic enough that the rule taxonomy is both faster and safer.
+FAST_PATH_OPS = {
+    "weather_forecast",
+    "clock_world",
+    "clock_stopwatch",
+    "clock_bedtime",
+    "alarm_set",
+    "alarm_delete",
+    "alarm_list",
+    "timer_start",
+    "timer_stop",
+    "music_play",
+    "music_pause",
+    "music_skip",
+    "music_volume",
+}
+
+
 # ─── Shared helpers ───────────────────────────────────────────────────────────
 
 _FILLER_RE = re.compile(
@@ -204,6 +223,26 @@ def _parse_relative_delay_ms(text: str) -> int | None:
         mult = {"second": 1_000, "minute": 60_000, "min": 60_000,
                 "hour": 3_600_000, "hr": 3_600_000, "day": 86_400_000}[unit]
         return max(1_000, int(val * mult))
+    m_compact = re.search(r"\bin\s+(\d+(?:\.\d+)?)(s|sec|secs|m|min|mins|h|hr|hrs|d|day|days)\b",
+                          lower)
+    if m_compact:
+        val = float(m_compact.group(1))
+        unit = m_compact.group(2)
+        mult = {
+            "s": 1_000,
+            "sec": 1_000,
+            "secs": 1_000,
+            "m": 60_000,
+            "min": 60_000,
+            "mins": 60_000,
+            "h": 3_600_000,
+            "hr": 3_600_000,
+            "hrs": 3_600_000,
+            "d": 86_400_000,
+            "day": 86_400_000,
+            "days": 86_400_000,
+        }[unit]
+        return max(1_000, int(val * mult))
     if re.search(r"\bin\s+half\s+an?\s+hour\b", lower):
         return 30 * 60_000
     m2 = re.search(r"\bin\s+an?\s+(hour|minute|min|second|day)\b", lower)
@@ -224,6 +263,7 @@ def _split_reminder_body_and_delay(raw: str) -> tuple[str, int] | None:
     lower = raw.lower()
     tail_pats = [
         r"\s+in\s+(\d+(?:\.\d+)?)\s+(second|minute|min|hour|hr|day)s?\s*$",
+        r"\s+in\s+(\d+(?:\.\d+)?)(s|sec|secs|m|min|mins|h|hr|hrs|d|day|days)\s*$",
         r"\s+in\s+half\s+an?\s+hour\s*$",
         r"\s+in\s+an?\s+(hour|minute|min|second|day)\s*$",
         r"\s+in\s+(?:a\s+)?(?:few|couple(?:\s+of)?)\s+(?:minutes?|hours?|days?)\s*$",
@@ -1524,6 +1564,15 @@ def _ext_calendar(raw: str, lower: str) -> dict | None:
     return {"action": action, "date": date_hint, "title": title}
 
 
+_EMAIL_PROVIDERS = [
+    ("gmail",      ["gmail", "google mail", "google email"]),
+    ("outlook",    ["outlook", "hotmail", "live mail"]),
+    ("yahoo",      ["yahoo mail", "yahoo inbox", "ymail"]),
+    ("icloud",     ["icloud mail", "icloud", "apple mail"]),
+    ("protonmail", ["protonmail", "proton mail"]),
+]
+
+
 def _ext_email(raw: str, lower: str) -> dict | None:
     action_map = [
         (r"\b(?:reply|respond|answer)\s+(?:to\s+)?(?:the\s+)?(?:email|message)\b", "reply"),
@@ -1542,13 +1591,31 @@ def _ext_email(raw: str, lower: str) -> dict | None:
         if re.search(pat, lower):
             action = act
             break
+
+    # Detect email provider name in text
+    provider = None
+    for prov, keywords in _EMAIL_PROVIDERS:
+        if any(kw in lower for kw in keywords):
+            provider = prov
+            break
+
+    # Provider keyword alone (e.g. "open gmail") implies read when no other action matched
+    if not action and provider:
+        action = "read"
+
+    print(f"[EMAIL] _ext_email raw={raw!r} action={action!r} provider={provider!r}", flush=True)
+
     if not action:
+        print(f"[EMAIL] _ext_email → NO ACTION, returning None (falls to content.find)", flush=True)
         return None
+
     to = None
     m = re.search(r"(?:to|email)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", raw)
     if m:
         to = m.group(1).strip()
-    return {"action": action, "to": to, "subject": _extract_content_name(lower)}
+    result = {"action": action, "to": to, "subject": _extract_content_name(lower), "provider": provider}
+    print(f"[EMAIL] _ext_email → {result}", flush=True)
+    return result
 
 
 # ─── Extended extractors ──────────────────────────────────────────────────────
@@ -3571,6 +3638,9 @@ def _ext_slack_send(raw: str, lower: str) -> dict | None:
     msg = m.group(2).strip() if m and m.group(2) else ""
     return {"channel": ch, "message": msg}
 
+def _ext_slack_channels(raw: str, lower: str) -> dict | None:
+    return {}
+
 def _ext_slack_read(raw: str, lower: str) -> dict | None:
     m = re.search(r"(?:check|read|show)\s+(?:my\s+)?(?:slack\s+)?#?(\S+)?(?:\s+channel)?", lower)
     return {"channel": m.group(1).strip() if m and m.group(1) else ""}
@@ -3860,8 +3930,28 @@ def _ext_health_hrv(raw: str, lower: str) -> dict | None:
     return {"days": days}
 
 
-def _ext_connections_manage(_raw: str, _lower: str) -> dict | None:
-    return {}
+_CONNECT_SERVICE_MAP: dict[str, str] = {
+    "gmail": "gmail", "google mail": "gmail",
+    "gcal": "gcal", "google calendar": "gcal", "calendar": "gcal",
+    "gdrive": "gdrive", "google drive": "gdrive", "drive": "gdrive",
+    "spotify": "spotify",
+    "slack": "slack",
+    "notion": "notion",
+    "asana": "asana",
+    "github": "github",
+    "jira": "jira",
+}
+
+def _ext_connections_manage(_raw: str, lower: str) -> dict | None:
+    # Detect disconnect intent
+    disconnect = bool(re.search(r"\bdisconnect\b", lower))
+    # Detect specific service
+    target_service = None
+    for keyword, svc in _CONNECT_SERVICE_MAP.items():
+        if re.search(r"\b" + re.escape(keyword) + r"\b", lower):
+            target_service = svc
+            break
+    return {"targetService": target_service, "disconnect": disconnect}
 
 
 # ─── Extractor registry ───────────────────────────────────────────────────────
@@ -4125,6 +4215,7 @@ _EXTRACTORS: dict[str, ExtractorFn] = {
     "gdrive_open":              _ext_gdrive_search,
     "gdrive_create":            _ext_gdrive_create,
     "gdrive_share":             _ext_gdrive_share,
+    "slack_channels":           _ext_slack_channels,
     "slack_send":               _ext_slack_send,
     "slack_read":               _ext_slack_read,
     "slack_search":             _ext_slack_search,
@@ -4245,7 +4336,7 @@ TAXONOMY: dict[str, Intent] = {
                  "laptop", "iphone", "headphones", "earbuds", "airpods", "tablet",
                  "monitor", "keyboard", "speaker", "smartwatch", "camera", "gaming",
                  "sofa", "couch", "desk", "mattress", "pillow", "lamp", "furniture",
-                 "puma", "nike", "adidas", "reebok", "new balance", "asics", "converse",
+                 "puma", "pumas", "nike", "adidas", "reebok", "new balance", "asics", "converse",
                  "vans", "jordan", "under armour", "fila", "skechers",
                  "buy", "order", "purchase", "shop for"],
         # Note/jot verbs, task/reminder verbs, and contact queries must not trigger shopping
@@ -4530,6 +4621,7 @@ TAXONOMY: dict[str, Intent] = {
         description="Look up a contact",
         signals=["contact", "contacts", "phone number", "email for", "number for",
                  "how do i reach", "how to contact"],
+        blockers=["contacts status", "show contacts status", "list contacts status"],
         extractor="contacts",
         examples=["find John's phone number", "look up contact for Dr. Kim",
                   "how do I reach Mike"],
@@ -4866,7 +4958,9 @@ TAXONOMY: dict[str, Intent] = {
                  "create a document", "new document", "cover letter", "resume",
                  "write me a", "start a document"],
         patterns=[r"\b(?:write|draft|create|start)\s+(?:a|an)\s+(?:letter|memo|essay|report|proposal|article|contract|agreement|cover\s+letter|resume|document)\b"],
-        blockers=["edit the", "update the", "change the", "modify the"],
+        blockers=["edit the", "update the", "change the", "modify the",
+                  "pause reminder", "resume reminder", "cancel reminder",
+                  "show reminder status", "show reminders", "list reminders"],
         extractor="document",
         examples=["write a cover letter for a software engineer role",
                   "draft a proposal for the client",
@@ -5223,16 +5317,23 @@ TAXONOMY: dict[str, Intent] = {
         id="email.read",
         op="email_read",
         domain="email",
-        description="Read or check email inbox",
+        description="Read or check email inbox (any provider)",
         signals=["check email", "read email", "check my email", "my inbox",
                  "my email", "new emails", "unread emails", "show my email",
-                 "any new email", "emails from"],
+                 "any new email", "emails from",
+                 "gmail", "my gmail", "gmail inbox", "open gmail", "check gmail",
+                 "outlook", "my outlook", "outlook inbox", "open outlook", "hotmail",
+                 "yahoo mail", "yahoo inbox", "protonmail", "icloud mail", "apple mail"],
         patterns=[r"\b(?:check|read|show|open)\s+(?:my\s+)?(?:email|inbox|mail)\b",
-                  r"\bany\s+(?:new|unread)\s+(?:email|messages?)\b"],
+                  r"\bany\s+(?:new|unread)\s+(?:email|messages?)\b",
+                  r"\b(?:open|check|show|read)\s+(?:gmail|outlook|hotmail|yahoo\s+mail|protonmail|icloud\s+mail)\b",
+                  r"\b(?:gmail|outlook|yahoo\s+mail|hotmail)\s+(?:inbox|email|mail)\b",
+                  r"\bmy\s+(?:gmail|outlook|hotmail|yahoo\s+mail|protonmail|icloud)\b"],
         blockers=["send", "write", "compose", "draft", "reply to"],
         extractor="email",
-        examples=["check my email", "show my inbox", "any new emails", "emails from Mike"],
-        slots={"action": "read", "from": "sender filter"},
+        examples=["check my email", "show my inbox", "any new emails", "open gmail",
+                  "check outlook", "my gmail inbox"],
+        slots={"action": "read", "from": "sender filter", "provider": "email provider"},
     ),
 
     "email.reply": Intent(
@@ -6002,6 +6103,7 @@ TAXONOMY: dict[str, Intent] = {
         description="List or browse contacts",
         signals=["my contacts", "list contacts", "show contacts", "all contacts",
                  "contact list", "browse contacts"],
+        blockers=["contacts status", "show contacts status", "list contacts status"],
         extractor="contacts_list",
         examples=["show me my contacts", "list all contacts",
                   "open my contact list"],
@@ -8658,6 +8760,18 @@ TAXONOMY: dict[str, Intent] = {
 
     # ── Enterprise — Slack ────────────────────────────────────────────────
 
+    "slack.list_channels": Intent(
+        id="slack.list_channels",
+        op="slack.list_channels",
+        domain="slack",
+        description="List Slack channels and unread counts",
+        signals=["show slack channels", "list slack channels", "slack channels",
+                 "show my slack channels", "browse slack channels"],
+        extractor="slack_channels",
+        examples=["show Slack channels", "list my Slack channels"],
+        slots={},
+    ),
+
     "slack.send": Intent(
         id="slack.send",
         op="slack_send",
@@ -9618,12 +9732,22 @@ TAXONOMY: dict[str, Intent] = {
                  "connect slack", "connect calendar", "connect drive",
                  "link spotify", "link gmail", "link slack",
                  "disconnect spotify", "disconnect gmail", "disconnect slack",
-                 "my integrations", "services connected", "what's connected"],
+                 "my integrations", "services connected", "what's connected",
+                 "authorize gmail", "authorize google", "authorize spotify",
+                 "connect my gmail", "connect my calendar", "connect my drive",
+                 "connect my spotify", "connect my slack",
+                 "link my gmail", "link my calendar", "link my spotify"],
+        patterns=[
+            r"\b(?:connect|link|authorize|setup|set up|integrate)\b.{0,20}\b(?:gmail|google|gcal|calendar|drive|spotify|slack|notion|asana|github|jira)\b",
+            r"\b(?:gmail|gcal|gdrive|spotify|slack)\b.{0,20}\b(?:connect|link|authorize|setup|integration)\b",
+            r"\bdisconnect\b.{0,20}\b(?:gmail|google|spotify|slack|calendar|drive)\b",
+        ],
         blockers=["internet connection", "wifi connection", "network connection",
                   "bluetooth connection", "vpn connection"],
         extractor="connections_manage",
         examples=["show my connections", "manage connected apps",
-                  "connect Spotify", "what services are connected"],
+                  "connect Spotify", "what services are connected",
+                  "connect my Gmail", "link my Google Calendar"],
         slots={},
     ),
 
@@ -9892,6 +10016,19 @@ def classify(text: str) -> IntentMatch | None:
     return None
 
 
+def classify_fast(text: str) -> IntentMatch | None:
+    """
+    Resolve deterministic high-frequency intents without ever consulting Nous.
+
+    Used for weather/time/music playback-style requests where taxonomy routing is
+    both faster and more predictable than an LLM hop.
+    """
+    match = classify(text)
+    if match and match.op in FAST_PATH_OPS:
+        return match
+    return None
+
+
 # ─── Backward-compat shim ─────────────────────────────────────────────────────
 
 def parse_semantic_command(text: str) -> "dict[str, Any] | None":
@@ -9911,6 +10048,7 @@ def parse_semantic_command(text: str) -> "dict[str, Any] | None":
 #   cargo run --bin nous-server --features http-api -- --model phi4-mini
 
 NOUS_URL: str = os.getenv("NOUS_URL", "")
+NOUS_CLASSIFY_TIMEOUT_S: float = max(0.05, float(os.getenv("GENOMEUI_NOUS_CLASSIFY_TIMEOUT_S", "1.0")))
 
 
 def _taxonomy_for_nous() -> list[dict[str, Any]]:
@@ -9927,22 +10065,27 @@ def _taxonomy_for_nous() -> list[dict[str, Any]]:
     ]
 
 
-async def classify_async(text: str) -> IntentMatch | None:
+async def classify_async(text: str, timeout_s: float | None = None) -> IntentMatch | None:
     """
     Async variant of classify() that routes through Nous when available.
 
     Resolution order:
-      1. Nous LLM (if NOUS_URL is set and server responds within 2 s)
+      1. Nous LLM (if NOUS_URL is set and server responds within the timeout budget)
       2. Rule-based classify() as fallback
 
     Returns an IntentMatch or None.
     """
+    fast = classify_fast(text)
+    if fast is not None:
+        return fast
+
     if NOUS_URL:
         try:
             import httpx  # already a project dependency (main.py uses it)
 
             payload = {"text": text, "intents": _taxonomy_for_nous()}
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            budget = max(0.05, float(timeout_s if timeout_s is not None else NOUS_CLASSIFY_TIMEOUT_S))
+            async with httpx.AsyncClient(timeout=budget) as client:
                 resp = await client.post(f"{NOUS_URL}/api/classify", json=payload)
             if resp.status_code == 200:
                 data = resp.json()

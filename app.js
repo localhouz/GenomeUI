@@ -1,3 +1,5 @@
+import QRCode from 'qrcode';
+
 const STORAGE_KEY = 'genui_memory_v4';
 const SESSION_STORAGE_KEY = 'genui_session_v1';
 const DEVICE_STORAGE_KEY = 'genui_device_v1';
@@ -8,23 +10,78 @@ const WS_RECONNECT_MIN_MS = 1200;
 const WS_RECONNECT_MAX_MS = 20000;
 const WS_RECONNECT_FACTOR = 1.8;
 
+function safeRandomId(prefix = 'id') {
+    try {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+            return crypto.randomUUID();
+        }
+    } catch { }
+    try {
+        if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+            const bytes = new Uint8Array(12);
+            crypto.getRandomValues(bytes);
+            const token = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+            return `${prefix}-${token}`;
+        }
+    } catch { }
+    return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function safeStructuredClone(value) {
+    try {
+        if (typeof structuredClone === 'function') return structuredClone(value);
+    } catch { }
+    return JSON.parse(JSON.stringify(value));
+}
+
+// Service worker disabled — GenomeUI runs in Electron, not as a PWA.
+// SW caching conflicts with clean-boot semantics (OS always boots fresh).
+function isElectronRuntime() {
+    return typeof navigator !== 'undefined' && /\bElectron\//.test(String(navigator.userAgent || ''));
+}
+
+function rewriteLoopbackOrigin(raw = '', fallbackPort = '') {
+    try {
+        const url = new URL(String(raw || '').trim(), window.location.href);
+        const host = String(url.hostname || '').trim();
+        if (host !== 'localhost' && host !== '127.0.0.1') return url.origin;
+        const localHosts = new Set(['127.0.0.1', '::1']);
+        const candidates = [];
+        if (Array.isArray(window.__GENOME_HOST_CANDIDATES__)) candidates.push(...window.__GENOME_HOST_CANDIDATES__);
+        if (typeof window !== 'undefined' && window.location && window.location.hostname) candidates.push(window.location.hostname);
+        const chosen = candidates.map(v => String(v || '').trim()).find(v => v && !localHosts.has(v) && v !== 'localhost');
+        if (!chosen) return url.origin;
+        url.hostname = chosen;
+        if (fallbackPort) url.port = String(fallbackPort);
+        return url.origin;
+    } catch {
+        return String(raw || '').trim();
+    }
+}
+
 if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => { });
-    });
+    if (isElectronRuntime()) {
+        navigator.serviceWorker.getRegistrations().then(regs => {
+            for (const reg of regs) reg.unregister();
+        });
+    } else {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js').catch(() => { });
+        });
+    }
 }
 
 const DEFAULT_MEMORY = {
     tasks: [
-        { id: crypto.randomUUID(), title: 'Replace mode-based UI with layered synthesis', done: false, createdAt: Date.now() - 7_200_000 },
-        { id: crypto.randomUUID(), title: 'Add schema validator for UI plans', done: false, createdAt: Date.now() - 5_400_000 }
+        { id: safeRandomId(), title: 'Replace mode-based UI with layered synthesis', done: false, createdAt: Date.now() - 7_200_000 },
+        { id: safeRandomId(), title: 'Add schema validator for UI plans', done: false, createdAt: Date.now() - 5_400_000 }
     ],
     expenses: [
-        { id: crypto.randomUUID(), amount: 28.5, category: 'food', note: 'lunch', createdAt: Date.now() - 86_400_000 },
-        { id: crypto.randomUUID(), amount: 96, category: 'cloud', note: 'gpu runtime', createdAt: Date.now() - 43_200_000 }
+        { id: safeRandomId(), amount: 28.5, category: 'food', note: 'lunch', createdAt: Date.now() - 86_400_000 },
+        { id: safeRandomId(), amount: 96, category: 'cloud', note: 'gpu runtime', createdAt: Date.now() - 43_200_000 }
     ],
     notes: [
-        { id: crypto.randomUUID(), text: 'Generative UI should synthesize from intent layers every turn.', createdAt: Date.now() - 3_000_000 }
+        { id: safeRandomId(), text: 'Generative UI should synthesize from intent layers every turn.', createdAt: Date.now() - 3_000_000 }
     ]
 };
 
@@ -78,6 +135,8 @@ const RemoteTurnService = {
             err.detail = detail?.detail || detail || {};
             if (response.status === 409 && (err.detail?.code === 'revision_conflict')) {
                 err.kind = 'revision_conflict';
+            } else if (response.status === 403 && (err.detail?.code === 'connector_scope_required')) {
+                err.kind = 'permission_denied';
             }
             throw err;
         }
@@ -267,7 +326,7 @@ const UIEngine = {
     inputContainer: document.querySelector('.input-container'),
 
     state: {
-        memory: structuredClone(DEFAULT_MEMORY),
+        memory: safeStructuredClone(DEFAULT_MEMORY),
         session: {
             lastIntent: '',
             lastEnvelope: null,
@@ -276,6 +335,7 @@ const UIEngine = {
             lastKernelTrace: null,
             handoff: { activeDeviceId: null, pending: null, lastClaimAt: null },
             presence: { activeCount: 0, count: 0, items: [], timeoutMs: 120000, updatedAt: 0 },
+            workspace: { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null },
             activeHistoryIndex: -1,
             sessionId: '',
             deviceId: '',
@@ -303,15 +363,27 @@ const UIEngine = {
         webdeck: {
             mode: 'surface'
         },
+        pwa: {
+            installReady: false,
+            installed: false
+        },
         runtimeEvents: [],
         activeSurface: null   // { domain, name, getData, cleanup } — set while a functional surface is mounted
     },
 
     async init() {
+        this._userHasActed = false;
+        this._bootGuardUntil = Date.now() + 600; // block all renders for first 600ms
+        this._deferredInstallPrompt = null;
+        this.container.classList.add('visible');
+        // Preserve runtime/worktree/history state across boots, but never auto-restore a stale scene.
+        sessionStorage.removeItem('genome_session'); // require auth on every boot — OS behaviour
         this.loadState();
+        this.renderWelcome();
         this.primeRelativeLocationContext().catch(() => { });
         this.setupElectronChrome();
         this.setupUXChrome();
+        this.setupPwaRuntime();
         this.setConnectivity(typeof navigator?.onLine === 'boolean' ? navigator.onLine : true);
         this.bindEvents();
         this.updateShortcutHint();
@@ -319,6 +391,7 @@ const UIEngine = {
         await this.runBootSequence();
         this.handleOAuthCallback();
         this._initNetworkMesh();
+        this._initNotifications();
         this.showToast('Surface ready. Press ? for command help.', 'info', 3000);
     },
 
@@ -584,6 +657,7 @@ const UIEngine = {
                 <div class="help-section">Shortcuts</div>
                 <div class="help-line"><span>/</span><span>Focus command input</span></div>
                 <div class="help-line"><span>Ctrl/Cmd+K</span><span>Focus and select input</span></div>
+                <div class="help-line"><span>Ctrl/Cmd+N</span><span>Open a new window</span></div>
                 <div class="help-line"><span>?</span><span>Open or close this guide</span></div>
                 <div class="help-line"><span>Esc</span><span>Close guide</span></div>
                 <div class="help-line"><span>Up or Down</span><span>Recall prior intents</span></div>
@@ -649,17 +723,17 @@ const UIEngine = {
         await this.bootstrapSession();
         await sleep(90);
 
-        this.setBootState('Compiling startup intent layers', 52);
-        const hasHistory = Array.isArray(this.state.history) && this.state.history.length > 0;
-        const hasIntent = Boolean(String(this.state.session.lastIntent || '').trim());
-        if (!hasHistory && !hasIntent) {
-            this.renderWelcome();
-        } else {
-            this.refreshSurface();
-        }
+        this.setBootState('Rehydrating shared runtime', 44);
+        await this.rehydrateBootRuntime();
+        await sleep(80);
+
+        this.setBootState('Compiling startup intent layers', 60);
+        // OS always boots to Latent Surface — session graph history is preserved
+        // and accessible via the history reel, but boot never restores last scene.
+        this.renderWelcome();
         await sleep(110);
 
-        this.setBootState('Synchronizing surface runtime', 78);
+        this.setBootState('Synchronizing surface runtime', 82);
         this.updateHistoryReel();
         this.updateStatus('READY');
         this.startRealtimeSync();
@@ -673,7 +747,61 @@ const UIEngine = {
         this.bootOverlay.classList.add('done');
     },
 
+    markUserEngaged() {
+        this._userHasActed = true;
+    },
+
     renderWelcome() {
+        const workspace = (this.state.session.workspace && typeof this.state.session.workspace === 'object')
+            ? this.state.session.workspace
+            : {};
+        const active = (workspace.activeContent && typeof workspace.activeContent === 'object')
+            ? workspace.activeContent
+            : {};
+        const worktrees = (workspace.worktrees && typeof workspace.worktrees === 'object')
+            ? Object.values(workspace.worktrees).filter((item) => item && typeof item === 'object')
+            : [];
+        const unread = Array.isArray(this.state.runtimeEvents)
+            ? this.state.runtimeEvents.filter((item) => item && typeof item === 'object' && !item.read).length
+            : 0;
+        const recentHistory = Array.isArray(this.state.history) ? this.state.history.slice(-3).reverse() : [];
+        const resumeCards = [];
+        if (active.name) {
+            resumeCards.push(`
+                <button type="button" class="welcome-tile" data-shell-object-kind="repo" data-shell-object-domain="${escapeAttr(String(active.domain || 'document'))}" data-shell-object-name="${escapeAttr(String(active.name || ''))}" data-shell-object-branch="${escapeAttr(String(active.branch || workspace.branch || 'main'))}" data-shell-object-item-id="${escapeAttr(String(active.itemId || ''))}">
+                    <div class="welcome-tile-label">resume ${escapeHtml(String(active.name || 'active object'))}</div>
+                </button>
+            `);
+        }
+        const worktreeCards = worktrees.slice(0, 3).map((item) => `
+            <button type="button" class="welcome-tile" data-shell-object-kind="worktree" data-shell-object-domain="${escapeAttr(String(item.domain || 'document'))}" data-shell-object-name="${escapeAttr(String(item.name || ''))}" data-shell-object-branch="${escapeAttr(String(item.branch || workspace.branch || 'main'))}" data-shell-object-item-id="${escapeAttr(String(item.itemId || ''))}">
+                <div class="welcome-tile-label">open ${escapeHtml(String(item.name || 'worktree'))}</div>
+            </button>
+        `);
+        if (unread > 0) {
+            resumeCards.push(`
+                <button type="button" class="welcome-tile" data-scene-domain="notifications">
+                    <div class="welcome-tile-label">review ${escapeHtml(String(unread))} alerts</div>
+                </button>
+            `);
+        }
+        resumeCards.push(`
+            <button type="button" class="welcome-tile" data-scene-domain="content">
+                <div class="welcome-tile-label">open content repo</div>
+            </button>
+        `);
+        resumeCards.push(`
+            <button type="button" class="welcome-tile" data-scene-domain="continuity">
+                <div class="welcome-tile-label">inspect continuity</div>
+            </button>
+        `);
+        if (worktrees.length > 0) {
+            resumeCards.push(`
+                <button type="button" class="welcome-tile" data-repo-worktrees="1">
+                    <div class="welcome-tile-label">inspect ${escapeHtml(String(worktrees.length))} worktrees</div>
+                </button>
+            `);
+        }
         const welcomeIntents = [
             'show weather in my city',
             'show me running shoes',
@@ -683,7 +811,47 @@ const UIEngine = {
         this.container.innerHTML = `
             <div class="welcome-surface">
                 <div class="welcome-title">Genome Surface OS</div>
-                <div class="welcome-sub">Intent-driven. No apps. Just surface.</div>
+                <div class="welcome-sub">Latent surface loaded. Runtime context is preserved; stale scenes stay asleep.</div>
+                <div class="welcome-tiles">
+                    ${resumeCards.join('')}
+                </div>
+                ${worktreeCards.length ? `
+                    <div class="welcome-tiles">
+                        ${worktreeCards.join('')}
+                    </div>
+                ` : ''}
+                <div class="welcome-sub" style="margin-top:18px;">
+                    branch ${escapeHtml(String(workspace.branch || 'main'))}
+                    · ${escapeHtml(String(worktrees.length))} worktrees
+                    · ${escapeHtml(String(this.state.session.presence?.activeCount || 0))} active devices
+                    · ${escapeHtml(String(recentHistory.length))} recent traces
+                </div>
+                ${recentHistory.length ? `
+                    <div class="welcome-tiles">
+                        ${recentHistory.map((entry) => {
+                            const target = this.inferHistoryEntryShellTarget(entry);
+                            if (target.type === 'repo') {
+                                return `
+                                    <button type="button" class="welcome-tile" data-shell-object-kind="repo" data-shell-object-domain="${escapeAttr(String(target.domain || 'document'))}" data-shell-object-name="${escapeAttr(String(target.name || ''))}" data-shell-object-branch="${escapeAttr(String(target.branch || 'main'))}">
+                                        <div class="welcome-tile-label">${escapeHtml(String(target.label || 'resume object'))}</div>
+                                    </button>
+                                `;
+                            }
+                            if (target.type === 'scene') {
+                                return `
+                                    <button type="button" class="welcome-tile" data-shell-object-kind="scene" data-shell-object-scene="${escapeAttr(String(target.value || 'generic'))}">
+                                        <div class="welcome-tile-label">${escapeHtml(String(target.label || 'resume surface'))}</div>
+                                    </button>
+                                `;
+                            }
+                            return `
+                                <button type="button" class="welcome-tile" data-command="${escapeAttr(String(target.value || 'resume surface'))}">
+                                    <div class="welcome-tile-label">${escapeHtml(String(target.label || target.value || 'resume surface'))}</div>
+                                </button>
+                            `;
+                        }).join('')}
+                    </div>
+                ` : ''}
                 <div class="welcome-tiles">
                     ${welcomeIntents.map((intent) => `
                         <button type="button" class="welcome-tile" data-command="${escapeAttr(intent)}">
@@ -694,6 +862,55 @@ const UIEngine = {
             </div>
         `;
         this.decorateQuickCommandTargets();
+    },
+
+    hydrateRemoteHistory(turnHistory, lastTurn = null) {
+        if (Array.isArray(this.state.history) && this.state.history.length) return;
+        const seedMemory = safeStructuredClone(this.state.memory || DEFAULT_MEMORY);
+        const remote = Array.isArray(turnHistory) ? turnHistory : [];
+        const entries = remote
+            .filter((item) => item && typeof item === 'object')
+            .map((item) => {
+                const intent = String(item.intent || '').trim();
+                if (!intent) return null;
+                return {
+                    intent,
+                    summary: String(item.execution?.message || intent).trim() || intent,
+                    timestamp: Number(item.timestamp || item.ts || Date.now()),
+                    thumbnail: null,
+                    memorySnapshot: safeStructuredClone(seedMemory),
+                    envelope: null,
+                    plan: null,
+                    executionSnapshot: item.execution || null,
+                    kernelTrace: null,
+                    planner: String(item.route?.target || '').trim(),
+                    remoteStub: true,
+                };
+            })
+            .filter(Boolean);
+        if (lastTurn?.envelope && lastTurn?.plan) {
+            const richEntry = {
+                intent: String(lastTurn.intent || 'resume surface').trim() || 'resume surface',
+                summary: String(lastTurn.execution?.message || lastTurn.intent || 'Session activity').trim() || 'Session activity',
+                timestamp: Number(lastTurn.timestamp || Date.now()),
+                thumbnail: null,
+                memorySnapshot: safeStructuredClone(seedMemory),
+                envelope: lastTurn.envelope,
+                plan: lastTurn.plan,
+                executionSnapshot: lastTurn.execution || null,
+                kernelTrace: lastTurn.kernelTrace || null,
+                planner: String(lastTurn.planner || '').trim(),
+                remoteStub: false,
+            };
+            if (entries.length && entries[entries.length - 1]?.intent === richEntry.intent) {
+                entries[entries.length - 1] = richEntry;
+            } else {
+                entries.push(richEntry);
+            }
+        }
+        if (!entries.length) return;
+        this.state.history = entries.slice(-HISTORY_LIMIT);
+        this.state.session.activeHistoryIndex = this.state.history.length - 1;
     },
 
     setBootState(label, percent) {
@@ -712,6 +929,9 @@ const UIEngine = {
             this.state.memory = session.memory || this.state.memory;
             this.state.session.handoff = session.handoff || this.state.session.handoff;
             this.state.session.presence = session.presence || this.state.session.presence;
+            this.state.session.workspace = session.workspace || this.state.session.workspace;
+            this.mergeRuntimeEvents(session.notifications, { replace: true });
+            this.hydrateRemoteHistory(session.turnHistory, session.lastTurn);
             this.writeSessionIdToUrl(session.sessionId);
             localStorage.setItem(SESSION_STORAGE_KEY, session.sessionId);
             await this.tryClaimHandoffFromUrl();
@@ -783,7 +1003,7 @@ const UIEngine = {
         // Running in main window (redirect-based flow rather than popup)
         if (success) {
             this.showToast(`${success} connected.`, 'ok', 2800);
-            this.handleIntent('show my connections');
+            this.showConnectionsPanel(success);
         } else if (error) {
             this.showToast(`OAuth error: ${error}`, 'warn', 3500);
         }
@@ -810,7 +1030,7 @@ const UIEngine = {
                 window.removeEventListener('message', onMsg);
                 if (evt.data.success) {
                     this.showToast(`${evt.data.success} connected.`, 'ok', 2800);
-                    this.handleIntent('show my connections');
+                    this.showConnectionsPanel(evt.data.success);
                 } else if (evt.data.error) {
                     this.showToast(`OAuth error: ${evt.data.error}`, 'warn', 3500);
                 }
@@ -872,6 +1092,32 @@ const UIEngine = {
         }
     },
 
+    /** Detect email domain protocol and start the right connect flow. */
+    async _connectEmailFlow(emailAddr, ctaEl) {
+        const domain = emailAddr.split('@')[1];
+        try {
+            const res = await fetch(`/api/connectors/email/domain?domain=${encodeURIComponent(domain)}`);
+            const info = await res.json();
+            if (info.protocol === 'oauth') {
+                await this._oauthConnectService(info.provider);
+            } else {
+                this._showImapPasswordForm(emailAddr, ctaEl);
+            }
+        } catch {
+            this.showToast('Could not detect email provider.', 'warn', 2400);
+        }
+    },
+
+    /** Show password field for IMAP providers and submit to /api/connectors/imap/connect. */
+    _showImapPasswordForm(emailAddr, ctaEl) {
+        if (!ctaEl) return;
+        ctaEl.innerHTML = `
+            <div class="connector-cta-label">${escapeHtml(emailAddr)}</div>
+            <input class="connector-email-input" type="password" placeholder="Password or app password" data-imap-password-input />
+            <button class="connector-cta-btn" data-action="imap-connect" data-email="${escapeAttr(emailAddr)}">Connect</button>
+            <div class="connector-cta-hint">Use an app-specific password if 2FA is enabled.</div>`;
+    },
+
     /** Disconnect (remove vault token) for a service. */
     async _oauthDisconnectService(svc) {
         const token = sessionStorage.getItem('genome_session') || '';
@@ -880,30 +1126,61 @@ const UIEngine = {
             const res = await fetch(`/api/auth/connections/${encodeURIComponent(svc)}`, { method: 'DELETE', headers });
             if (!res.ok) { this.showToast(`Could not disconnect ${svc}.`, 'warn', 2600); return; }
             this.showToast(`${svc} disconnected.`, 'ok', 2200);
-            this.handleIntent('show my connections');
+            this.showConnectionsPanel();
         } catch {
             this.showToast(`Failed to disconnect ${svc}.`, 'warn', 2600);
         }
     },
 
+    async rehydrateBootRuntime() {
+        if (!this.state.session.sessionId) return;
+        try {
+            const [workspace, notifications] = await Promise.all([
+                this._fetchWorkspaceState(),
+                this._fetchNotificationsState(),
+            ]);
+            if (workspace && typeof workspace === 'object') {
+                this.state.session.workspace = workspace;
+            }
+            if (Array.isArray(notifications)) {
+                this.state.runtimeEvents = notifications.slice(-20);
+            }
+        } catch {
+            // Boot should remain resilient even if runtime refresh is unavailable.
+        }
+        try {
+            const [presenceRes, handoffRes] = await Promise.all([
+                fetch(`/api/session/${encodeURIComponent(this.state.session.sessionId)}/presence`),
+                fetch(`/api/session/${encodeURIComponent(this.state.session.sessionId)}/handoff/stats`),
+            ]);
+            if (presenceRes.ok) {
+                this.state.session.presence = await presenceRes.json();
+            }
+            if (handoffRes.ok) {
+                this.state.session.handoff = await handoffRes.json();
+            }
+        } catch {
+            // Presence/handoff should never block shell startup.
+        }
+        this.saveState();
+    },
+
     async startHandoff() {
-        const sid = this.state.session.sessionId;
-        if (!sid || !this.state.session.deviceId) return;
-        const out = await RemoteTurnService.handoffStart(sid, this.state.session.deviceId);
-        this.state.session.revision = Number(out.revision || this.state.session.revision);
-        this.state.session.handoff = out.handoff || {
-            activeDeviceId: this.state.session.deviceId,
-            pending: { token: out.token, fromDeviceId: this.state.session.deviceId, expiresAt: out.expiresAt },
-            lastClaimAt: this.state.session.handoff?.lastClaimAt || null
-        };
-        const claimUrl = new URL(window.location.href);
-        claimUrl.searchParams.set('session', sid);
-        claimUrl.searchParams.set('handoff', out.token);
-        const link = String(claimUrl);
-        if (navigator?.clipboard?.writeText) {
+        const out = await this.startSessionHandoff();
+        if (!out) return;
+        const pending = (out.handoff && typeof out.handoff.pending === 'object') ? out.handoff.pending : {};
+        const paired = (out.pairedSurface && typeof out.pairedSurface === 'object') ? out.pairedSurface : ((pending.pairedSurface && typeof pending.pairedSurface === 'object') ? pending.pairedSurface : {});
+        const link = this.buildHandoffShareUrl(out.token || pending.token, out.backendUrl || pending.backendUrl, out.bridgeUrl || pending.bridgeUrl);
+        if (link && navigator?.clipboard?.writeText) {
             try { await navigator.clipboard.writeText(link); } catch { }
         }
-        this.showToast('Handoff token issued. Claim link copied.', 'ok', 3200);
+        if (out.relayRouted || pending.relayRouted || paired.routed || paired.woke) {
+            const target = String(paired.targetLabel || paired.targetSurfaceId || 'mobile').trim();
+            this.showToast(`Genome takeover requested on ${target}.`, 'ok', 3200);
+        } else {
+            await this.showHandoffQr(link, pending.expiresAt || out.expiresAt);
+            this.showToast('Genome phone surface QR ready.', 'ok', 3200);
+        }
         this.updateStatus('HANDOFF_PENDING');
         this.refreshSurface();
         this.saveState();
@@ -927,20 +1204,29 @@ const UIEngine = {
     parseHandoffIntent(text) {
         const value = String(text || '').trim();
         if (!value) return null;
-        if (/^start handoff$/i.test(value)) {
+        const normalized = value.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (/^start hand ?off$/i.test(value)) {
             return { mode: 'start' };
         }
         const claim = value.match(/^claim handoff\s+([a-z0-9-]+)$/i);
         if (claim) {
             return { mode: 'claim', token: claim[1] };
         }
+        const targetPhone = /\b(phone|iphone|android|mobile|cell)\b/i.test(normalized);
+        const targetTablet = /\b(ipad|tablet)\b/i.test(normalized);
+        const targetDevice = /\b(device)\b/i.test(normalized);
+        const handoffVerb = /\b(hand ?off|continue|switch|move|send|pick up)\b/i.test(normalized);
+        const handoffPattern = /\b(hand ?off to|continue (this )?on|switch to|move to|send to|pick up on)\b/i.test(normalized);
+        if ((targetPhone || targetTablet || targetDevice) && (handoffVerb || handoffPattern)) {
+            return { mode: 'start', target: targetPhone ? 'phone' : (targetTablet ? 'tablet' : 'device') };
+        }
         return null;
     },
 
     resolveSessionIdFromUrl() {
         const params = new URLSearchParams(window.location.search);
-        const value = String(params.get('session') || '').trim().toLowerCase();
-        return value ? value.replace(/[^a-z0-9_-]/g, '').slice(0, 32) : '';
+        const value = String(params.get('session') || '').trim();
+        return value ? value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) : '';
     },
 
     writeSessionIdToUrl(sessionId) {
@@ -1053,6 +1339,19 @@ const UIEngine = {
                     this.ensureAuth().then(() => this.openWebSocketSync());
                     return;
                 }
+                if (payload.type === 'notification') {
+                    const { title = '', body = '', route = '' } = payload;
+                    // In-app toast
+                    this.showToast(`${title}${body ? ': ' + body : ''}`, 'info', 5000);
+                    // OS-level desktop notification (Electron or Web Notifications API)
+                    if (window.electronAPI?.notify) {
+                        window.electronAPI.notify({ title, body, route });
+                    } else if (Notification?.permission === 'granted') {
+                        const n = new Notification(title, { body, silent: false });
+                        if (route) n.onclick = () => { n.close(); this.submitTurn(route); };
+                    }
+                    return;
+                }
                 this.applyRemoteSync(payload);
                 this.setConnectivity(true);
             } catch {
@@ -1129,7 +1428,9 @@ const UIEngine = {
         this.state.memory = snapshot.memory || this.state.memory;
         this.state.session.handoff = snapshot.handoff || this.state.session.handoff;
         this.state.session.presence = snapshot.presence || this.state.session.presence;
-        if (snapshot.lastTurn?.envelope && snapshot.lastTurn?.plan) {
+        this.state.session.workspace = snapshot.workspace || this.state.session.workspace;
+        this.mergeRuntimeEvents(snapshot.notifications, { replace: true });
+        if (snapshot.lastTurn?.envelope && snapshot.lastTurn?.plan && this._userHasActed) {
             const plan = UIPlanSchema.normalize(snapshot.lastTurn.plan);
             this.state.session.lastExecution = snapshot.lastTurn.execution || this.state.session.lastExecution;
             this.state.session.lastKernelTrace = snapshot.lastTurn.kernelTrace || this.deriveKernelTrace(snapshot.lastTurn.execution, snapshot.lastTurn.route);
@@ -1142,25 +1443,22 @@ const UIEngine = {
     applyBackgroundEvents(events) {
         const incoming = Array.isArray(events) ? events : [];
         if (!incoming.length) return;
-        const prior = Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
-        const seen = new Set(prior.map((item) => `${item.id}:${item.ts}`));
-        const next = [...prior];
         for (const item of incoming) {
             if (!item || typeof item !== 'object') continue;
-            const jobId = String(item.jobId || '');
             const createdAt = Number(item.createdAt || Date.now());
-            const key = `${jobId}:${createdAt}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
             const title = String(item.title || 'Background event').trim();
             const message = String(item.message || '').trim();
-            next.push({
-                id: jobId || key,
+            this.mergeRuntimeEvents([{
+                id: String(item.jobId || `${item.type || 'event'}:${createdAt}`),
                 type: String(item.type || 'event'),
                 ts: createdAt,
                 title,
-                message
-            });
+                message,
+                severity: String(item.severity || 'info'),
+                route: String(item.intent || ''),
+                read: false,
+                source: String(item.source || 'runtime'),
+            }]);
             const eventType = String(item.type || 'event');
             if (eventType === 'continuity_alert') {
                 this.showToast(`${message || title}`, 'warn', 5000);
@@ -1169,9 +1467,42 @@ const UIEngine = {
                 }
             } else {
                 this.showToast(`${title}: ${message || 'updated'}`, 'info', 2600);
+                // OS-level notification for reminders and relay messages
+                if (['reminder', 'alarm', 'message', 'relay_message'].includes(eventType)) {
+                    const route = eventType.includes('message') ? 'show my messages' : String(item.intent || '').trim();
+                    this.osNotify(title, message || 'GenomeUI', route);
+                }
             }
         }
-        this.state.runtimeEvents = next.slice(-8);
+    },
+
+    mergeRuntimeEvents(events, { replace = false } = {}) {
+        const incoming = Array.isArray(events) ? events : [];
+        const prior = replace ? [] : (Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : []);
+        const seen = new Set();
+        const next = [];
+        for (const raw of [...prior, ...incoming]) {
+            if (!raw || typeof raw !== 'object') continue;
+            const ts = Number(raw.ts || raw.createdAt || Date.now());
+            const title = String(raw.title || 'Notification').trim() || 'Notification';
+            const id = String(raw.id || `${raw.type || 'event'}:${ts}`).trim() || `${raw.type || 'event'}:${ts}`;
+            const key = `${id}:${ts}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            next.push({
+                id,
+                type: String(raw.type || 'event').trim() || 'event',
+                ts,
+                title,
+                message: String(raw.message || '').trim(),
+                severity: String(raw.severity || 'info').trim() || 'info',
+                route: String(raw.route || raw.intent || '').trim(),
+                read: Boolean(raw.read),
+                source: String(raw.source || 'runtime').trim() || 'runtime',
+            });
+        }
+        next.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+        this.state.runtimeEvents = next.slice(-20);
     },
 
     applyRemoteSync(payload) {
@@ -1194,14 +1525,16 @@ const UIEngine = {
         this.state.memory = payload.memory || this.state.memory;
         this.state.session.handoff = payload.handoff || this.state.session.handoff;
         this.state.session.presence = payload.presence || this.state.session.presence;
+        this.state.session.workspace = payload.workspace || this.state.session.workspace;
+        this.mergeRuntimeEvents(payload.notifications, { replace: true });
         this.applyBackgroundEvents(payload.backgroundEvents);
-        if (payload.lastTurn?.envelope && payload.lastTurn?.plan) {
+        if (payload.lastTurn?.envelope && payload.lastTurn?.plan && this._userHasActed) {
             const plan = UIPlanSchema.normalize(payload.lastTurn.plan);
             this.state.session.lastExecution = payload.lastTurn.execution || this.state.session.lastExecution;
             this.state.session.lastKernelTrace = payload.lastTurn.kernelTrace || this.deriveKernelTrace(payload.lastTurn.execution, payload.lastTurn.route);
             this.render(plan, payload.lastTurn.envelope, this.state.session.lastKernelTrace);
             this.updateStatus(`SYNCED:${payload.lastTurn.planner || 'REMOTE'}`);
-        } else if (priorHandoff !== JSON.stringify(this.state.session.handoff || {})) {
+        } else if (this._userHasActed && priorHandoff !== JSON.stringify(this.state.session.handoff || {})) {
             this.refreshSurface();
             this.updateStatus('SYNCED:HANDOFF');
         }
@@ -1235,6 +1568,12 @@ const UIEngine = {
                 event.preventDefault();
                 this.input.focus();
                 this.input.select();
+                return;
+            }
+
+            if (accel && String(event.key || '').toLowerCase() === 'n') {
+                event.preventDefault();
+                window.electronAPI?.newWindow?.(window.location.href);
                 return;
             }
 
@@ -1317,7 +1656,7 @@ const UIEngine = {
             this.inputContainer.classList.remove('active-intent');
         });
 
-        this.container.addEventListener('click', (event) => {
+        this.container.addEventListener('click', async (event) => {
             const webdeckModeBtn = event.target.closest('[data-webdeck-mode-toggle]');
             if (webdeckModeBtn) {
                 this.toggleWebdeckMode();
@@ -1327,6 +1666,7 @@ const UIEngine = {
             const sceneButton = event.target.closest('[data-scene-domain]');
             if (sceneButton) {
                 const domain = String(sceneButton.dataset.sceneDomain || '').trim().toLowerCase();
+                this.markUserEngaged();
                 if (domain) this.switchToSceneDomain(domain);
                 return;
             }
@@ -1345,11 +1685,264 @@ const UIEngine = {
                 return;
             }
 
+            // ── Universal email connect button ────────────────────────────────
+            if (event.target.closest('[data-action="email-connect"]')) {
+                const cta = event.target.closest('.connector-cta');
+                const input = cta?.querySelector('[data-email-connect-input]');
+                const emailAddr = (input?.value || '').trim().toLowerCase();
+                if (!emailAddr || !emailAddr.includes('@')) {
+                    this.showToast('Enter a valid email address.', 'warn', 2400);
+                    return;
+                }
+                this._connectEmailFlow(emailAddr, cta);
+                return;
+            }
+
+            // ── IMAP password submit ──────────────────────────────────────────
+            if (event.target.closest('[data-action="imap-connect"]')) {
+                const btn = event.target.closest('[data-action="imap-connect"]');
+                const cta = btn.closest('.connector-cta');
+                const emailAddr = btn.dataset.email || '';
+                const pwInput = cta?.querySelector('[data-imap-password-input]');
+                const password = pwInput?.value || '';
+                if (!password) { this.showToast('Enter a password.', 'warn', 2000); return; }
+                btn.disabled = true;
+                btn.textContent = 'Connecting…';
+                try {
+                    const res = await fetch('/api/connectors/imap/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email: emailAddr, password }),
+                    });
+                    const data = await res.json();
+                    if (data.ok) {
+                        this.showToast(`${emailAddr} connected.`, 'ok', 2600);
+                        this.handleIntent('check my email');
+                    } else {
+                        this.showToast(data.error || 'Connection failed.', 'warn', 3000);
+                        btn.disabled = false;
+                        btn.textContent = 'Connect';
+                    }
+                } catch {
+                    this.showToast('Connection failed.', 'warn', 2400);
+                    btn.disabled = false;
+                    btn.textContent = 'Connect';
+                }
+                return;
+            }
+
             // ── OAuth disconnect button ───────────────────────────────────────
             const disconnectBtn = event.target.closest('[data-oauth-disconnect]');
             if (disconnectBtn) {
                 const svc = String(disconnectBtn.dataset.oauthDisconnect || '').trim();
                 if (svc) this._oauthDisconnectService(svc);
+                return;
+            }
+
+            const markNotificationsBtn = event.target.closest('[data-notifications-mark-read]');
+            if (markNotificationsBtn) {
+                const app = String(markNotificationsBtn.dataset.notificationsMarkRead || '').trim();
+                const ok = await this.markNotificationsRead(app);
+                if (!ok) this.showToast('Could not update notifications.', 'warn', 2200);
+                return;
+            }
+
+            const clearNotificationsBtn = event.target.closest('[data-notifications-clear]');
+            if (clearNotificationsBtn) {
+                const app = String(clearNotificationsBtn.dataset.notificationsClear || '').trim();
+                const ok = await this.clearNotifications(app);
+                if (!ok) this.showToast('Could not clear notifications.', 'warn', 2200);
+                return;
+            }
+
+            const grantBtn = event.target.closest('[data-connector-grant]');
+            if (grantBtn) {
+                const scope = String(grantBtn.dataset.connectorGrant || '').trim();
+                const ok = await this.setConnectorGrant(scope, true);
+                if (!ok) this.showToast('Could not grant connector scope.', 'warn', 2200);
+                return;
+            }
+
+            const revokeGrantBtn = event.target.closest('[data-connector-revoke]');
+            if (revokeGrantBtn) {
+                const scope = String(revokeGrantBtn.dataset.connectorRevoke || '').trim();
+                const ok = await this.setConnectorGrant(scope, false);
+                if (!ok) this.showToast('Could not revoke connector scope.', 'warn', 2200);
+                return;
+            }
+
+            const inspectConnectorBtn = event.target.closest('[data-connector-inspect]');
+            if (inspectConnectorBtn) {
+                const service = String(inspectConnectorBtn.dataset.connectorInspect || '').trim().toLowerCase();
+                if (!service) return;
+                const ok = await this.showConnectionsPanel(service);
+                if (!ok) this.showToast('Could not inspect connector.', 'warn', 2200);
+                return;
+            }
+
+            const liveSurfaceBtn = event.target.closest('[data-live-surface]');
+            if (liveSurfaceBtn) {
+                const surface = String(liveSurfaceBtn.dataset.liveSurface || '').trim();
+                const driveQuery = String(liveSurfaceBtn.dataset.driveQuery || '').trim();
+                if (surface === 'email') await this.showEmailInbox();
+                else if (surface === 'calendar') await this.showCalendarAgenda();
+                else if (surface === 'messaging') await this.showMessagingInbox();
+                else if (surface === 'drive') await this.showDriveFiles(driveQuery);
+                else if (surface === 'files') await this.showWorkspaceFiles();
+                else if (surface === 'content') await this.showContentRepository();
+                else if (surface === 'notifications') await this.showNotificationsInbox();
+                else if (surface === 'music') this.handleIntent('play my top songs');
+                return;
+            }
+
+            const continuityClearBtn = event.target.closest('[data-continuity-clear]');
+            if (continuityClearBtn) {
+                const ok = await this.clearContinuityAlerts();
+                if (!ok) this.showToast('Could not clear continuity alerts.', 'warn', 2200);
+                return;
+            }
+
+            const continuityDrillBtn = event.target.closest('[data-continuity-drill]');
+            if (continuityDrillBtn) {
+                const ok = await this.drillContinuityAlert();
+                if (!ok) this.showToast('Could not drill continuity alert.', 'warn', 2200);
+                return;
+            }
+
+            const continuityPruneBtn = event.target.closest('[data-continuity-prune]');
+            if (continuityPruneBtn) {
+                const all = continuityPruneBtn.dataset.continuityPrune === 'all';
+                const ok = await this.prunePresence(all);
+                if (!ok) this.showToast('Could not prune presence.', 'warn', 2200);
+                return;
+            }
+
+            const runtimeRefreshBtn = event.target.closest('[data-runtime-refresh]');
+            if (runtimeRefreshBtn) {
+                const ok = await this.showRuntimeHealth();
+                if (!ok) this.showToast('Could not refresh runtime health.', 'warn', 2200);
+                return;
+            }
+
+            const autopilotToggleBtn = event.target.closest('[data-continuity-autopilot]');
+            if (autopilotToggleBtn) {
+                const enabled = autopilotToggleBtn.dataset.continuityAutopilot === 'on';
+                const ok = await this.setContinuityAutopilot(enabled);
+                if (!ok) this.showToast('Could not update continuity autopilot.', 'warn', 2200);
+                return;
+            }
+
+            const autopilotTickBtn = event.target.closest('[data-continuity-autopilot-tick]');
+            if (autopilotTickBtn) {
+                const ok = await this.tickContinuityAutopilot();
+                if (!ok) this.showToast('Could not run continuity autopilot.', 'warn', 2200);
+                return;
+            }
+
+            const autopilotModeBtn = event.target.closest('[data-continuity-autopilot-mode]');
+            if (autopilotModeBtn) {
+                const mode = String(autopilotModeBtn.dataset.continuityAutopilotMode || '').trim().toLowerCase();
+                const ok = mode && mode !== 'recommended'
+                    ? await this.configureContinuityAutopilot({ mode })
+                    : await this.applyRecommendedContinuityMode();
+                if (!ok) this.showToast('Could not apply recommended continuity mode.', 'warn', 2200);
+                return;
+            }
+
+            const continuityNextBtn = event.target.closest('[data-continuity-next-apply]');
+            if (continuityNextBtn) {
+                const ok = await this.applyContinuityNextAction();
+                if (!ok) this.showToast('Could not apply the next continuity action.', 'warn', 2200);
+                return;
+            }
+
+            const handoffStartBtn = event.target.closest('[data-handoff-start]');
+            if (handoffStartBtn) {
+                const report = await this.startSessionHandoff(String(handoffStartBtn.dataset.handoffSurface || '').trim());
+                if (!report?.ok) {
+                    this.showToast('Could not start handoff.', 'warn', 2200);
+                    return;
+                }
+                const pending = (report.handoff && typeof report.handoff.pending === 'object') ? report.handoff.pending : {};
+                const paired = (report.pairedSurface && typeof report.pairedSurface === 'object') ? report.pairedSurface : ((pending.pairedSurface && typeof pending.pairedSurface === 'object') ? pending.pairedSurface : {});
+                const token = String(report.token || pending.token || '').trim();
+                const shareUrl = this.buildHandoffShareUrl(token, report.backendUrl || pending.backendUrl, report.bridgeUrl || pending.bridgeUrl);
+                if (shareUrl) {
+                    await this.copyTextToClipboard(shareUrl);
+                    if (report.relayRouted || pending.relayRouted || paired.routed || paired.woke) {
+                        const target = String(paired.targetLabel || paired.targetSurfaceId || 'mobile').trim();
+                        this.showToast(`Genome takeover requested on ${target}.`, 'ok', 2400);
+                    } else {
+                        await this.showHandoffQr(shareUrl, pending.expiresAt || report.expiresAt);
+                        this.showToast('Genome phone surface QR ready.', 'ok', 2400);
+                    }
+                } else {
+                    this.showToast('Handoff started.', 'ok', 2200);
+                }
+                await this.showContinuitySurface();
+                return;
+            }
+            const preferSurfaceBtn = event.target.closest('[data-surface-prefer]');
+            if (preferSurfaceBtn) {
+                const surfaceId = String(preferSurfaceBtn.dataset.surfacePrefer || '').trim();
+                const ok = await this.preferPairedSurface(surfaceId);
+                this.showToast(ok ? 'Preferred surface updated.' : 'Could not update preferred surface.', ok ? 'ok' : 'warn', 2200);
+                if (ok) await this.showContinuitySurface();
+                return;
+            }
+
+            const handoffCopyBtn = event.target.closest('[data-handoff-copy]');
+            if (handoffCopyBtn) {
+                const token = String(handoffCopyBtn.dataset.handoffCopy || '').trim();
+                const shareUrl = this.buildHandoffShareUrl(token, handoffCopyBtn.dataset.handoffBackend || '', handoffCopyBtn.dataset.handoffBridge || '');
+                const ok = await this.copyTextToClipboard(shareUrl || token);
+                if (!ok) this.showToast('Could not copy handoff token.', 'warn', 2200);
+                else this.showToast('Handoff link copied.', 'ok', 2200);
+                return;
+            }
+
+            const handoffQrBtn = event.target.closest('[data-handoff-qr]');
+            if (handoffQrBtn) {
+                const token = String(handoffQrBtn.dataset.handoffQr || '').trim();
+                const backendUrl = String(handoffQrBtn.dataset.handoffBackend || '').trim();
+                const shareUrl = this.buildHandoffShareUrl(token, backendUrl, handoffQrBtn.dataset.handoffBridge || '');
+                if (!shareUrl) {
+                    this.showToast('No pending handoff QR available.', 'warn', 2200);
+                    return;
+                }
+                await this.showHandoffQr(shareUrl, handoffQrBtn.dataset.handoffExpires || 0);
+                return;
+            }
+
+            const autopilotAlignBtn = event.target.closest('[data-continuity-autopilot-align]');
+            if (autopilotAlignBtn) {
+                const enabled = autopilotAlignBtn.dataset.continuityAutopilotAlign === 'on';
+                const ok = await this.configureContinuityAutopilot({ autoAlignMode: enabled });
+                if (!ok) this.showToast('Could not update continuity auto-align.', 'warn', 2200);
+                return;
+            }
+
+            const autopilotResetBtn = event.target.closest('[data-continuity-autopilot-reset]');
+            if (autopilotResetBtn) {
+                const clearHistory = autopilotResetBtn.dataset.continuityAutopilotReset === 'history';
+                const ok = await this.resetContinuityAutopilot(clearHistory);
+                if (!ok) this.showToast('Could not reset continuity autopilot.', 'warn', 2200);
+                return;
+            }
+
+            const postureApplyBtn = event.target.closest('[data-continuity-posture-apply]');
+            if (postureApplyBtn) {
+                const index = Math.max(1, Number(postureApplyBtn.dataset.continuityPostureApply || 1));
+                const ok = await this.applyContinuityPostureAction(index);
+                if (!ok) this.showToast('Could not apply posture action.', 'warn', 2200);
+                return;
+            }
+
+            const postureBatchBtn = event.target.closest('[data-continuity-posture-batch]');
+            if (postureBatchBtn) {
+                const limit = Math.max(1, Math.min(10, Number(postureBatchBtn.dataset.continuityPostureBatch || 3)));
+                const ok = await this.applyContinuityPostureBatch(limit);
+                if (!ok) this.showToast('Could not apply posture batch.', 'warn', 2200);
                 return;
             }
 
@@ -1361,10 +1954,165 @@ const UIEngine = {
                 return;
             }
 
+            const repoBranchBtn = event.target.closest('[data-repo-branch]');
+            if (repoBranchBtn) {
+                const domain = String(repoBranchBtn.dataset.repoDomain || '').trim();
+                const name = String(repoBranchBtn.dataset.repoName || '').trim();
+                const currentBranch = String(repoBranchBtn.dataset.repoBranch || this._contentBranchFor(domain, name)).trim();
+                const nextBranch = String(window.prompt(`Create or switch branch for ${name || domain}`, currentBranch === 'main' ? 'draft' : currentBranch) || '').trim();
+                if (!nextBranch) return;
+                const item = await this.createRepoBranch(domain, name, nextBranch);
+                if (!item) {
+                    this.showToast('Branch action failed.', 'warn', 2400);
+                    return;
+                }
+                this.showToast(`Branch ready: ${nextBranch}`, 'ok', 2200);
+                if (domain && name) {
+                    this.openRepoObject(domain, name, nextBranch);
+                }
+                return;
+            }
+
+            const repoHistoryBtn = event.target.closest('[data-repo-history]');
+            if (repoHistoryBtn) {
+                const domain = String(repoHistoryBtn.dataset.repoDomain || '').trim();
+                const name = String(repoHistoryBtn.dataset.repoName || '').trim();
+                if (domain && name) {
+                    this.showRepoHistory(domain, name);
+                }
+                return;
+            }
+
+            const repoMergeBtn = event.target.closest('[data-repo-merge]');
+            if (repoMergeBtn) {
+                const domain = String(repoMergeBtn.dataset.repoDomain || '').trim();
+                const name = String(repoMergeBtn.dataset.repoName || '').trim();
+                const sourceBranch = String(repoMergeBtn.dataset.repoMerge || '').trim();
+                const targetBranch = String(repoMergeBtn.dataset.repoTargetBranch || this._contentBranchFor(domain, name)).trim();
+                if (domain && name && sourceBranch && targetBranch && sourceBranch !== targetBranch) {
+                    const item = await this.mergeRepoBranch(domain, name, sourceBranch, targetBranch);
+                    if (!item) {
+                        this.showToast('Merge failed.', 'warn', 2400);
+                        return;
+                    }
+                    this.showToast(`Merged ${sourceBranch} into ${targetBranch}.`, 'ok', 2200);
+                    if (String(this.state.activeSurface?.domain || '') === domain && String(this.state.activeSurface?.name || '') === name) {
+                        await this.openRepoObject(domain, name, targetBranch);
+                    } else {
+                        await this.showRepoHistory(domain, name);
+                    }
+                }
+                return;
+            }
+
+            const repoWorktreesBtn = event.target.closest('[data-repo-worktrees]');
+            if (repoWorktreesBtn) {
+                this.markUserEngaged();
+                this.showWorkspaceWorktrees();
+                return;
+            }
+
+            const worktreeActivateBtn = event.target.closest('[data-worktree-activate]');
+            if (worktreeActivateBtn) {
+                const itemId = String(worktreeActivateBtn.dataset.worktreeActivate || '').trim();
+                const domain = String(worktreeActivateBtn.dataset.worktreeDomain || '').trim();
+                const name = String(worktreeActivateBtn.dataset.worktreeName || '').trim();
+                const branch = String(worktreeActivateBtn.dataset.worktreeBranch || '').trim();
+                const item = await this.activateWorkspaceWorktree(itemId);
+                if (!item) {
+                    this.showToast('Could not activate worktree.', 'warn', 2200);
+                    return;
+                }
+                this.openRepoObject(domain || item.domain, name || item.name, branch || item.branch || this._contentBranchFor(domain || item.domain, name || item.name));
+                return;
+            }
+
+            const worktreeDetachBtn = event.target.closest('[data-worktree-detach]');
+            if (worktreeDetachBtn) {
+                const itemId = String(worktreeDetachBtn.dataset.worktreeDetach || '').trim();
+                const ok = await this.detachWorkspaceWorktree(itemId);
+                if (!ok) {
+                    this.showToast('Could not detach worktree.', 'warn', 2200);
+                    return;
+                }
+                this.showToast('Worktree detached.', 'ok', 2000);
+                this.showWorkspaceWorktrees();
+                return;
+            }
+
+            const worktreeAttachBtn = event.target.closest('[data-worktree-attach]');
+            if (worktreeAttachBtn) {
+                const domain = String(worktreeAttachBtn.dataset.worktreeDomain || '').trim();
+                const name = String(worktreeAttachBtn.dataset.worktreeName || '').trim();
+                const branch = String(worktreeAttachBtn.dataset.worktreeBranch || '').trim();
+                const item = await this.attachWorkspaceWorktree(domain, name, branch);
+                if (!item) {
+                    this.showToast('Could not attach worktree.', 'warn', 2200);
+                    return;
+                }
+                this.showToast('Worktree attached.', 'ok', 2000);
+                this.showWorkspaceWorktrees();
+                return;
+            }
+
+            const repoRevertBtn = event.target.closest('[data-repo-revert]');
+            if (repoRevertBtn) {
+                const domain = String(repoRevertBtn.dataset.repoDomain || '').trim();
+                const name = String(repoRevertBtn.dataset.repoName || '').trim();
+                const hash = String(repoRevertBtn.dataset.repoRevert || '').trim();
+                if (!domain || !name || !hash) return;
+                const ok = window.confirm(`Revert ${name} to ${hash.slice(0, 8)}?`);
+                if (!ok) return;
+                const item = await this.revertRepoObject(domain, name, hash);
+                if (!item) {
+                    this.showToast('Revert failed.', 'warn', 2400);
+                    return;
+                }
+                this.showToast(`Reverted ${name} to ${hash.slice(0, 8)}`, 'ok', 2400);
+                this.openRepoObject(domain, name, item.branch || this._contentBranchFor(domain, name));
+                return;
+            }
+
+            const repoOpenBtn = event.target.closest('[data-repo-open]');
+            if (repoOpenBtn) {
+                const domain = String(repoOpenBtn.dataset.repoDomain || '').trim();
+                const name = String(repoOpenBtn.dataset.repoName || '').trim();
+                const branch = String(repoOpenBtn.dataset.repoBranch || this._contentBranchFor(domain, name)).trim();
+                if (domain && name) {
+                    this.markUserEngaged();
+                    this.openRepoObject(domain, name, branch);
+                }
+                return;
+            }
+
+            const shellObjectBtn = event.target.closest('[data-shell-object-kind]');
+            if (shellObjectBtn) {
+                const kind = String(shellObjectBtn.dataset.shellObjectKind || '').trim();
+                this.markUserEngaged();
+                const ok = await this.openShellObject({
+                    kind,
+                    domain: String(shellObjectBtn.dataset.shellObjectDomain || '').trim(),
+                    name: String(shellObjectBtn.dataset.shellObjectName || '').trim(),
+                    branch: String(shellObjectBtn.dataset.shellObjectBranch || '').trim(),
+                    itemId: String(shellObjectBtn.dataset.shellObjectItemId || '').trim(),
+                    service: String(shellObjectBtn.dataset.shellObjectService || '').trim(),
+                    scene: String(shellObjectBtn.dataset.shellObjectScene || '').trim(),
+                });
+                if (!ok) this.showToast('Could not open shell object.', 'warn', 2200);
+                return;
+            }
             const suggestion = event.target.closest('[data-command]');
             if (!suggestion) return;
             const command = suggestion.dataset.command;
             if (!command) return;
+            const repoOpen = String(command).match(/^open\s+(document|spreadsheet|presentation)\s+(.+)$/i);
+            if (repoOpen) {
+                const [, domain, name] = repoOpen;
+                this.openRepoObject(domain, name);
+                return;
+            }
+            const shellHandled = await this.runDirectShellCommand(command);
+            if (shellHandled) return;
             this.input.value = command;
             this.input.focus();
             this.handleIntent(command);
@@ -1373,6 +2121,7 @@ const UIEngine = {
         this.historyReel.addEventListener('click', (event) => {
             const node = event.target.closest('[data-history-index]');
             if (!node) return;
+            this.markUserEngaged();
             this.restoreFromHistory(Number(node.dataset.historyIndex));
         });
 
@@ -1599,19 +2348,60 @@ const UIEngine = {
         return this.inferIntentContext(this.state.session.lastIntent || '');
     },
 
-    showToast(message, type = 'info', duration = 1800) {
+    clearToast() {
+        if (!this.toast) return;
+        if (this._toastTimer) clearTimeout(this._toastTimer);
+        this._toastTimer = null;
+        this.toast.className = '';
+        this.toast.replaceChildren();
+    },
+
+    showToast(message, type = 'info', duration = 1800, action = null) {
         if (!this.toast) return;
         this.toast.className = `visible tone-${type}`;
-        this.toast.textContent = String(message || 'Updated.');
+        this.toast.replaceChildren();
+        const text = document.createElement('span');
+        text.className = 'ux-toast-text';
+        text.textContent = String(message || 'Updated.');
+        this.toast.appendChild(text);
+        if (action && typeof action === 'object' && typeof action.onClick === 'function') {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'ux-toast-action';
+            button.textContent = String(action.label || 'Open');
+            button.addEventListener('click', async () => {
+                try {
+                    await action.onClick();
+                } finally {
+                    this.clearToast();
+                }
+            });
+            this.toast.appendChild(button);
+        }
         if (this._toastTimer) clearTimeout(this._toastTimer);
-        this._toastTimer = setTimeout(() => {
-            this.toast.className = '';
-            this.toast.textContent = '';
-        }, duration);
+        this._toastTimer = setTimeout(() => this.clearToast(), duration);
+    },
+
+    async installUpdateNow(version = '') {
+        if (!window.electronAPI?.installUpdateNow) {
+            this.showToast('Update restart is only available in Electron.', 'warn', 2600);
+            return;
+        }
+        try {
+            const result = await window.electronAPI.installUpdateNow();
+            if (result?.ok) {
+                this.showToast(`Restarting to install ${version || 'the update'}...`, 'ok', 2400);
+                return;
+            }
+        } catch (_) {
+            // fall through to warning toast below
+        }
+        this.showToast('No downloaded update is ready to install yet.', 'warn', 2600);
     },
 
     async handleIntent(text) {
         if (!text) return;
+        this.markUserEngaged(); // user is engaged — allow remote sync to render
         this.rememberIntent(text);
         if (window.electronAPI?.isElectron && typeof window.electronAPI?.setIntentContext === 'function') {
             window.electronAPI.setIntentContext(this.inferIntentContext(text));
@@ -1644,6 +2434,7 @@ const UIEngine = {
 
         const startTime = performance.now();
         this.state.session.lastIntent = text;
+        this.state.session.isApplyingLocalTurn = true; // close race: block stale-lastTurn syncs from this moment
         this.status.innerText = 'INTERPRETING INTENT...';
         this.inputContainer.classList.add('active-intent');
         this.container.classList.add('refracting');
@@ -1655,6 +2446,7 @@ const UIEngine = {
             this._applyRemote(text, cached, startTime, 'cache');
             this.container.classList.remove('refracting');
             this.inputContainer.classList.remove('active-intent');
+            this.state.session.isApplyingLocalTurn = false;
             // Background refresh — update cache silently, no re-render
             const activeSurface = this.state.activeSurface;
             const activeContent = activeSurface?.getData
@@ -1715,6 +2507,7 @@ const UIEngine = {
             const domain = remote.envelope?.uiIntent?.kind || '';
             if (domain) SemanticCache.set(text, domain, remote);
 
+            console.log('[EMAIL] remote response op=', remote.execution?.op, 'plan.kind=', remote.plan?.kind, 'data=', remote.execution?.data);
             this.state.memory = remote.memory || this.state.memory;
             envelope = remote.envelope;
             execution = remote.execution;
@@ -1751,6 +2544,26 @@ const UIEngine = {
                 this.container.classList.remove('refracting', 'turn-thinking');
                 this.container.classList.add('turn-error');
                 setTimeout(() => this.container.classList.remove('turn-error'), 700);
+                this.inputContainer.classList.remove('active-intent');
+                SoundEngine.error();
+                return;
+            }
+            if (error?.kind === 'permission_denied' && error?.detail?.execution && error?.detail?.plan && error?.detail?.envelope) {
+                const remote = error.detail;
+                const domain = remote.envelope?.uiIntent?.kind || '';
+                if (domain) SemanticCache.invalidate(domain);
+                this._applyRemote(text, remote, startTime, 'remote');
+                const missingScopes = Array.isArray(remote.missingConnectorScopes)
+                    ? remote.missingConnectorScopes.map((item) => String(item || '').trim()).filter(Boolean)
+                    : [];
+                const scopeLabel = missingScopes.length ? missingScopes[0] : '';
+                const message = String(
+                    remote.message
+                    || remote.execution?.message
+                    || (scopeLabel ? `Permission required: ${scopeLabel}` : 'Permission required for connector action.')
+                ).trim();
+                this.showToast(message, 'warn', 3600);
+                this.container.classList.remove('refracting', 'turn-thinking');
                 this.inputContainer.classList.remove('active-intent');
                 SoundEngine.error();
                 return;
@@ -1799,16 +2612,26 @@ const UIEngine = {
     // Shared helper — apply a remote response object to state + render (used by cache hit path)
     _applyRemote(text, remote, startTime, plannerSource = 'remote') {
         this.state.memory = remote.memory || this.state.memory;
+        this.state.session.sessionId = remote.sessionId || this.state.session.sessionId;
+        this.state.session.revision = Number(remote.revision || this.state.session.revision);
+        this.state.session.presence = remote.presence || this.state.session.presence;
+        this.state.session.handoff = remote.handoff || this.state.session.handoff;
         const envelope = remote.envelope;
         const execution = remote.execution;
         const kernelTrace = remote.kernelTrace || this.deriveKernelTrace(execution, remote.route);
         const safePlan = UIPlanSchema.normalize(remote.plan);
+        this.writeSessionIdToUrl(this.state.session.sessionId);
+        this.openWebSocketSync();
+        const updatedContent = remote.execution?.data?.updatedContent;
+        if (updatedContent !== undefined && this.state.activeSurface) {
+            this._applyUpdatedContent(updatedContent);
+        }
         this.state.session.lastEnvelope = envelope;
         this.state.session.lastExecution = execution;
         this.state.session.lastKernelTrace = kernelTrace;
         this.render(safePlan, envelope, kernelTrace);
         SoundEngine.transition();
-        this.pushHistory(text, envelope, execution, safePlan, plannerSource, kernelTrace, null);
+        this.pushHistory(text, envelope, execution, safePlan, plannerSource, kernelTrace, remote.merge || null);
         this.state.metrics.latency = Math.round(performance.now() - startTime);
         this.state.metrics.entropy = 0.01 + Math.random() * 0.04;
         this.updateStatus(execution?.ok ? `STABLE:${plannerSource.toUpperCase()}` : 'NEEDS INPUT');
@@ -1834,6 +2657,10 @@ const UIEngine = {
     },
 
     render(plan, envelope, kernelTrace = this.state.session.lastKernelTrace) {
+        // Boot guard: OS always starts at Latent Surface. Block all renders for
+        // the first 600ms after page load — long enough for all boot-time sync
+        // paths (WS, SSE, poll) to fire and be ignored.
+        if (this._bootGuardUntil && Date.now() < this._bootGuardUntil) return;
         this.container.classList.remove('turn-thinking');
         this.teardownSceneGraphics();
         this.state.session.lastPlan = plan;
@@ -1851,10 +2678,10 @@ const UIEngine = {
         this.state.sceneDock.lastTransition = this.computeSceneTransition(priorDomain, nextDomain);
         this.state.sceneDock.activeDomain = nextDomain;
         const sceneDock = this.renderSceneDock(nextDomain);
-        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow', 'music', 'messaging', 'connections', 'network', 'document', 'spreadsheet', 'code', 'terminal', 'presentation'].includes(core.kind);
+        const showCoreCopy = !['shopping', 'webdeck', 'social', 'banking', 'contacts', 'telephony', 'tasks', 'files', 'expenses', 'notes', 'sports', 'sports_manage', 'weather', 'weather_7day', 'weather_tomorrow', 'music', 'messaging', 'connections', 'network', 'document', 'spreadsheet', 'code', 'terminal', 'presentation', 'runtime'].includes(core.kind);
         const hud = this.buildImmersiveHud(core, plan, envelope, kernelTrace, this.state.session.lastExecution);
         const railBlocks = this.buildImmersiveRailBlocks(blocks);
-        const darkScenes = new Set(['weather','weather_7day','weather_tomorrow','tasks','expenses','notes','music','banking','sports','sports_manage','messaging','files','connections','network','travel','health','reminders','reminders_list','social','contacts','telephony','domain','graph','location','calendar','email','code','terminal','document','spreadsheet','presentation','content','reference','clock','enterprise','github','jira','notion','asana','finance','gaming','arvr','dating']);
+        const darkScenes = new Set(['weather','weather_7day','weather_tomorrow','tasks','expenses','notes','music','banking','sports','sports_manage','messaging','files','connections','network','travel','health','reminders','reminders_list','social','contacts','telephony','domain','graph','location','calendar','email','code','terminal','document','spreadsheet','presentation','content','reference','clock','enterprise','github','jira','notion','asana','finance','gaming','arvr','dating','plan','runtime']);
         const sceneTone = darkScenes.has(core.kind) ? 'dark' : 'light';
         this.container.innerHTML = `
             <div class="workspace immersive" data-scene-tone="${escapeAttr(sceneTone)}">
@@ -1985,11 +2812,15 @@ const UIEngine = {
             { id: 'expenses', label: 'expenses' },
             { id: 'notes', label: 'notes' },
             { id: 'graph', label: 'graph' },
+            { id: 'content', label: 'content' },
             { id: 'files', label: 'files' },
+            { id: 'drive', label: 'drive' },
+            { id: 'calendar', label: 'calendar' },
             { id: 'weather', label: 'weather' },
             { id: 'location', label: 'location' },
             { id: 'shopping', label: 'shopping' },
             { id: 'music', label: 'music' },
+            { id: 'email', label: 'email' },
             { id: 'messaging', label: 'messages' },
             { id: 'health', label: 'health' },
             { id: 'smarthome', label: 'home' },
@@ -1997,6 +2828,9 @@ const UIEngine = {
             { id: 'payments', label: 'pay' },
             { id: 'focus', label: 'focus' },
             { id: 'notifications', label: 'alerts' },
+            { id: 'handoff', label: 'continuity' },
+            { id: 'connectors', label: 'connections' },
+            { id: 'runtime', label: 'runtime' },
             { id: 'webdeck', label: 'web' },
             { id: 'social', label: 'social' },
             { id: 'banking', label: 'banking' },
@@ -2050,6 +2884,9 @@ const UIEngine = {
         if (!entry || typeof entry !== 'object') return 'generic';
         const execution = entry.executionSnapshot || null;
         const core = this.buildCoreSurface(entry.plan || {}, entry.envelope || {}, execution);
+        if (core?.kind === 'document' && core?.info?.storage === 'connector' && String(core?.info?.service || '').trim() === 'gdrive') {
+            return 'drive';
+        }
         return String(core?.kind || 'generic');
     },
 
@@ -2063,11 +2900,15 @@ const UIEngine = {
             expenses: 'show expenses',
             notes: 'show notes',
             graph: 'show graph summary',
-            files: 'show files',
+            content: 'show content history',
+            files: 'show workspace files',
+            drive: 'show my drive files',
+            calendar: 'show my calendar',
             weather: weatherHint ? `show weather in ${weatherHint}` : "what's the weather where i am",
             location: 'where am i',
             shopping: 'show me running shoes',
             music: 'play my top songs',
+            email: 'check my email',
             messaging: 'show my messages',
             health: 'show my health summary',
             smarthome: 'show home status',
@@ -2075,6 +2916,9 @@ const UIEngine = {
             payments: 'show my payment history',
             focus: 'show my screen time stats',
             notifications: 'show my notifications',
+            handoff: 'show continuity',
+            connectors: 'show connections',
+            runtime: 'show runtime health',
             webdeck: 'open example.com',
             social: 'show my social feed',
             banking: 'show account balances',
@@ -2083,6 +2927,47 @@ const UIEngine = {
             generic: 'show me what i can do'
         };
         return byDomain[String(domain || 'generic')] || byDomain.generic;
+    },
+
+    inferHistoryEntryShellTarget(entry) {
+        if (!entry || typeof entry !== 'object') return { type: 'scene', value: 'generic', label: 'resume surface' };
+        const execution = entry.executionSnapshot || null;
+        const core = this.buildCoreSurface(entry.plan || {}, entry.envelope || {}, execution);
+        const kind = String(core?.kind || 'generic').trim().toLowerCase();
+        const info = (core?.info && typeof core.info === 'object') ? core.info : {};
+
+        if (['document', 'spreadsheet', 'presentation'].includes(kind)) {
+            const name = String(info.name || '').trim();
+            if (name) {
+                return {
+                    type: 'repo',
+                    domain: kind,
+                    name,
+                    branch: String(info.branch || this.state.session.workspace?.branch || 'main'),
+                    label: `resume ${name}`
+                };
+            }
+        }
+
+        const sceneKinds = new Set(['content', 'files', 'drive', 'email', 'messaging', 'calendar', 'notifications', 'handoff', 'connectors', 'runtime']);
+        if (sceneKinds.has(kind)) {
+            const labelMap = {
+                content: 'open content repo',
+                files: 'open workspace files',
+                drive: 'open drive',
+                email: 'open email',
+                messaging: 'open messages',
+                calendar: 'open calendar',
+                notifications: 'open notifications',
+                handoff: 'inspect continuity',
+                connectors: 'open connections',
+                runtime: 'inspect runtime',
+            };
+            return { type: 'scene', value: kind, label: labelMap[kind] || `open ${kind}` };
+        }
+
+        const intent = String(entry?.intent || this.sceneDomainToIntent(kind)).trim() || 'resume surface';
+        return { type: 'command', value: intent, label: intent };
     },
 
     buildShoppingRefineCommands(brandName, rawQuery = '', category = 'shoes') {
@@ -2116,6 +3001,55 @@ const UIEngine = {
     async switchToSceneDomain(domain) {
         const target = String(domain || '').trim().toLowerCase();
         if (!target) return;
+        this.syncActiveSurfaceWorkspaceFocus();
+        if (target === 'generic') {
+            this.renderWelcome();
+            this.state.sceneDock.lastTransition = this.computeSceneTransition(this.state.sceneDock.activeDomain, 'generic');
+            this.state.sceneDock.activeDomain = 'generic';
+            this.applySceneTransition();
+            this.saveState();
+            return;
+        }
+        if (target === 'notifications') {
+            await this.showNotificationsInbox();
+            return;
+        }
+        if (target === 'handoff' || target === 'continuity') {
+            await this.showContinuitySurface();
+            return;
+        }
+        if (target === 'connectors') {
+            await this.showConnectionsPanel();
+            return;
+        }
+        if (target === 'runtime') {
+            await this.showRuntimeHealth();
+            return;
+        }
+        if (target === 'email') {
+            await this.showEmailInbox();
+            return;
+        }
+        if (target === 'messaging') {
+            await this.showMessagingInbox();
+            return;
+        }
+        if (target === 'calendar') {
+            await this.showCalendarAgenda();
+            return;
+        }
+        if (target === 'content') {
+            await this.showContentRepository();
+            return;
+        }
+        if (target === 'drive') {
+            await this.showDriveFiles();
+            return;
+        }
+        if (target === 'files') {
+            await this.showWorkspaceFiles();
+            return;
+        }
         // Weather is time-sensitive — never restore stale history, always fetch fresh.
         if (target !== 'weather') {
             let matchIndex = -1;
@@ -2598,15 +3532,51 @@ const UIEngine = {
         const latest = toolResults.length ? toolResults[toolResults.length - 1] : null;
         const domains = Array.isArray(envelope?.stateIntent?.readDomains) ? envelope.stateIntent.readDomains : [];
         const domain = String(domains[0] || 'generic');
+        const tolerantSurfaceOps = new Set([
+            'gmail.list', 'gmail.search', 'gmail.send', 'gmail.trash',
+            'email_read', 'email_search',
+            'gcal.list', 'gcal.create', 'gcal.delete',
+            'calendar_list', 'calendar_availability',
+            'gdrive.list', 'gdrive.create', 'gdrive.open',
+            'slack.list_channels', 'slack.send', 'slack.read',
+            'slack_send', 'slack_read', 'slack_search', 'slack_status', 'slack_reaction',
+            'messaging_send', 'messaging_read', 'messaging_reply', 'messaging_search',
+            'connections_status',
+        ]);
+
+        // ── Multi-step plan: 2+ ops executed → plan surface ─────────────────
+        if (execution?.isPlan && toolResults.length >= 2) {
+            const allOk   = toolResults.every(r => r?.ok !== false);
+            const anyFail = toolResults.some(r => r?.ok === false);
+            const doneCount = toolResults.filter(r => r?.ok).length;
+            const headline = anyFail
+                ? `${doneCount}/${toolResults.length} steps completed`
+                : `${toolResults.length} steps completed`;
+            return {
+                headline,
+                summary: fallbackHeadline,
+                variant: 'result',
+                kind: 'plan',
+                theme: anyFail ? 'theme-warn' : 'theme-plan',
+                info: { steps: toolResults, intent: fallbackHeadline, allOk, anyFail },
+            };
+        }
         if (!latest) {
             if (domain === 'tasks') return { headline: 'Task Flow', summary: 'Generated task workspace', variant: 'result', kind: 'tasks', theme: 'theme-tasks' };
             if (domain === 'expenses') return { headline: 'Spend Pulse', summary: 'Generated expense workspace', variant: 'result', kind: 'expenses', theme: 'theme-expenses' };
             if (domain === 'notes') return { headline: 'Knowledge Stream', summary: 'Generated notes workspace', variant: 'result', kind: 'notes', theme: 'theme-notes' };
             if (domain === 'graph') return { headline: 'System Graph', summary: 'Generated relation workspace', variant: 'result', kind: 'graph', theme: 'theme-graph' };
-            if (domain === 'files') return { headline: 'File Surface', summary: 'Generated file workspace', variant: 'result', kind: 'files', theme: 'theme-files' };
+            if (domain === 'content') return { headline: 'Content Repo', summary: 'Repository objects and history', variant: 'result', kind: 'content', theme: 'theme-content', info: { action: 'list', items: [], branch: this.state.session.workspace?.branch || 'main' } };
+            if (domain === 'files') return { headline: 'Workspace Files', summary: 'External filesystem workspace', variant: 'result', kind: 'files', theme: 'theme-files', info: { storage: 'workspace', path: '.', items: [] } };
+            if (domain === 'drive') return { headline: 'Google Drive', summary: 'Connector file storage', variant: 'result', kind: 'drive', theme: 'theme-files', info: { storage: 'connector', service: 'gdrive', items: [] } };
+            if (domain === 'email') return { headline: 'Email', summary: 'Inbox and mail routing', variant: 'result', kind: 'email', theme: 'theme-email', info: { messages: [], provider: 'gmail' } };
+            if (domain === 'notifications') return { headline: 'Notifications', summary: 'Shell event inbox', variant: 'result', kind: 'notifications', theme: 'theme-notifications', info: { items: Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [] } };
+            if (domain === 'handoff') return { headline: 'Continuity', summary: 'Cross-device runtime state', variant: 'result', kind: 'handoff', theme: 'theme-handoff', info: {} };
+            if (domain === 'connectors') return { headline: 'Connections', summary: 'Manage connected services', variant: 'result', kind: 'connections', theme: 'theme-connections' };
+            if (domain === 'runtime') return { headline: 'Runtime', summary: 'Shell health and latency', variant: 'result', kind: 'runtime', theme: 'theme-connections', info: {} };
             return { headline: fallbackHeadline, summary: fallbackSummary, variant: 'intent', kind: 'generic', theme: 'theme-neutral' };
         }
-        if (!latest.ok) {
+        if (!latest.ok && !tolerantSurfaceOps.has(String(latest.op || ''))) {
             return { headline: fallbackHeadline, summary: fallbackSummary, variant: 'intent', kind: 'generic', theme: 'theme-neutral' };
         }
         if (latest.op === 'weather_forecast') {
@@ -2948,8 +3918,11 @@ const UIEngine = {
         if (domain === 'graph') {
             return { headline: 'System Graph', summary: 'Generated relation workspace', variant: 'result', kind: 'graph', theme: 'theme-graph' };
         }
+        if (domain === 'content') {
+            return { headline: 'Content Repo', summary: 'Repository objects and history', variant: 'result', kind: 'content', theme: 'theme-content', info: { action: 'list', items: [], branch: this.state.session.workspace?.branch || 'main' } };
+        }
         if (domain === 'files') {
-            return { headline: 'File Surface', summary: 'Generated file workspace', variant: 'result', kind: 'files', theme: 'theme-files' };
+            return { headline: 'Workspace Files', summary: 'External filesystem workspace', variant: 'result', kind: 'files', theme: 'theme-files' };
         }
         if (latest.op === 'mcp_tool_call') {
             const serverName = String(latest.serverName || latest.data?.serverName || 'Connected App').trim();
@@ -2977,6 +3950,26 @@ const UIEngine = {
                 'spotify.queue','spotify.volume']);
             if (_musicOps.has(latest.op)) {
                 const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                if (d.connected === false || d.fallbackReason === 'no_active_device') {
+                    const summary = d.connected === false
+                        ? 'Connect Spotify to control playback'
+                        : (d.error || 'Open Spotify on an active device');
+                    return {
+                        headline: 'Spotify',
+                        summary,
+                        variant: 'result',
+                        kind: 'music',
+                        theme: 'theme-music',
+                        info: {
+                            notConnected: true,
+                            service: 'spotify',
+                            source: d.source || 'live',
+                            fallbackReason: d.fallbackReason || '',
+                            error: d.error || '',
+                            op: latest.op,
+                        },
+                    };
+                }
                 const track   = String(d.track  || '').trim();
                 const artist  = String(d.artist || '').trim();
                 const album   = String(d.album  || '').trim();
@@ -2994,13 +3987,20 @@ const UIEngine = {
             const _emailOps = new Set(['gmail.list','gmail.search','gmail.send','gmail.trash']);
             if (_emailOps.has(latest.op) || (['email_read','email_search'].includes(latest.op) && Array.isArray(latest.data?.messages))) {
                 const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                const provider = String(d.provider || (latest.op?.startsWith('gmail.') ? 'gmail' : 'email')).toLowerCase();
+                const providerLabel = provider === 'email' ? 'Email' : provider.charAt(0).toUpperCase() + provider.slice(1);
+                console.log('[EMAIL] buildCoreSurface op=', latest.op, 'd=', d, 'provider=', provider);
+                if (d.connected === false) {
+                    return { headline: providerLabel, summary: 'Connect to view inbox', variant: 'result', kind: 'email', theme: 'theme-email',
+                             info: { messages: [], unread_count: 0, notConnected: true, service: provider, op: latest.op, provider, source: d.source || 'live', fallbackReason: d.fallbackReason || '', error: d.error || '' } };
+                }
                 const messages = Array.isArray(d.messages) ? d.messages : [];
                 const unread   = Number(d.unread_count || messages.filter(m => m.unread).length);
                 const first    = messages[0] || {};
                 const headline = unread > 0 ? `${unread} unread` : 'Inbox';
-                const summary  = first.subject ? first.subject.slice(0, 60) : (d.source === 'scaffold' ? 'Gmail scaffold' : 'Gmail');
+                const summary  = d.ok === false ? (d.error || `${providerLabel} unavailable`) : (first.subject ? first.subject.slice(0, 60) : (d.source === 'scaffold' ? `${providerLabel} scaffold` : providerLabel));
                 return { headline, summary, variant: 'result', kind: 'email', theme: 'theme-email',
-                         info: { messages, unread_count: unread, source: d.source || 'scaffold', query: d.query || '', op: latest.op } };
+                         info: { messages, unread_count: unread, source: d.source || 'scaffold', query: d.query || '', op: latest.op, provider, authoritative: d.authoritative !== false, error: d.error || '' } };
             }
         }
         // ── Google Calendar with live data ─────────────────────────────────────
@@ -3009,13 +4009,17 @@ const UIEngine = {
             const _calEnriched = ['calendar_list','calendar_availability'].includes(latest.op) && Array.isArray(latest.data?.events);
             if (_calOps.has(latest.op) || _calEnriched) {
                 const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                if (d.connected === false) {
+                    return { headline: 'Google Calendar', summary: 'Connect to view events', variant: 'result', kind: 'calendar', theme: 'theme-calendar',
+                             info: { events: [], notConnected: true, service: 'gcal', op: latest.op, source: d.source || 'live', fallbackReason: d.fallbackReason || '', error: d.error || '' } };
+                }
                 const events  = Array.isArray(d.events) ? d.events : [];
                 const next    = events[0] || null;
                 const headline = next ? (next.summary || 'Event').slice(0, 50) : (events.length + ' events');
-                const summary  = next ? String(next.start || '').slice(0, 16) : (d.source === 'scaffold' ? 'Calendar scaffold' : 'Google Calendar');
+                const summary  = d.ok === false ? (d.error || 'Calendar unavailable') : (next ? String(next.start || '').slice(0, 16) : (d.source === 'scaffold' ? 'Calendar scaffold' : 'Google Calendar'));
                 return { headline: events.length ? headline : 'No upcoming events', summary,
                          variant: 'result', kind: 'calendar', theme: 'theme-calendar',
-                         info: { events, source: d.source || 'scaffold', op: latest.op } };
+                         info: { events, source: d.source || 'scaffold', op: latest.op, authoritative: d.authoritative !== false, error: d.error || '' } };
             }
         }
         // ── Google Drive with live data ────────────────────────────────────────
@@ -3023,12 +4027,16 @@ const UIEngine = {
             const _driveOps = new Set(['gdrive.list','gdrive.create','gdrive.open']);
             if (_driveOps.has(latest.op)) {
                 const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                if (d.connected === false) {
+                    return { headline: 'Google Drive', summary: 'Connect to view files', variant: 'result', kind: 'drive', theme: 'theme-files',
+                             info: { files: [], notConnected: true, service: 'gdrive', source: d.source || 'live', fallbackReason: d.fallbackReason || '', error: d.error || '', op: latest.op, storage: 'connector' } };
+                }
                 const files   = Array.isArray(d.files) ? d.files : [];
                 const first   = files[0] || {};
                 const headline = first.name ? first.name.slice(0, 50) : `${files.length} files`;
-                const summary  = files.length > 1 ? `${files.length} files in Drive` : (d.source === 'scaffold' ? 'Drive scaffold' : 'Google Drive');
-                return { headline, summary, variant: 'result', kind: 'document', theme: 'theme-document',
-                         info: { files, source: d.source || 'scaffold', op: latest.op } };
+                const summary  = d.ok === false ? (d.error || 'Drive unavailable') : (files.length > 1 ? `${files.length} files in Drive` : (d.source === 'scaffold' ? 'Drive scaffold' : 'Google Drive'));
+                return { headline, summary, variant: 'result', kind: 'drive', theme: 'theme-files',
+                         info: { files, items: files, source: d.source || 'scaffold', op: latest.op, authoritative: d.authoritative !== false, error: d.error || '', service: 'gdrive', storage: 'connector' } };
             }
         }
         // ── Slack / Messaging with live data ───────────────────────────────────
@@ -3038,15 +4046,19 @@ const UIEngine = {
                 'messaging_send','messaging_read','messaging_reply','messaging_search']);
             if (_slackOps.has(latest.op)) {
                 const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+                if (d.connected === false) {
+                    return { headline: 'Slack', summary: 'Connect to view channels', variant: 'result', kind: 'messaging', theme: 'theme-messaging',
+                             info: { channels: [], messages: [], unread: 0, notConnected: true, service: 'slack', source: d.source || 'live', fallbackReason: d.fallbackReason || '', error: d.error || '', op: latest.op } };
+                }
                 const channels = Array.isArray(d.channels) ? d.channels : [];
                 const messages = Array.isArray(d.messages) ? d.messages : [];
                 const unread   = channels.reduce((s, c) => s + Number(c.unread_count || 0), 0);
                 const first    = channels[0] || messages[0] || {};
                 const headline = channels.length ? `#${first.name || 'general'}` : (messages.length ? 'Messages' : 'Slack');
-                const summary  = unread > 0 ? `${unread} unread` : (d.source === 'scaffold' ? 'Slack scaffold' : 'Up to date');
+                const summary  = d.ok === false ? (d.error || 'Slack unavailable') : (unread > 0 ? `${unread} unread` : (d.source === 'scaffold' ? 'Slack scaffold' : 'Up to date'));
                 return { headline, summary, variant: 'result', kind: 'messaging', theme: 'theme-messaging',
                          info: { channels, messages, unread, source: d.source || 'scaffold',
-                                 channel: d.channel || '', op: latest.op } };
+                                 channel: d.channel || '', op: latest.op, authoritative: d.authoritative !== false, error: d.error || '', service: 'slack' } };
             }
         }
         // ── GitHub ops ────────────────────────────────────────────────────────
@@ -3522,12 +4534,79 @@ const UIEngine = {
         if (latest.op === 'connections_status') {
             const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
             const services = (d.services && typeof d.services === 'object') ? d.services : {};
+            const grants = Array.isArray(d.grants) ? d.grants : [];
+            const grantsSummary = (d.grantsSummary && typeof d.grantsSummary === 'object') ? d.grantsSummary : {};
             const connectedCount = Object.values(services).filter(s => s && s.connected).length;
             const total = Object.keys(services).length || 6;
             const headline = 'Connections';
             const summary = connectedCount > 0 ? `${connectedCount} of ${total} connected` : 'No services connected';
+            const targetService = String(d.targetService || '').trim() || null;
             return { headline, summary, variant: 'result', kind: 'connections', theme: 'theme-connections',
-                     info: { services, op: 'connections_status' } };
+                     info: { services, grants, grantsSummary, op: 'connections_status', targetService } };
+        }
+        if (['list_connector_grants', 'grant_connector_scope', 'revoke_connector_scope'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const grants = Array.isArray(d.items) ? d.items : [];
+            const grantsSummary = {
+                count: Number(d.count || grants.length || 0),
+                granted: Number(d.granted || grants.filter((item) => item?.granted).length || 0),
+            };
+            return {
+                headline: 'Connections',
+                summary: String(latest.message || 'Connector grants'),
+                variant: 'result',
+                kind: 'connections',
+                theme: 'theme-connections',
+                info: {
+                    services: {},
+                    grants,
+                    grantsSummary,
+                    op: latest.op,
+                    targetService: null,
+                }
+            };
+        }
+        if (['runtime_profile', 'self_check'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const health = (d.health && typeof d.health === 'object') ? d.health : {};
+            const selfCheck = (d.selfCheck && typeof d.selfCheck === 'object') ? d.selfCheck : {};
+            const profile = (d.profile && typeof d.profile === 'object') ? d.profile : {};
+            const services = (d.services && typeof d.services === 'object') ? d.services : {};
+            const totalMs = Number(health.performance?.totalMs || profile.latencyMs?.avg || 0);
+            const headline = totalMs > 0 ? `${totalMs}ms` : 'Runtime';
+            const summary = Boolean(selfCheck.overallOk) ? 'healthy' : 'attention needed';
+            return {
+                headline,
+                summary,
+                variant: 'result',
+                kind: 'runtime',
+                theme: 'theme-connections',
+                info: { health, selfCheck, profile, services, op: latest.op }
+            };
+        }
+        if (['continuity_alerts', 'clear_continuity_alerts'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const continuity = (d.continuity && typeof d.continuity === 'object') ? d.continuity : {};
+            const alerts = (d.alerts && typeof d.alerts === 'object') ? d.alerts : {};
+            const handoff = (d.handoff && typeof d.handoff === 'object') ? d.handoff : {};
+            const presence = (d.presence && typeof d.presence === 'object') ? d.presence : {};
+            const health = (continuity.health && typeof continuity.health === 'object') ? continuity.health : {};
+            return {
+                headline: String(health.status || 'continuity'),
+                summary: String(latest.message || 'Cross-device runtime state'),
+                variant: 'result',
+                kind: 'handoff',
+                theme: 'theme-handoff',
+                info: { continuity, alerts, handoff, presence, op: latest.op }
+            };
+        }
+        if (['notifications_view', 'notifications_clear', 'notifications_clear_app', 'notifications_mark_read', 'notifications_settings'].includes(latest.op)) {
+            const d = (latest.data && typeof latest.data === 'object') ? latest.data : {};
+            const items = Array.isArray(d.notifications) ? d.notifications : (Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : []);
+            const headline = items.length ? `${items.length} notifications` : 'Notifications';
+            const summary = String(latest.message || 'Shell event inbox');
+            return { headline, summary, variant: 'result', kind: 'notifications', theme: 'theme-notifications',
+                     info: { items, op: latest.op, source: d.source || 'live' } };
         }
         // ── Computer layer ops ─────────────────────────────────────────────────
         {
@@ -3535,13 +4614,13 @@ const UIEngine = {
             const action = String(d.action || '').trim();
             const name   = String(d.name   || '').trim();
             const topic  = String(d.topic  || '').trim();
-            if (['document_create', 'document_edit'].includes(latest.op)) {
+            if (['document_create', 'document_edit', 'document_open'].includes(latest.op)) {
                 return { headline: name || topic || (action === 'edit' ? 'Edit document' : 'New document'), summary: action || 'document', variant: 'result', kind: 'document', theme: 'theme-document', info: d };
             }
-            if (['spreadsheet_create', 'spreadsheet_edit'].includes(latest.op)) {
+            if (['spreadsheet_create', 'spreadsheet_edit', 'spreadsheet_open'].includes(latest.op)) {
                 return { headline: name || (action === 'edit' ? 'Edit spreadsheet' : 'New spreadsheet'), summary: action || 'spreadsheet', variant: 'result', kind: 'spreadsheet', theme: 'theme-spreadsheet', info: d };
             }
-            if (['presentation_create', 'presentation_edit'].includes(latest.op)) {
+            if (['presentation_create', 'presentation_edit', 'presentation_open'].includes(latest.op)) {
                 const slides = d.slides ? `${d.slides} slides` : '';
                 return { headline: name || topic || (action === 'edit' ? 'Edit presentation' : 'New presentation'), summary: [action, slides].filter(Boolean).join(' · ') || 'presentation', variant: 'result', kind: 'presentation', theme: 'theme-presentation', info: d };
             }
@@ -3563,9 +4642,28 @@ const UIEngine = {
                 const subject = String(d.subject || d.query || '').trim();
                 return { headline: (action === 'compose' || action === 'reply') ? (to ? `→ ${to}` : 'compose') : (subject || 'inbox'), summary: action || 'email', variant: 'result', kind: 'email', theme: 'theme-email', info: d };
             }
-            if (['content_find', 'content_list', 'content_history', 'content_branch', 'content_revert', 'content_share'].includes(latest.op)) {
+            if (['content_find', 'content_list', 'content_history', 'content_branch', 'content_merge', 'content_revert', 'content_worktrees', 'content_attach', 'content_activate', 'content_detach', 'content_share'].includes(latest.op)) {
                 const type = String(d.type || '').trim();
-                return { headline: name || action || 'content', summary: [type, action].filter(Boolean).join(' · ') || 'content', variant: 'result', kind: 'content', theme: 'theme-content', info: d };
+                const items = Array.isArray(d.items) ? d.items : [];
+                const history = Array.isArray(d.history) ? d.history : [];
+                const worktrees = Array.isArray(d.worktrees) ? d.worktrees : [];
+                const itemCount = action === 'history' ? history.length : items.length;
+                return {
+                    headline: name || (itemCount ? `${itemCount} object${itemCount === 1 ? '' : 's'}` : action || 'content'),
+                    summary: [type, action, d.branch].filter(Boolean).join(' · ') || 'content',
+                    variant: 'result',
+                    kind: 'content',
+                    theme: 'theme-content',
+                    info: {
+                        ...d,
+                        items,
+                        history,
+                        worktrees,
+                        source: d.source || 'live',
+                        connected: d.connected !== false,
+                        authoritative: d.authoritative !== false,
+                    }
+                };
             }
         }
         // ── Computer domain fallbacks (when latest.ok but op not specifically mapped) ──
@@ -3577,6 +4675,8 @@ const UIEngine = {
         if (domain === 'calendar')     return { headline: 'Calendar',     summary: 'Generated calendar workspace',     variant: 'result', kind: 'calendar',     theme: 'theme-calendar'     };
         if (domain === 'email')        return { headline: 'Email',        summary: 'Generated email workspace',        variant: 'result', kind: 'email',        theme: 'theme-email'        };
         if (domain === 'content')      return { headline: 'Content',      summary: 'Generated content workspace',      variant: 'result', kind: 'content',      theme: 'theme-content'      };
+        if (domain === 'files')        return { headline: 'Files',        summary: 'External filesystem workspace',    variant: 'result', kind: 'files',        theme: 'theme-files', info: { storage: 'workspace', path: '.', items: [] } };
+        if (domain === 'drive')        return { headline: 'Drive',        summary: 'Connector file storage',          variant: 'result', kind: 'drive',        theme: 'theme-files', info: { storage: 'connector', service: 'gdrive', items: [] } };
         // ── Wave-3 domain fallbacks ──────────────────────────────────────────────────
         if (domain === 'music')         return { headline: 'Music',         summary: 'Music player',            variant: 'result', kind: 'music',         theme: 'theme-music'         };
         if (domain === 'messaging')     return { headline: 'Messages',      summary: 'Messaging',               variant: 'result', kind: 'messaging',     theme: 'theme-messaging'     };
@@ -3627,6 +4727,93 @@ const UIEngine = {
     },
 
     buildPrimaryVisual(core, execution, envelope, plan) {
+        // ── Multi-step plan scene ─────────────────────────────────────────────
+        if (core.kind === 'plan') {
+            const { steps = [], intent = '', allOk, anyFail } = core.info || {};
+            const domainFor = (op) => {
+                const o = String(op || '').toLowerCase();
+                if (!o) return 'generic';
+                if (o.includes('gmail') || o.includes('email')) return 'email';
+                if (o.includes('gcal') || o.includes('calendar')) return 'calendar';
+                if (o.includes('gdrive')) return 'drive';
+                if (o.includes('slack') || o.includes('message')) return 'messaging';
+                if (o.includes('document') || o.includes('spreadsheet') || o.includes('presentation') || o.includes('content_')) return 'content';
+                if (o.includes('notify') || o.includes('alert')) return 'notifications';
+                if (o.includes('connect')) return 'connectors';
+                if (o.includes('handoff') || o.includes('continuity') || o.includes('presence')) return 'handoff';
+                if (o.includes('runtime') || o.includes('self_check')) return 'runtime';
+                if (o.includes('file')) return 'files';
+                if (o.includes('task')) return 'tasks';
+                if (o.includes('note')) return 'notes';
+                if (o.includes('expense')) return 'expenses';
+                return 'generic';
+            };
+            const iconFor = (op) => {
+                if (!op) return '○';
+                const o = String(op).toLowerCase();
+                if (o.includes('weather')) return '☁';
+                if (o.includes('music') || o.includes('spotify')) return '♫';
+                if (o.includes('calendar') || o.includes('gcal')) return '📅';
+                if (o.includes('gmail') || o.includes('email')) return '✉';
+                if (o.includes('task')) return '✓';
+                if (o.includes('note')) return '✎';
+                if (o.includes('remind')) return '⏰';
+                if (o.includes('slack') || o.includes('message')) return '💬';
+                if (o.includes('search') || o.includes('web')) return '⌕';
+                if (o.includes('file')) return '📄';
+                if (o.includes('travel') || o.includes('flight')) return '✈';
+                if (o.includes('shop') || o.includes('cart')) return '🛍';
+                return '▷';
+            };
+            const stepRows = steps.map((s, i) => {
+                const ok = s?.ok !== false;
+                const msg = String(s?.message || s?.op || '').slice(0, 80);
+                const opLabel = String(s?.op || '').replace(/_/g, ' ');
+                const statusClass = ok ? 'plan-step-ok' : 'plan-step-fail';
+                const icon = iconFor(s?.op);
+                return `
+                    <div class="plan-step ${statusClass}">
+                        <span class="plan-step-num">${i + 1}</span>
+                        <span class="plan-step-icon">${escapeHtml(icon)}</span>
+                        <div class="plan-step-body">
+                            <div class="plan-step-op">${escapeHtml(opLabel)}</div>
+                            <div class="plan-step-msg">${escapeHtml(msg)}</div>
+                        </div>
+                        <span class="plan-step-status">${ok ? '✓' : '✗'}</span>
+                    </div>`;
+            }).join('');
+            const domainCards = Array.from(new Map(steps.map((step) => {
+                const domain = domainFor(step?.op);
+                return [domain, {
+                    domain,
+                    ok: step?.ok !== false,
+                    op: String(step?.op || '').replace(/_/g, ' '),
+                    message: String(step?.message || step?.op || '').slice(0, 64),
+                }];
+            })).values())
+                .filter((item) => item.domain !== 'generic')
+                .slice(0, 4)
+                .map((item) => `
+                    <button class="cnt-item" type="button" data-scene-domain="${escapeAttr(item.domain)}">
+                        <div class="cnt-item-icon ${escapeAttr(item.domain)}"></div>
+                        <div class="cnt-item-name">${escapeHtml(item.domain)}</div>
+                        <div class="cnt-item-type">${item.ok ? 'ready' : 'attention'}</div>
+                        <div class="cnt-item-ver">${escapeHtml(item.op)}</div>
+                        <div class="cnt-item-time">${escapeHtml(item.message)}</div>
+                    </button>
+                `).join('');
+            const summaryLine = anyFail
+                ? `<span class="plan-summary-warn">${steps.filter(s => s?.ok === false).length} step(s) failed</span>`
+                : `<span class="plan-summary-ok">All steps completed</span>`;
+            return `
+                <div class="plan-scene">
+                    <div class="plan-intent">${escapeHtml(intent)}</div>
+                    ${domainCards ? `<div class="cnt-history">${domainCards}</div>` : ''}
+                    <div class="plan-steps">${stepRows}</div>
+                    <div class="plan-summary">${summaryLine}</div>
+                </div>`;
+        }
+
         if (core.kind === 'shopping') {
             const info = core.info || {};
             const items = Array.isArray(info.items) ? info.items.slice(0, 24) : [];
@@ -4563,30 +5750,65 @@ const UIEngine = {
         }
         if (core.kind === 'files') {
             const info = core.info || {};
+            if (info.notConnected) {
+                return `<div class="scene scene-files interactive">
+                    <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
+                    <div class="scene-grid"></div>
+                    <div class="files-head">
+                        <div class="files-title">${escapeHtml(String(info.service || 'files'))}</div>
+                        <div class="files-meta">connector</div>
+                    </div>
+                    <div class="files-body">
+                        <div class="connector-cta">
+                            <div class="connector-cta-label">Connect ${escapeHtml(String(info.service || 'drive'))} to view files</div>
+                            <button class="connector-cta-btn" data-oauth-connect="${escapeAttr(String(info.service || 'gdrive'))}">Connect</button>
+                        </div>
+                        <pre class="files-preview">${escapeHtml(String(info.error || info.fallbackReason || 'No live files available.'))}</pre>
+                    </div>
+                </div>`;
+            }
             const items = Array.isArray(info.items) ? info.items.slice(0, 28) : [];
             const op = String(info.op || '').trim();
             const path = String(info.path || '').trim();
             const excerpt = String(info.excerpt || '').trim();
             const lineCount = Number(info.lineCount || 0);
+            const storage = String(info.storage || (info.service ? 'connector' : 'workspace')).trim();
+            const title = storage === 'connector'
+                ? String(info.service || 'connector').trim()
+                : (path || 'workspace');
+            const meta = storage === 'connector'
+                ? `${String(info.service || 'files')} | ${String(items.length || lineCount)}`
+                : `${String(op || 'files')} | ${String(items.length || lineCount)}`;
+            const storageLabel = storage === 'connector' ? 'connector storage' : 'workspace filesystem';
             const treeHtml = items.map((item) => {
                 const name = String(item?.name || item || '').trim();
                 const type = String(item?.type || (name.endsWith('/') ? 'dir' : 'file')).trim();
                 const cleanBase = path && path !== '.' ? String(path).replace(/\/+$/g, '') : '';
                 const cleanName = name.replace(/\/+$/g, '');
                 const nodePath = cleanBase ? `${cleanBase}/${cleanName}` : cleanName;
-                const command = type === 'dir' ? `list files ${nodePath}` : `read file ${nodePath}`;
-                return `<button class="files-node ${escapeAttr(type)}" type="button" data-command="${escapeAttr(command)}">${escapeHtml(name || '(item)')}</button>`;
+                if (storage === 'connector') {
+                    return `<button class="files-node ${escapeAttr(type)}" type="button" data-live-surface="drive" data-drive-query="${escapeAttr(cleanName)}">${escapeHtml(name || '(item)')}</button>`;
+                }
+                if (type === 'dir') {
+                    return `<button class="files-node ${escapeAttr(type)}" type="button" data-command="${escapeAttr(`list files ${nodePath}`)}">${escapeHtml(name || '(item)')}</button>`;
+                }
+                return `<button class="files-node ${escapeAttr(type)}" type="button" data-command="${escapeAttr(`read file ${nodePath}`)}">${escapeHtml(name || '(item)')}</button>`;
             }).join('');
             return `<div class="scene scene-files interactive">
                 <canvas class="scene-canvas generic-canvas" data-scene="generic"></canvas>
                 <div class="scene-grid"></div>
                 <div class="files-head">
-                    <div class="files-title">${escapeHtml(path || 'workspace')}</div>
-                    <div class="files-meta">${escapeHtml(op || 'files')} | ${escapeHtml(String(items.length || lineCount))}</div>
+                    <div class="files-title">${escapeHtml(title)}</div>
+                    <div class="files-meta">${escapeHtml(meta)}</div>
                 </div>
                 <div class="files-body">
-                    <div class="files-tree">${treeHtml || '<div class="files-node">No entries</div>'}</div>
-                    <pre class="files-preview">${escapeHtml(excerpt || 'No file preview loaded.')}</pre>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">${escapeHtml(storageLabel)}</div>
+                        ${storage === 'workspace' ? `<button class="cnt-type-badge" type="button" data-scene-domain="files">root</button>` : ''}
+                        ${storage === 'connector' ? `<button class="cnt-type-badge" type="button" data-scene-domain="connectors">connections</button>` : ''}
+                    </div>
+                    <div class="files-tree">${treeHtml || `<div class="files-node">${escapeHtml(storage === 'connector' ? 'No connected files' : 'No entries')}</div>`}</div>
+                    <pre class="files-preview">${escapeHtml(excerpt || (storage === 'connector' ? 'Select a connected file source to inspect content.' : 'No file preview loaded.'))}</pre>
                 </div>
             </div>`;
         }
@@ -4949,6 +6171,8 @@ const UIEngine = {
             const name   = String(info.name  || '').trim();
             const topic  = String(info.topic || '').trim();
             const title  = name || topic || (action === 'edit' ? 'Existing Document' : 'New Document');
+            const branch = String(info.branch || this.state.session.workspace?.activeContent?.branch || 'main').trim();
+            const hash = String(info.hash || this.state.session.workspace?.activeContent?.hash || '').trim();
             return `<div class="scene scene-computer scene-document interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="document"></canvas>
                 <div class="functional-surface">
@@ -4963,6 +6187,8 @@ const UIEngine = {
                         <button data-cmd="insertUnorderedList" title="Bullet list">•</button>
                         <button data-cmd="insertOrderedList" title="Numbered list">1.</button>
                         <span class="func-doc-name">${escapeHtml(title)}</span>
+                        <button class="func-branch-badge" type="button" data-repo-branch="1" data-repo-domain="document" data-repo-name="${escapeAttr(name || title)}" data-repo-branch="${escapeAttr(branch)}">${escapeHtml(branch)}</button>
+                        <button class="func-hash-badge" type="button" data-repo-history="1" data-repo-domain="document" data-repo-name="${escapeAttr(name || title)}">${escapeHtml(hash ? hash.slice(0, 8) : 'new')}</button>
                         <span class="func-save-status" data-save-status>Saved</span>
                     </div>
                     <div class="func-doc-body" contenteditable="true"
@@ -4974,6 +6200,8 @@ const UIEngine = {
         if (core.kind === 'spreadsheet') {
             const info = core.info || {};
             const name = String(info.name || 'New Spreadsheet').trim();
+            const branch = String(info.branch || this.state.session.workspace?.activeContent?.branch || 'main').trim();
+            const hash = String(info.hash || this.state.session.workspace?.activeContent?.hash || '').trim();
             const COLS = ['A','B','C','D','E','F','G','H'];
             const ROWS = 20;
             const thHtml = `<th class="row-num-head"></th>` + COLS.map((c) => `<th>${c}</th>`).join('');
@@ -4988,6 +6216,8 @@ const UIEngine = {
                         <span class="func-cell-ref" data-cell-ref>A1</span>
                         <input class="func-formula-bar" data-formula-bar placeholder="Value or formula…" />
                         <span class="func-doc-name">${escapeHtml(name)}</span>
+                        <button class="func-branch-badge" type="button" data-repo-branch="1" data-repo-domain="spreadsheet" data-repo-name="${escapeAttr(name)}" data-repo-branch="${escapeAttr(branch)}">${escapeHtml(branch)}</button>
+                        <button class="func-hash-badge" type="button" data-repo-history="1" data-repo-domain="spreadsheet" data-repo-name="${escapeAttr(name)}">${escapeHtml(hash ? hash.slice(0, 8) : 'new')}</button>
                         <span class="func-save-status" data-save-status>Saved</span>
                     </div>
                     <div class="func-sheet-wrap">
@@ -5004,6 +6234,8 @@ const UIEngine = {
             const name  = String(info.name  || '').trim();
             const topic = String(info.topic || '').trim();
             const title = name || topic || 'New Presentation';
+            const branch = String(info.branch || this.state.session.workspace?.activeContent?.branch || 'main').trim();
+            const hash = String(info.hash || this.state.session.workspace?.activeContent?.hash || '').trim();
             // One starter slide
             const thumbHtml = `<div class="func-pres-thumb-wrap">
                 <div class="func-pres-thumb active" data-slide-index="0"></div>
@@ -5016,6 +6248,8 @@ const UIEngine = {
                         <button data-slide-cmd="add" title="Add slide">+ Slide</button>
                         <button data-slide-cmd="delete" title="Delete slide">Delete</button>
                         <span class="func-doc-name">${escapeHtml(title)}</span>
+                        <button class="func-branch-badge" type="button" data-repo-branch="1" data-repo-domain="presentation" data-repo-name="${escapeAttr(name || title)}" data-repo-branch="${escapeAttr(branch)}">${escapeHtml(branch)}</button>
+                        <button class="func-hash-badge" type="button" data-repo-history="1" data-repo-domain="presentation" data-repo-name="${escapeAttr(name || title)}">${escapeHtml(hash ? hash.slice(0, 8) : 'new')}</button>
                         <span class="func-save-status" data-save-status>Saved</span>
                     </div>
                     <div class="func-pres-wrap">
@@ -5076,17 +6310,24 @@ const UIEngine = {
         }
         if (core.kind === 'calendar') {
             const info   = core.info || {};
+            if (info.notConnected) {
+                return `<div class="scene scene-computer scene-calendar interactive">
+                    <canvas class="scene-canvas computer-canvas" data-scene="calendar"></canvas>
+                    <div class="cal-shell">
+                        <div class="connector-cta">
+                            <div class="connector-cta-label">Google Calendar not connected</div>
+                            <button class="connector-cta-btn" data-oauth-connect="${escapeAttr(info.service || 'gcal')}">Connect Calendar</button>
+                            <button class="connector-cta-btn" type="button" data-scene-domain="connectors">Open connections</button>
+                        </div>
+                    </div>
+                </div>`;
+            }
             const action = String(info.action || 'list').trim();
             const title  = String(info.title  || '').trim();
             const date   = String(info.date   || 'today').trim();
             const isCreate = action === 'create';
             const connectorEvents = Array.isArray(info.events) ? info.events : [];
-            const events = connectorEvents.length ? connectorEvents : [
-                { time: '9:00',  label: 'Team standup'         },
-                { time: '11:00', label: 'Design review'        },
-                { time: '14:00', label: title || 'Focus block' },
-                { time: '16:30', label: 'Wrap-up sync'         },
-            ];
+            const events = connectorEvents;
             const focused = isCreate
                 ? { time: date, label: title || 'New Event' }
                 : (() => {
@@ -5110,7 +6351,7 @@ const UIEngine = {
                     <div class="cal-focus-time">${escapeHtml(focused.time)}</div>
                     <div class="cal-focus-title">${escapeHtml(focused.label)}</div>
                     ${isCreate ? '<div class="cal-creating">scheduling···</div>' : ''}
-                    <div class="cal-stream">${restHtml}</div>
+                    <div class="cal-stream">${!isCreate && !events.length ? '<div class="cnt-empty">No upcoming events available.</div>' : restHtml}</div>
                 </div>
             </div>`;
         }
@@ -5123,13 +6364,7 @@ const UIEngine = {
             const query   = String(info.query   || '').trim();
             const isCompose = action === 'compose' || action === 'reply';
             const connectorMessages = Array.isArray(info.messages) ? info.messages : [];
-            const msgs = connectorMessages.length ? connectorMessages : [
-                { from: 'Sarah Mitchell',    subject: 'Re: Project update',  snippet: "Looks great, let's sync tomorrow morning to go over the details.", date: '10:42 AM', unread: true  },
-                { from: 'Team Alerts',       subject: 'Daily digest',        snippet: 'Here is your summary for today.',   date: '8:01 AM',  unread: false },
-                { from: from || 'Mike T.',   subject: subject || query || 'Meeting notes', snippet: 'Attached are the notes from our call.', date: 'Yesterday', unread: action === 'reply' },
-                { from: 'Design Weekly',     subject: 'Issue #142',          snippet: 'This week in design systems...', date: 'Mon', unread: false },
-                { from: 'GitHub',            subject: 'New pull request',    snippet: 'A pull request was opened on your repo.', date: 'Mon', unread: false },
-            ];
+            const msgs = connectorMessages;
             const unread = msgs.filter(m => m.unread).length;
             const focused = msgs[0] || {};
             const streamHtml = msgs.slice(1, 5).map((m, i) => `
@@ -5138,7 +6373,23 @@ const UIEngine = {
                     <span class="email-stream-dot">·</span>
                     <span class="email-stream-subject">${escapeHtml(String(m.subject || '').slice(0, 48))}</span>
                 </div>`).join('');
-            const inboxHtml = `
+            const provider = String(info.provider || info.service || 'gmail').toLowerCase();
+            const providerLabel = provider === 'email' ? 'Email' : provider.charAt(0).toUpperCase() + provider.slice(1);
+            const notConnected = Boolean(info.notConnected);
+            const connectHtml = notConnected ? `
+                <div class="connector-cta">
+                    <div class="connector-cta-label">Connect your email</div>
+                    <input class="connector-email-input" type="email" placeholder="you@example.com" data-email-connect-input />
+                    <button class="connector-cta-btn" data-action="email-connect">Continue</button>
+                    <button class="connector-cta-btn" type="button" data-scene-domain="connectors">Open connections</button>
+                </div>` : '';
+            const emptyInboxHtml = `
+                <div class="email-unread-wrap">
+                    <div class="email-unread-value">0</div>
+                    <div class="email-unread-label">messages</div>
+                </div>
+                <div class="cnt-empty">${escapeHtml(info.error || `No live messages available from ${providerLabel}.`)}</div>`;
+            const inboxHtml = notConnected ? connectHtml : `
                 <div class="email-unread-wrap">
                     <div class="email-unread-value">${unread || msgs.length}</div>
                     <div class="email-unread-label">${unread ? 'unread' : 'messages'}</div>
@@ -5158,7 +6409,41 @@ const UIEngine = {
             return `<div class="scene scene-computer scene-email interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="email"></canvas>
                 <div class="email-shell ${isCompose ? 'email-shell--compose' : ''}">
-                    ${isCompose ? composeHtml : inboxHtml}
+                    ${isCompose ? composeHtml : (msgs.length ? inboxHtml : emptyInboxHtml)}
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'notifications') {
+            const info = core.info || {};
+            const items = Array.isArray(info.items) ? info.items : [];
+            const rows = items
+                .slice()
+                .sort((a, b) => Number(b.ts || b.createdAt || 0) - Number(a.ts || a.createdAt || 0))
+                .map((item) => {
+                    const ts = Number(item.ts || item.createdAt || 0);
+                    const time = ts ? formatDate(ts) : '';
+                    const title = String(item.title || item.type || 'Notification').trim();
+                    const message = String(item.message || '').trim();
+                    const route = String(item.route || '').trim();
+                    const severity = String(item.severity || 'info').trim() || 'info';
+                    return `
+                        <button class="cnt-hist-item ${item.read ? '' : 'current'}" type="button"${route ? ` data-command="${escapeAttr(route)}"` : ` data-scene-domain="notifications"`}>
+                            <div class="cnt-hist-ver">${escapeHtml(severity)}</div>
+                            <div class="cnt-hist-msg">${escapeHtml(title)}${message ? ` · ${escapeHtml(message)}` : ''}</div>
+                            <div class="cnt-hist-time">${escapeHtml(time)}</div>
+                        </button>`;
+                }).join('');
+            const sourceLabel = info.source === 'live' ? 'runtime inbox' : String(info.source || 'notifications').trim();
+            return `<div class="scene scene-computer scene-content interactive">
+                <canvas class="scene-canvas computer-canvas" data-scene="notifications"></canvas>
+                <div class="cnt-shell">
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">notifications</div>
+                        <div class="cnt-type-badge">${escapeHtml(sourceLabel)}</div>
+                        <button class="cnt-type-badge" type="button" data-notifications-mark-read="all">mark read</button>
+                        <button class="cnt-type-badge" type="button" data-notifications-clear="all">clear</button>
+                    </div>
+                    <div class="cnt-history">${rows || '<div class="cnt-empty">No runtime notifications yet.</div>'}</div>
                 </div>
             </div>`;
         }
@@ -5167,47 +6452,136 @@ const UIEngine = {
             const action   = String(info.action || 'find').trim();
             const name     = String(info.name   || '').trim();
             const type     = String(info.type   || '').trim();
-            const isHistory = ['history', 'branch', 'revert'].includes(action);
-            const listItems = [
-                { name: name || 'Q4 Report',       type: type || 'document',     ver: 'v3', time: '2h ago'   },
-                { name: 'Budget 2026',             type: 'spreadsheet',           ver: 'v7', time: 'yesterday'},
-                { name: 'Product Roadmap',         type: 'presentation',          ver: 'v2', time: '3d ago'  },
-            ];
-            const histItems = [
-                { ver: 'HEAD', msg: 'Latest revision',         time: 'now',       current: true  },
-                { ver: 'v3',   msg: 'Updated section 2',       time: '2h ago',    current: false },
-                { ver: 'v2',   msg: 'Added executive summary', time: 'yesterday', current: false },
-                { ver: 'v1',   msg: 'Initial draft',           time: '3d ago',    current: false },
-            ];
+            const isHistory = ['history', 'branch', 'merge', 'revert'].includes(action);
+            const isWorktrees = action === 'worktrees';
+            const listItems = Array.isArray(info.items) ? info.items : [];
+            const histItems = Array.isArray(info.history) ? info.history : [];
+            const branchItems = Array.isArray(info.branches) ? info.branches : [];
+            const workspace = this.state.session.workspace || {};
+            const rawWorktrees = Array.isArray(info.worktrees)
+                ? info.worktrees
+                : Object.values((workspace.worktrees && typeof workspace.worktrees === 'object') ? workspace.worktrees : {});
+            const worktreeItems = rawWorktrees;
+            const activeItemId = String(workspace.activeContent?.itemId || '');
+            const runtimeFocus = (info.runtimeFocus && typeof info.runtimeFocus === 'object') ? info.runtimeFocus : ((workspace.activeContent && typeof workspace.activeContent === 'object') ? workspace.activeContent : null);
+            const presence = (info.presence && typeof info.presence === 'object') ? info.presence : (this.state.session.presence || {});
+            const handoff = (info.handoff && typeof info.handoff === 'object') ? info.handoff : (this.state.session.handoff || {});
+            const attachedIds = new Set(worktreeItems.map((item) => String(item?.itemId || '')));
+            const repoTime = (value) => {
+                const n = Number(value || 0);
+                if (!n) return '';
+                return formatDate(n < 1e12 ? n * 1000 : n);
+            };
+            const activeDevices = Number(presence.activeCount || presence.count || 0);
+            const runtimeHtml = `
+                <div class="cnt-header">
+                    <div class="cnt-action-badge">runtime</div>
+                    ${workspace?.repoId ? `<div class="cnt-type-badge">${escapeHtml(String(workspace.repoId || 'user-global'))}</div>` : ''}
+                    ${runtimeFocus?.name ? `<div class="cnt-type-badge">${escapeHtml(String(runtimeFocus.name || ''))}</div>` : ''}
+                    ${runtimeFocus?.branch ? `<div class="cnt-type-badge">${escapeHtml(String(runtimeFocus.branch || 'main'))}</div>` : ''}
+                    <div class="cnt-type-badge">${escapeHtml(String(activeDevices))} active</div>
+                    ${handoff?.activeDeviceId ? `<div class="cnt-type-badge">${escapeHtml(String(handoff.activeDeviceId))}</div>` : ''}
+                </div>`;
             const listHtml = listItems.map((item) => `
                 <div class="cnt-item">
-                    <div class="cnt-item-icon ${escapeAttr(item.type)}"></div>
-                    <div class="cnt-item-name">${escapeHtml(item.name)}</div>
-                    <div class="cnt-item-type">${escapeHtml(item.type)}</div>
-                    <div class="cnt-item-ver">${escapeHtml(item.ver)}</div>
-                    <div class="cnt-item-time">${escapeHtml(item.time)}</div>
+                    <div class="cnt-item-icon ${escapeAttr(String(item.domain || item.type || 'content'))}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.name || 'Untitled'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.headMessage || item.summary || item.domain || item.type || 'content').slice(0, 72))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.branch || 'main'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(repoTime(item.updated_at))}</div>
+                    <span class="cnt-type-badge">${attachedIds.has(String(item.itemId || '')) ? 'attached' : 'repo'}</span>
+                    ${Number(item.revisionCount || 0) > 0 ? `<span class="cnt-type-badge">${escapeHtml(String(item.revisionCount || 0))} rev</span>` : ''}
+                    ${Number(item.branchCount || 0) > 1 ? `<span class="cnt-type-badge">${escapeHtml(String(item.branchCount || 0))} branches</span>` : ''}
+                    ${Number(item.attachedSessions || 0) > 0 ? `<span class="cnt-type-badge">${escapeHtml(String(item.attachedSessions || 0))} mounted</span>` : ''}
+                    <button class="cnt-type-badge" type="button" data-shell-object-kind="repo" data-shell-object-domain="${escapeAttr(String(item.domain || item.type || 'content'))}" data-shell-object-name="${escapeAttr(String(item.name || 'Untitled'))}" data-shell-object-branch="${escapeAttr(String(item.branch || 'main'))}" data-shell-object-item-id="${escapeAttr(String(item.itemId || ''))}">open</button>
+                    ${attachedIds.has(String(item.itemId || ''))
+                        ? ''
+                        : `<button class="cnt-type-badge" type="button" data-worktree-attach="1" data-worktree-domain="${escapeAttr(String(item.domain || item.type || 'content'))}" data-worktree-name="${escapeAttr(String(item.name || 'Untitled'))}" data-worktree-branch="${escapeAttr(String(item.branch || 'main'))}">attach</button>`}
                 </div>`).join('');
             const histHtml = histItems.map((item) => `
-                <div class="cnt-hist-item ${item.current ? 'current' : ''}">
-                    <div class="cnt-hist-ver">${escapeHtml(item.ver)}</div>
-                    <div class="cnt-hist-msg">${escapeHtml(item.msg)}</div>
-                    <div class="cnt-hist-time">${escapeHtml(item.time)}</div>
+                <button class="cnt-hist-item ${item.current ? 'current' : ''}" type="button"${!item.current && name ? ` data-repo-revert="${escapeAttr(String(item.hash || ''))}" data-repo-domain="${escapeAttr(type || 'document')}" data-repo-name="${escapeAttr(name)}"` : (name ? ` data-repo-history="1" data-repo-domain="${escapeAttr(type || 'document')}" data-repo-name="${escapeAttr(name)}"` : ` data-scene-domain="content"`)}>
+                    <div class="cnt-hist-ver">${escapeHtml(String(item.hash || 'HEAD').slice(0, 8))}</div>
+                    <div class="cnt-hist-msg">${escapeHtml(String(item.message || 'Revision'))}</div>
+                    <div class="cnt-hist-time">${escapeHtml(repoTime(item.createdAt || item.created_at))}</div>
+                </button>`).join('');
+            const branchesHtml = branchItems.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${escapeAttr(type || 'content')}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.branch || 'main'))}${item.isDefault ? ' *' : ''}</div>
+                    <div class="cnt-item-type">branch</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.hash || '').slice(0, 8) || 'HEAD')}</div>
+                    <div class="cnt-item-time">${escapeHtml(repoTime(item.updated_at))}</div>
+                    <button class="cnt-type-badge" type="button" data-repo-branch="1" data-repo-domain="${escapeAttr(type || 'document')}" data-repo-name="${escapeAttr(name)}" data-repo-branch="${escapeAttr(String(item.branch || 'main'))}">switch</button>
+                    ${String(item.branch || 'main') !== String(info.branch || 'main')
+                        ? `<button class="cnt-type-badge" type="button" data-repo-merge="${escapeAttr(String(item.branch || 'main'))}" data-repo-domain="${escapeAttr(type || 'document')}" data-repo-name="${escapeAttr(name)}" data-repo-target-branch="${escapeAttr(String(info.branch || 'main'))}">merge</button>`
+                        : ''}
                 </div>`).join('');
+            const worktreesHtml = worktreeItems.map((item) => `
+                <div class="cnt-item${String(item.itemId || '') === activeItemId || item.active ? ' current' : ''}">
+                    <div class="cnt-item-icon ${escapeAttr(String(item.domain || 'content'))}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.name || 'Untitled'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.domain || 'content'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.branch || 'main'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(repoTime(item.updatedAt))}</div>
+                    <button class="cnt-type-badge" type="button" data-shell-object-kind="worktree" data-shell-object-item-id="${escapeAttr(String(item.itemId || ''))}" data-shell-object-domain="${escapeAttr(String(item.domain || ''))}" data-shell-object-name="${escapeAttr(String(item.name || ''))}" data-shell-object-branch="${escapeAttr(String(item.branch || 'main'))}">open</button>
+                    <button class="cnt-type-badge" type="button" data-worktree-detach="${escapeAttr(String(item.itemId || ''))}">detach</button>
+                </div>`).join('');
+            const emptyHtml = isHistory
+                ? `<div class="cnt-empty">${escapeHtml(name ? `No stored revisions for ${name}.` : 'No stored revisions yet.')}</div>`
+                : `<div class="cnt-empty">${escapeHtml(info.query ? `No content matched "${info.query}".` : 'No repo objects found yet.')}</div>`;
+            const authorityHtml = info.authoritative === false
+                ? `<div class="cnt-empty">${escapeHtml(info.error || info.fallbackReason || 'This surface is not authoritative.')}</div>`
+                : '';
+            const branchPanelHtml = name && type
+                ? `<div class="cnt-history">${branchesHtml || '<div class="cnt-empty">No branches yet.</div>'}</div>`
+                : '';
+            const worktreePanelHtml = `<div class="cnt-history">${worktreesHtml || '<div class="cnt-empty">No attached worktrees in this session.</div>'}</div>`;
             return `<div class="scene scene-computer scene-content interactive">
                 <canvas class="scene-canvas computer-canvas" data-scene="content"></canvas>
                 <div class="cnt-shell">
                     <div class="cnt-header">
                         <div class="cnt-action-badge">${escapeHtml(action)}</div>
                         ${type ? `<div class="cnt-type-badge">${escapeHtml(type)}</div>` : ''}
+                        ${info.branch ? `<div class="cnt-type-badge">${escapeHtml(String(info.branch))}</div>` : ''}
+                        ${info.mergedFromBranch ? `<div class="cnt-type-badge">from ${escapeHtml(String(info.mergedFromBranch))}</div>` : ''}
+                        <div class="cnt-type-badge">${escapeHtml(String(info.source || 'live'))}</div>
+                        <div class="cnt-type-badge">${info.authoritative === false ? 'non-authoritative' : 'authoritative'}</div>
                         ${name ? `<div class="cnt-name">${escapeHtml(name)}</div>` : ''}
+                        ${name && type ? `<button class="cnt-type-badge" type="button" data-repo-branch="1" data-repo-domain="${escapeAttr(type)}" data-repo-name="${escapeAttr(name)}" data-repo-branch="${escapeAttr(String(info.branch || 'main'))}">branch</button>` : ''}
+                        ${name && type ? `<button class="cnt-type-badge" type="button" data-repo-history="1" data-repo-domain="${escapeAttr(type)}" data-repo-name="${escapeAttr(name)}">history</button>` : ''}
+                        <button class="cnt-type-badge" type="button" data-repo-worktrees="1">worktrees</button>
+                        ${info.authoritative === false ? `<button class="cnt-type-badge" type="button" data-scene-domain="connectors">connections</button>` : ''}
                     </div>
-                    ${isHistory ? `<div class="cnt-history">${histHtml}</div>` : `<div class="cnt-list">${listHtml}</div>`}
+                    ${authorityHtml}
+                    ${runtimeHtml}
+                    ${!isWorktrees && name && type ? `<div class="cnt-header"><div class="cnt-action-badge">branches</div></div>${branchPanelHtml}` : ''}
+                    ${!isWorktrees ? `<div class="cnt-header"><div class="cnt-action-badge">worktrees</div></div>${worktreePanelHtml}` : ''}
+                    ${isWorktrees
+                        ? `<div class="cnt-list">${worktreesHtml || '<div class="cnt-empty">No attached worktrees in this session.</div>'}</div>`
+                        : isHistory
+                        ? `<div class="cnt-history">${histHtml || emptyHtml}</div>`
+                        : `<div class="cnt-list">${listHtml || emptyHtml}</div>`}
                 </div>
             </div>`;
         }
         // ── Music / Spotify scene ──────────────────────────────────────────────
         if (core.kind === 'music') {
             const info     = core.info || {};
+            if (info.notConnected) {
+                const label = info.fallbackReason === 'no_active_device'
+                    ? 'Open Spotify on a device, then try again'
+                    : 'Connect Spotify to view playback';
+                return `<div class="scene scene-music interactive">
+                    <canvas class="scene-canvas music-canvas" data-scene="music"></canvas>
+                    <div class="music-shell">
+                        <div class="connector-cta">
+                            <div class="connector-cta-label">${escapeHtml(label)}</div>
+                            <button class="connector-cta-btn" data-oauth-connect="${escapeAttr(String(info.service || 'spotify'))}">Connect Spotify</button>
+                            <button class="connector-cta-btn" type="button" data-scene-domain="connectors">Open connections</button>
+                        </div>
+                    </div>
+                </div>`;
+            }
             const track    = String(info.track    || '').trim();
             const artist   = String(info.artist   || '').trim();
             const albumArt = String(info.album_art || '').trim();
@@ -5238,6 +6612,18 @@ const UIEngine = {
         // ── Messaging / Slack scene ────────────────────────────────────────────
         if (core.kind === 'messaging') {
             const info     = core.info || {};
+            if (info.notConnected) {
+                return `<div class="scene scene-messaging interactive">
+                    <canvas class="scene-canvas messaging-canvas" data-scene="messaging"></canvas>
+                    <div class="msg-shell">
+                        <div class="connector-cta">
+                            <div class="connector-cta-label">Connect Slack to view channels</div>
+                            <button class="connector-cta-btn" data-oauth-connect="${escapeAttr(String(info.service || 'slack'))}">Connect Slack</button>
+                            <button class="connector-cta-btn" type="button" data-scene-domain="connectors">Open connections</button>
+                        </div>
+                    </div>
+                </div>`;
+            }
             const channels = Array.isArray(info.channels) ? info.channels : [];
             const messages = Array.isArray(info.messages) ? info.messages : [];
             const unread   = Number(info.unread || channels.reduce((s, c) => s + Number(c.unread_count || 0), 0));
@@ -5263,7 +6649,7 @@ const UIEngine = {
                     <div class="msg-hero">${unread || 0}</div>
                     <div class="msg-hero-label">unread${channels.length > 0 ? ` across ${channels.length} channels` : ''}</div>
                     ${focusName ? `<div class="msg-focus"><span class="msg-focus-hash">#</span><span class="msg-focus-name">${escapeHtml(focusName)}</span>${focusedUnread > 0 ? `<span class="msg-focus-count">${focusedUnread}</span>` : ''}</div>` : ''}
-                    ${streamItems ? `<div class="msg-stream">${streamItems}</div>` : ''}
+                    ${streamItems ? `<div class="msg-stream">${streamItems}</div>` : '<div class="cnt-empty">No live messages available.</div>'}
                 </div>
             </div>`;
         }
@@ -5321,6 +6707,15 @@ const UIEngine = {
         if (core.kind === 'connections') {
             const info     = core.info || {};
             const services = (info.services && typeof info.services === 'object') ? info.services : {};
+            const grants = Array.isArray(info.grants) ? info.grants : [];
+            const grantsSummary = (info.grantsSummary && typeof info.grantsSummary === 'object') ? info.grantsSummary : {};
+            const providers = (info.providers && typeof info.providers === 'object') ? info.providers : {};
+            const contracts = (info.contracts && typeof info.contracts === 'object') ? info.contracts : {};
+            const serviceDiagnostics = (info.serviceDiagnostics && typeof info.serviceDiagnostics === 'object') ? info.serviceDiagnostics : null;
+            const focusedServiceInfo = (serviceDiagnostics?.serviceInfo && typeof serviceDiagnostics.serviceInfo === 'object') ? serviceDiagnostics.serviceInfo : {};
+            const focusedSnapshot = (serviceDiagnostics?.snapshot && typeof serviceDiagnostics.snapshot === 'object') ? serviceDiagnostics.snapshot : {};
+            const focusedGrants = Array.isArray(serviceDiagnostics?.relevantGrants) ? serviceDiagnostics.relevantGrants : [];
+            const focusedActions = Array.isArray(serviceDiagnostics?.actions) ? serviceDiagnostics.actions : [];
             const _mkLogoUri = svg => `data:image/svg+xml,${encodeURIComponent(svg)}`;
             const _svcMeta = {
                 spotify: { logo: 'https://cdn.simpleicons.org/spotify/ffffff',        label: 'Spotify',         desc: 'Music streaming' },
@@ -5336,27 +6731,822 @@ const UIEngine = {
                 const connected = Boolean(svc.connected);
                 const configured = svc.configured !== false;
                 const mode = String(svc.mode || 'scaffold');
-                const statusLabel = connected ? `connected · ${mode}` : 'not connected';
+                const statusCode = String(svc.status || (connected ? 'connected' : (configured ? 'ready_to_connect' : 'credentials_required')));
+                const statusLabel = connected ? `connected · ${mode}` : statusCode.replace(/_/g, ' ');
+                const detail = String(svc.detail || '').trim();
+                const fallbackReason = String(svc.fallbackReason || '').trim();
+                const lastError = String(svc.lastError || '').trim();
+                const authoritative = svc.authoritative !== false;
+                const sampleCount = Number(svc.sampleCount || 0);
+                const requiredScopes = Array.isArray(svc.requiredScopes) ? svc.requiredScopes.filter(Boolean) : [];
+                const riskLevels = Array.isArray(svc.riskLevels) ? svc.riskLevels.filter(Boolean) : [];
+                const domainLabel = String(svc.domain || '').trim();
+                const providerId = String(svc.providerId || '').trim();
+                const surfaceByService = { gmail: 'email', gcal: 'calendar', gdrive: 'drive', slack: 'messaging', spotify: 'music', plaid: 'connections' };
+                const liveSurface = surfaceByService[svcId] || 'connections';
+                const openButton = connected
+                    ? `<button class="conn-card-btn" type="button" data-live-surface="${escapeAttr(liveSurface)}">open</button>`
+                    : '';
+                const inspectButton = `<button class="conn-card-btn" type="button" data-connector-inspect="${escapeAttr(svcId)}">inspect</button>`;
                 const cardFooter = connected
-                    ? `<button class="conn-card-btn" type="button" data-oauth-disconnect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}">disconnect</button>`
-                    : `<button class="conn-card-btn" type="button" data-oauth-connect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}"${!configured ? ' data-oauth-needs-creds="1"' : ''}>connect</button>`;
+                    ? `${inspectButton}${openButton}<button class="conn-card-btn" type="button" data-oauth-disconnect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}">disconnect</button>`
+                    : `${inspectButton}<button class="conn-card-btn" type="button" data-oauth-connect="${escapeAttr(svcId)}" data-auth-token="${escapeAttr(token)}"${!configured ? ' data-oauth-needs-creds="1"' : ''}>connect</button>`;
                 return `<div class="conn-card ${connected ? 'conn-card--live' : ''}" data-card-svc="${escapeAttr(svcId)}">
                     <img class="conn-card-logo" src="${meta.logo}" alt="${escapeHtml(meta.label)}" width="36" height="36">
                     <div class="conn-card-name">${escapeHtml(meta.label)}</div>
                     <div class="conn-card-desc">${escapeHtml(meta.desc)}</div>
-                    <div class="conn-card-status">${escapeHtml(statusLabel)}</div>
+                    <div class="conn-card-status">${escapeHtml(authoritative ? statusLabel : `${statusLabel} · degraded`)}</div>
+                    ${(domainLabel || providerId) ? `<div class="conn-card-desc">${escapeHtml([domainLabel, providerId].filter(Boolean).join(' · '))}</div>` : ''}
+                    ${requiredScopes.length ? `<div class="conn-card-desc">${escapeHtml(String(requiredScopes.length))} scopes${riskLevels.length ? ` · ${riskLevels.join('/')}` : ''}</div>` : ''}
+                    ${detail ? `<div class="conn-card-desc">${escapeHtml(detail)}</div>` : ''}
+                    ${sampleCount > 0 ? `<div class="conn-card-desc">${escapeHtml(String(sampleCount))} live items detected</div>` : ''}
+                    ${fallbackReason ? `<div class="conn-card-desc">${escapeHtml(fallbackReason.replace(/_/g, ' '))}</div>` : ''}
+                    ${lastError ? `<div class="conn-card-desc">${escapeHtml(lastError)}</div>` : ''}
                     ${cardFooter}
                 </div>`;
             }).join('');
+            const grantsHtml = grants.slice(0, 10).map((item) => {
+                const scope = String(item.scope || '').trim();
+                const granted = Boolean(item.granted);
+                const expiresAt = Number(item.expiresAt || 0);
+                const expiry = expiresAt ? formatDate(expiresAt) : '';
+                const domains = Array.isArray(item.domains) ? item.domains.filter(Boolean) : [];
+                const providers = Array.isArray(item.providers) ? item.providers.filter(Boolean) : [];
+                const capabilities = Array.isArray(item.capabilities) ? item.capabilities.filter(Boolean) : [];
+                const risk = String(item.risk || '').trim();
+                const support = String(item.support || '').trim();
+                const capabilityLabel = capabilities.length
+                    ? `${capabilities.length} capability${capabilities.length === 1 ? '' : 'ies'}`
+                    : '';
+                const metaLine = [domains.join(', '), providers.join(', '), risk ? `risk ${risk}` : '', support].filter(Boolean).join(' · ');
+                return `<div class="cnt-item">
+                    <div class="cnt-item-icon ${granted ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(scope || 'scope')}</div>
+                    <div class="cnt-item-type">${granted ? 'granted' : 'blocked'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(metaLine || expiry || 'persistent')}</div>
+                    <div class="cnt-item-time"></div>
+                    ${granted
+                        ? `<button class="cnt-type-badge" type="button" data-connector-revoke="${escapeAttr(scope)}">revoke</button>`
+                        : `<button class="cnt-type-badge" type="button" data-connector-grant="${escapeAttr(scope)}">grant</button>`}
+                </div>`;
+            }).join('');
+            const targetSvc = String(info.targetService || '').trim();
+            const autoConnect = targetSvc && _svcMeta[targetSvc] && !(services[targetSvc]?.connected) ? targetSvc : '';
+            const focusedSampleRows = (Array.isArray(focusedSnapshot.sampleItems) ? focusedSnapshot.sampleItems : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon document"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.label || 'item'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.type || 'sample'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.detail || '').slice(0, 96))}</div>
+                    <div class="cnt-item-time">${escapeHtml(String(item.time || ''))}</div>
+                </div>`).join('');
+            const focusedGrantRows = focusedGrants.slice(0, 8).map((item) => {
+                const scope = String(item.scope || '').trim();
+                const granted = Boolean(item.granted);
+                const risk = String(item.risk || '').trim();
+                const support = String(item.support || '').trim();
+                const metaLine = [risk ? `risk ${risk}` : '', support].filter(Boolean).join(' Â· ');
+                return `<div class="cnt-item">
+                    <div class="cnt-item-icon ${granted ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(scope || 'scope')}</div>
+                    <div class="cnt-item-type">${granted ? 'granted' : 'blocked'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(metaLine || 'connector scope')}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`;
+            }).join('');
+            const focusedActionButtons = focusedActions.map((item) => {
+                const id = String(item.id || '').trim();
+                const label = String(item.label || id || 'action').trim();
+                const surface = String(item.surface || '').trim();
+                if (id === 'open' && surface) return `<button class="cnt-type-badge" type="button" data-shell-object-kind="service" data-shell-object-service="${escapeAttr(String(serviceDiagnostics?.service || ''))}">${escapeHtml(label)}</button>`;
+                if (id === 'disconnect') return `<button class="cnt-type-badge" type="button" data-oauth-disconnect="${escapeAttr(String(serviceDiagnostics?.service || ''))}">${escapeHtml(label)}</button>`;
+                if (id === 'connect') return `<button class="cnt-type-badge" type="button" data-oauth-connect="${escapeAttr(String(serviceDiagnostics?.service || ''))}"${focusedServiceInfo.configured === false ? ' data-oauth-needs-creds="1"' : ''}>${escapeHtml(label)}</button>`;
+                if (surface) return `<button class="cnt-type-badge" type="button" data-shell-object-kind="scene" data-shell-object-scene="${escapeAttr(surface)}">${escapeHtml(label)}</button>`;
+                return '';
+            }).filter(Boolean).join('');
+            const providerRows = Object.entries(providers).slice(0, 12).map(([key, item]) => {
+                const provider = (item && typeof item === 'object') ? item : {};
+                const mode = String(provider.mode || 'unknown').trim();
+                const execution = String(provider.execution || '').trim();
+                const configured = provider.configured === false ? 'unconfigured' : (provider.configured === true ? 'configured' : '');
+                const meta = [execution, configured].filter(Boolean).join(' · ');
+                return `<div class="cnt-item">
+                    <div class="cnt-item-icon ${mode === 'live' ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(key || 'provider'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(mode)}</div>
+                    <div class="cnt-item-ver">${escapeHtml(meta || 'provider policy')}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`;
+            }).join('');
+            const contractRows = Object.entries(contracts).slice(0, 16).map(([key, item]) => {
+                const contract = (item && typeof item === 'object') ? item : {};
+                const desktop = String(contract.desktop || '').trim();
+                const mobile = String(contract.mobile || '').trim();
+                const fallback = String(contract.fallback || '').trim();
+                const meta = [desktop ? `desktop ${desktop}` : '', mobile ? `mobile ${mobile}` : '', fallback ? `fallback ${fallback}` : '']
+                    .filter(Boolean)
+                    .join(' · ');
+                return `<div class="cnt-item">
+                    <div class="cnt-item-icon document"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(key || 'contract'))}</div>
+                    <div class="cnt-item-type">contract</div>
+                    <div class="cnt-item-ver">${escapeHtml(meta || 'adapter contract')}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`;
+            }).join('');
+            return `<div class="scene scene-connections interactive"${autoConnect ? ` data-auto-connect="${escapeAttr(autoConnect)}"` : ''}>
+                <canvas class="scene-canvas domain-canvas" data-scene="connections"></canvas>
+                <div class="connections-shell">
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">connector state</div>
+                        <div class="cnt-type-badge">${escapeHtml(String(grantsSummary.granted || 0))}/${escapeHtml(String(grantsSummary.count || grants.length || 0))} grants</div>
+                        ${targetSvc ? `<div class="cnt-type-badge">${escapeHtml(targetSvc)}</div>` : ''}
+                    </div>
+                    <div class="connections-grid">${cardsHtml}</div>
+                    ${serviceDiagnostics ? `
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">service detail</div>
+                        <div class="cnt-type-badge">${escapeHtml(String(focusedServiceInfo.label || serviceDiagnostics.service || 'connector'))}</div>
+                        <div class="cnt-type-badge">${focusedServiceInfo.authoritative === false ? 'degraded' : 'authoritative'}</div>
+                        <button class="cnt-type-badge" type="button" data-shell-object-kind="scene" data-shell-object-scene="connectors">all services</button>
+                        ${focusedActionButtons}
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${focusedServiceInfo.connected ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">status</div>
+                            <div class="cnt-item-type">${escapeHtml(String(focusedServiceInfo.status || 'unknown').replace(/_/g, ' '))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(focusedServiceInfo.detail || focusedSnapshot.error || ''))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(focusedServiceInfo.sampleCount || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">live samples</div>
+                            <div class="cnt-item-type">${escapeHtml(String(focusedSnapshot.source || focusedServiceInfo.mode || 'live'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(focusedServiceInfo.sampleCount || 0))} items</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">provider</div>
+                            <div class="cnt-item-type">${escapeHtml(String(focusedServiceInfo.providerId || 'connector'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(focusedServiceInfo.domain || ''))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${focusedServiceInfo.lastError ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">fallback</div>
+                            <div class="cnt-item-type">${escapeHtml(String(focusedServiceInfo.fallbackReason || 'none').replace(/_/g, ' '))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(focusedServiceInfo.lastError || 'steady'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">sample items</div>
+                    </div>
+                    <div class="cnt-history">${focusedSampleRows || '<div class="cnt-empty">No live sample items available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">relevant grants</div>
+                    </div>
+                    <div class="cnt-history">${focusedGrantRows || '<div class="cnt-empty">No relevant grants found for this service.</div>'}</div>` : ''}
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">provider modes</div>
+                    </div>
+                    <div class="cnt-history">${providerRows || '<div class="cnt-empty">No provider modes available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">adapter contracts</div>
+                    </div>
+                    <div class="cnt-history">${contractRows || '<div class="cnt-empty">No connector contracts available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">capability grants</div>
+                    </div>
+                    <div class="cnt-history">${grantsHtml || '<div class="cnt-empty">No connector grant catalog available.</div>'}</div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'runtime') {
+            const info = core.info || {};
+            const health = (info.health && typeof info.health === 'object') ? info.health : {};
+            const selfCheck = (info.selfCheck && typeof info.selfCheck === 'object') ? info.selfCheck : {};
+            const profile = (info.profile && typeof info.profile === 'object') ? info.profile : {};
+            const services = (info.services && typeof info.services === 'object') ? info.services : {};
+            const diagnostics = (info.diagnostics && typeof info.diagnostics === 'object') ? info.diagnostics : {};
+            const perf = (health.performance && typeof health.performance === 'object') ? health.performance : {};
+            const jobs = (health.jobs && typeof health.jobs === 'object') ? health.jobs : {};
+            const deadLetters = (health.deadLetters && typeof health.deadLetters === 'object') ? health.deadLetters : {};
+            const runtimeWorkspace = (health.workspace && typeof health.workspace === 'object') ? health.workspace : {};
+            const runtimeActive = (runtimeWorkspace.activeContent && typeof runtimeWorkspace.activeContent === 'object')
+                ? runtimeWorkspace.activeContent
+                : {};
+            const slo = (health.slo && typeof health.slo === 'object') ? health.slo : {};
+            const sloAlerts = Array.isArray(slo.alerts) ? slo.alerts : [];
+            const latency = (profile.latencyMs && typeof profile.latencyMs === 'object') ? profile.latencyMs : {};
+            const outcomes = (profile.outcomes && typeof profile.outcomes === 'object') ? profile.outcomes : {};
+            const continuityNext = (diagnostics.continuityNext && typeof diagnostics.continuityNext === 'object') ? diagnostics.continuityNext : {};
+            const autopilotSummary = (diagnostics.continuityAutopilot && typeof diagnostics.continuityAutopilot === 'object') ? diagnostics.continuityAutopilot : {};
+            const autopilotPreview = (diagnostics.continuityAutopilotPreview && typeof diagnostics.continuityAutopilotPreview === 'object') ? diagnostics.continuityAutopilotPreview : {};
+            const autopilotGuardrails = (diagnostics.continuityAutopilotGuardrails && typeof diagnostics.continuityAutopilotGuardrails === 'object') ? diagnostics.continuityAutopilotGuardrails : {};
+            const autopilotMode = (diagnostics.continuityAutopilotMode && typeof diagnostics.continuityAutopilotMode === 'object') ? diagnostics.continuityAutopilotMode : {};
+            const autopilotDrift = (diagnostics.continuityAutopilotDrift && typeof diagnostics.continuityAutopilotDrift === 'object') ? diagnostics.continuityAutopilotDrift : {};
+            const autopilotAlignment = (diagnostics.continuityAutopilotAlignment && typeof diagnostics.continuityAutopilotAlignment === 'object') ? diagnostics.continuityAutopilotAlignment : {};
+            const postureActions = (diagnostics.continuityAutopilotPostureActions && typeof diagnostics.continuityAutopilotPostureActions === 'object') ? diagnostics.continuityAutopilotPostureActions : {};
+            const postureActionMetrics = (diagnostics.continuityAutopilotPostureActionMetrics && typeof diagnostics.continuityAutopilotPostureActionMetrics === 'object') ? diagnostics.continuityAutopilotPostureActionMetrics : {};
+            const checks = Array.isArray(selfCheck.checks) ? selfCheck.checks : [];
+            const previewInfo = (autopilotPreview.preview && typeof autopilotPreview.preview === 'object') ? autopilotPreview.preview : {};
+            const driftSummary = (autopilotDrift.summary && typeof autopilotDrift.summary === 'object') ? autopilotDrift.summary : {};
+            const alignmentSummary = (autopilotAlignment.summary && typeof autopilotAlignment.summary === 'object') ? autopilotAlignment.summary : {};
+            const checksHtml = checks.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.ok ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.name || 'check'))}</div>
+                    <div class="cnt-item-type">${item.ok ? 'ok' : 'degraded'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.detail || ''))}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`).join('');
+            const serviceRows = Object.entries(services).map(([key, item]) => {
+                const svc = (item && typeof item === 'object') ? item : {};
+                return `<div class="cnt-item">
+                    <div class="cnt-item-icon ${svc.running ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(svc.label || key))}</div>
+                    <div class="cnt-item-type">${svc.running ? 'running' : 'down'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(svc.detail || ''))}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`;
+            }).join('');
+            const postureRows = (Array.isArray(postureActions.items) ? postureActions.items : []).map((item, index) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${String(item.priority || 'p2').toLowerCase() === 'p0' ? 'generic' : 'document'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.title || 'action'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.priority || 'p2'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.reason || item.command || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time"></div>
+                    <button class="cnt-type-badge" type="button" data-continuity-posture-apply="${index + 1}">apply</button>
+                </div>`).join('');
             return `<div class="scene scene-connections interactive">
                 <canvas class="scene-canvas domain-canvas" data-scene="connections"></canvas>
                 <div class="connections-shell">
-                    <div class="connections-grid">${cardsHtml}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">runtime health</div>
+                        <div class="cnt-type-badge">${escapeHtml(String(perf.totalMs || latency.avg || 0))}ms</div>
+                        <div class="cnt-type-badge">${Boolean(selfCheck.overallOk) ? 'healthy' : 'degraded'}</div>
+                        <button class="cnt-type-badge" type="button" data-scene-domain="content">repo</button>
+                        <button class="cnt-type-badge" type="button" data-repo-worktrees="1">worktrees</button>
+                        <button class="cnt-type-badge" type="button" data-runtime-refresh="1">refresh</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">latency</div>
+                            <div class="cnt-item-type">p50/p95</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(latency.p50 || 0))}/${escapeHtml(String(latency.p95 || 0))}ms</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">budget</div>
+                            <div class="cnt-item-type">${perf.withinBudget === false ? 'over' : 'within'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(perf.budgetMs || 0))}ms</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">jobs</div>
+                            <div class="cnt-item-type">active/total</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(jobs.active || 0))}/${escapeHtml(String(jobs.total || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">dead letters</div>
+                            <div class="cnt-item-type">backlog</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(deadLetters.count || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">within budget</div>
+                            <div class="cnt-item-type">sample</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(outcomes.withinBudgetPct || 0))}%</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">worktrees</div>
+                            <div class="cnt-item-type">mounted</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(runtimeWorkspace.worktreeCount || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${runtimeActive.name ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">active content</div>
+                            <div class="cnt-item-type">${escapeHtml(String(runtimeActive.branch || runtimeWorkspace.branch || 'main'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(runtimeActive.name || 'none'))}</div>
+                            <div class="cnt-item-time"></div>
+                            ${runtimeActive.name && runtimeActive.domain
+                                ? `<button class="cnt-type-badge" type="button" data-shell-object-kind="repo" data-shell-object-domain="${escapeAttr(String(runtimeActive.domain || 'document'))}" data-shell-object-name="${escapeAttr(String(runtimeActive.name || ''))}" data-shell-object-branch="${escapeAttr(String(runtimeActive.branch || runtimeWorkspace.branch || 'main'))}" data-shell-object-item-id="${escapeAttr(String(runtimeActive.itemId || ''))}">open</button>`
+                                : ''}
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${sloAlerts.length ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">slo alerts</div>
+                            <div class="cnt-item-type">${Number(slo.breachStreak || 0) > 0 ? 'watch' : 'stable'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(sloAlerts.length || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">self-check</div>
+                    </div>
+                    <div class="cnt-history">${checksHtml || '<div class="cnt-empty">No runtime checks available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">services</div>
+                    </div>
+                    <div class="cnt-history">${serviceRows || '<div class="cnt-empty">No runtime services available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">control plane</div>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-mode="recommended">apply mode</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-posture-batch="3">apply batch</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${previewInfo.appliable === false ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">preview</div>
+                            <div class="cnt-item-type">${escapeHtml(String(previewInfo.reason || autopilotSummary.previewReason || 'unknown'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(previewInfo.command || previewInfo.title || 'next step').slice(0, 72))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(autopilotGuardrails.blockerCount || 0) > 0 ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">guardrails</div>
+                            <div class="cnt-item-type">${Number(autopilotGuardrails.blockerCount || 0) > 0 ? 'blocked' : 'clear'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotGuardrails.blockerCount || 0))} blockers</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${driftSummary.drifted ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">mode drift</div>
+                            <div class="cnt-item-type">${driftSummary.drifted ? 'drifted' : 'aligned'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotMode.recommendedMode || autopilotSummary.recommendedMode || 'normal'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(alignmentSummary.aligned || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">alignment</div>
+                            <div class="cnt-item-type">recent</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(alignmentSummary.aligned || 0))}/${escapeHtml(String(alignmentSummary.count || 0))} aligned</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(postureActionMetrics.summary?.applied || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">posture actions</div>
+                            <div class="cnt-item-type">1h</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(postureActionMetrics.summary?.applied || 0))}/${escapeHtml(String(postureActionMetrics.summary?.count || 0))} applied</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-history">${postureRows || '<div class="cnt-empty">No posture actions available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">next actions</div>
+                        <button class="cnt-type-badge" type="button" data-shell-object-kind="scene" data-shell-object-scene="continuity">continuity</button>
+                        <button class="cnt-type-badge" type="button" data-shell-object-kind="scene" data-shell-object-scene="connectors">connections</button>
+                        <button class="cnt-type-badge" type="button" data-shell-object-kind="scene" data-shell-object-scene="notifications">alerts</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(continuityNext.count || 0) > 0 ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">continuity next</div>
+                            <div class="cnt-item-type">${escapeHtml(String(continuityNext.topPriority || 'none'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(continuityNext.count || 0))} actions</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${autopilotSummary.enabled ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">autopilot</div>
+                            <div class="cnt-item-type">${autopilotSummary.enabled ? 'enabled' : 'idle'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotSummary.recommendedMode || autopilotSummary.lastResult || 'normal'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        if (core.kind === 'handoff') {
+            const info = core.info || {};
+            const continuity = (info.continuity && typeof info.continuity === 'object') ? info.continuity : {};
+            const alerts = (info.alerts && typeof info.alerts === 'object') ? info.alerts : {};
+            const handoff = (info.handoff && typeof info.handoff === 'object') ? info.handoff : {};
+            const presence = (info.presence && typeof info.presence === 'object') ? info.presence : {};
+            const incidents = (info.incidents && typeof info.incidents === 'object') ? info.incidents : {};
+            const nextActions = (info.nextActions && typeof info.nextActions === 'object') ? info.nextActions : {};
+            const diagnostics = (info.diagnostics && typeof info.diagnostics === 'object') ? info.diagnostics : {};
+            const autopilot = (continuity.continuityAutopilot && typeof continuity.continuityAutopilot === 'object')
+                ? continuity.continuityAutopilot
+                : (this.state.session.continuityAutopilot || {});
+            const health = (continuity.health && typeof continuity.health === 'object') ? continuity.health : {};
+            const handoffStats = (handoff.stats && typeof handoff.stats === 'object') ? handoff.stats : {};
+            const latency = (handoffStats.latencyMs && typeof handoffStats.latencyMs === 'object') ? handoffStats.latencyMs : {};
+            const continuityWorkspace = (continuity.workspace && typeof continuity.workspace === 'object') ? continuity.workspace : {};
+            const continuityActive = (continuityWorkspace.activeContent && typeof continuityWorkspace.activeContent === 'object')
+                ? continuityWorkspace.activeContent
+                : {};
+            const continuityNotifications = (continuity.notifications && typeof continuity.notifications === 'object')
+                ? continuity.notifications
+                : {};
+            const autopilotSummary = (diagnostics.continuityAutopilot && typeof diagnostics.continuityAutopilot === 'object') ? diagnostics.continuityAutopilot : {};
+            const continuityHistory = (info.continuityHistory && typeof info.continuityHistory === 'object') ? info.continuityHistory : {};
+            const continuityAnomalies = (info.continuityAnomalies && typeof info.continuityAnomalies === 'object') ? info.continuityAnomalies : {};
+            const autopilotHistory = (info.autopilotHistory && typeof info.autopilotHistory === 'object') ? info.autopilotHistory : {};
+            const autopilotPreview = (info.autopilotPreview && typeof info.autopilotPreview === 'object') ? info.autopilotPreview : {};
+            const autopilotMetrics = (info.autopilotMetrics && typeof info.autopilotMetrics === 'object') ? info.autopilotMetrics : {};
+            const autopilotGuardrails = (info.autopilotGuardrails && typeof info.autopilotGuardrails === 'object') ? info.autopilotGuardrails : {};
+            const autopilotMode = (info.autopilotMode && typeof info.autopilotMode === 'object') ? info.autopilotMode : {};
+            const autopilotDrift = (info.autopilotDrift && typeof info.autopilotDrift === 'object') ? info.autopilotDrift : {};
+            const autopilotAlignment = (info.autopilotAlignment && typeof info.autopilotAlignment === 'object') ? info.autopilotAlignment : {};
+            const autopilotPolicyMatrix = (info.autopilotPolicyMatrix && typeof info.autopilotPolicyMatrix === 'object') ? info.autopilotPolicyMatrix : {};
+            const postureHistory = (info.postureHistory && typeof info.postureHistory === 'object') ? info.postureHistory : {};
+            const postureAnomalies = (info.postureAnomalies && typeof info.postureAnomalies === 'object') ? info.postureAnomalies : {};
+            const postureActions = (info.postureActions && typeof info.postureActions === 'object') ? info.postureActions : {};
+            const postureActionMetrics = (info.postureActionMetrics && typeof info.postureActionMetrics === 'object') ? info.postureActionMetrics : {};
+            const posturePolicyMatrix = (info.posturePolicyMatrix && typeof info.posturePolicyMatrix === 'object') ? info.posturePolicyMatrix : {};
+            const pairedSurfaces = (info.pairedSurfaces && typeof info.pairedSurfaces === 'object') ? info.pairedSurfaces : {};
+            const pendingHandoff = (handoff.pending && typeof handoff.pending === 'object') ? handoff.pending : {};
+            const previewInfo = (autopilotPreview.preview && typeof autopilotPreview.preview === 'object') ? autopilotPreview.preview : {};
+            const autopilotMetricsSummary = (autopilotMetrics.metrics && typeof autopilotMetrics.metrics === 'object') ? autopilotMetrics.metrics : {};
+            const guardrailState = (autopilotGuardrails.guardrails && typeof autopilotGuardrails.guardrails === 'object') ? autopilotGuardrails.guardrails : {};
+            const driftInfo = (autopilotDrift.summary && typeof autopilotDrift.summary === 'object') ? autopilotDrift.summary : {};
+            const alignmentSummary = (autopilotAlignment.summary && typeof autopilotAlignment.summary === 'object') ? autopilotAlignment.summary : {};
+            const pendingToken = String(pendingHandoff.token || '').trim();
+            const pendingBackendUrl = String(pendingHandoff.backendUrl || '').trim();
+            const pendingBridgeUrl = String(pendingHandoff.bridgeUrl || '').trim();
+            const pendingExpires = Number(pendingHandoff.expiresAt || 0);
+            const pendingPair = (pendingHandoff.pairedSurface && typeof pendingHandoff.pairedSurface === 'object') ? pendingHandoff.pairedSurface : {};
+            const pendingShareUrl = this.buildHandoffShareUrl(pendingToken, pendingBackendUrl, pendingBridgeUrl);
+            const alertItems = Array.isArray(handoffStats.alerts) ? handoffStats.alerts : (Array.isArray(alerts.items) ? alerts.items : []);
+            const devices = Array.isArray(presence.items) ? presence.items : [];
+            const pairedItems = Array.isArray(pairedSurfaces.items) ? pairedSurfaces.items : [];
+            const deviceRows = devices.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.active ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.label || item.deviceId || 'device'))}</div>
+                    <div class="cnt-item-type">${item.active ? 'active' : 'stale'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.platform || 'unknown'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.lastSeenAt ? formatDate(item.lastSeenAt) : '')}</div>
+                </div>`).join('');
+            const pairedRows = pairedItems.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.preferred ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.label || item.surfaceId || 'surface'))}</div>
+                    <div class="cnt-item-type">${item.preferred ? 'preferred' : escapeHtml(String(item.role || 'surface'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.platform || 'unknown'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.updatedAt ? formatDate(item.updatedAt) : '')}</div>
+                    <button class="cnt-type-badge" type="button" data-handoff-start="1" data-handoff-surface="${escapeAttr(String(item.surfaceId || ''))}">take over</button>
+                    ${item.preferred ? '' : `<button class="cnt-type-badge" type="button" data-surface-prefer="${escapeAttr(String(item.surfaceId || ''))}">prefer</button>`}
+                </div>`).join('');
+            const alertRows = alertItems.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon generic"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.message || item.reason || 'alert'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.status || health.status || 'attention'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.deviceId || handoff.activeDeviceId || 'session'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.createdAt ? formatDate(item.createdAt) : '')}</div>
+                </div>`).join('');
+            const incidentItems = Array.isArray(incidents.items) ? incidents.items : [];
+            const incidentRows = incidentItems.map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon generic"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.type || item.category || 'incident'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.severity || 'low'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.detail || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const nextItems = Array.isArray(nextActions.items) ? nextActions.items : [];
+            const nextRows = nextItems.map((item) => `
+                <button class="cnt-item" type="button"${String(item.command || '').trim() ? ` data-command="${escapeAttr(String(item.command || '').trim())}"` : ''}>
+                    <div class="cnt-item-icon ${String(item.priority || 'p2').toLowerCase() === 'p0' ? 'generic' : 'document'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.title || 'action'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.priority || 'p2'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.reason || item.command || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time"></div>
+                </button>`).join('');
+            const continuityHistoryRows = (Array.isArray(continuityHistory.items) ? continuityHistory.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${String(item.status || 'healthy') === 'critical' ? 'generic' : 'document'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.source || 'snapshot'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.status || 'unknown'))}</div>
+                    <div class="cnt-item-ver">score ${escapeHtml(String(item.score || 0))} · breaches ${escapeHtml(String(item.handoffBreaches || 0))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const continuityAnomalyRows = (Array.isArray(continuityAnomalies.items) ? continuityAnomalies.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon generic"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.type || 'anomaly'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.severity || 'watch'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.detail || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const autopilotHistoryRows = (Array.isArray(autopilotHistory.items) ? autopilotHistory.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.changed ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.reason || item.source || 'autopilot'))}</div>
+                    <div class="cnt-item-type">${item.changed ? 'changed' : 'observed'}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.command || item.message || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const postureActionRows = (Array.isArray(postureActions.items) ? postureActions.items : []).map((item, index) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${String(item.priority || 'p2').toLowerCase() === 'p0' ? 'generic' : 'document'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.title || 'action'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.priority || 'p2'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.reason || item.command || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time"></div>
+                    <button class="cnt-type-badge" type="button" data-continuity-posture-apply="${index + 1}">apply</button>
+                </div>`).join('');
+            const postureHistoryRows = (Array.isArray(postureHistory.items) ? postureHistory.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.modeDrifted ? 'generic' : 'document'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.mode || 'normal'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.recommendedMode || 'normal'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.previewReason || 'unknown'))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const postureAnomalyRows = (Array.isArray(postureAnomalies.items) ? postureAnomalies.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon generic"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.type || 'anomaly'))}</div>
+                    <div class="cnt-item-type">${escapeHtml(String(item.mode || 'normal'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.detail || item.reason || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time">${escapeHtml(item.ts ? formatDate(item.ts) : '')}</div>
+                </div>`).join('');
+            const modeMatrixRows = (Array.isArray(autopilotPolicyMatrix.items) ? autopilotPolicyMatrix.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.allowed ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.targetMode || 'normal'))}</div>
+                    <div class="cnt-item-type">${item.allowed ? 'allowed' : escapeHtml(String(item.code || 'blocked'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.reason || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time"></div>
+                    ${item.allowed ? `<button class="cnt-type-badge" type="button" data-continuity-autopilot-mode="${escapeAttr(String(item.targetMode || 'normal'))}">set</button>` : ''}
+                </div>`).join('');
+            const posturePolicyRows = (Array.isArray(posturePolicyMatrix.items) ? posturePolicyMatrix.items : []).map((item) => `
+                <div class="cnt-item">
+                    <div class="cnt-item-icon ${item.appliable ? 'document' : 'generic'}"></div>
+                    <div class="cnt-item-name">${escapeHtml(String(item.title || 'action'))}</div>
+                    <div class="cnt-item-type">${item.appliable ? 'ready' : escapeHtml(String(item.policyCode || item.reason || 'blocked'))}</div>
+                    <div class="cnt-item-ver">${escapeHtml(String(item.command || '').slice(0, 72))}</div>
+                    <div class="cnt-item-time"></div>
+                </div>`).join('');
+            return `<div class="scene scene-connections interactive">
+                <canvas class="scene-canvas domain-canvas" data-scene="connections"></canvas>
+                <div class="connections-shell">
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">continuity</div>
+                        <div class="cnt-type-badge">${escapeHtml(String(health.status || 'healthy'))}</div>
+                        <div class="cnt-type-badge">${escapeHtml(String(presence.activeCount || 0))}/${escapeHtml(String(presence.count || 0))} active</div>
+                        ${handoff.activeDeviceId ? `<div class="cnt-type-badge">${escapeHtml(String(handoff.activeDeviceId || ''))}</div>` : ''}
+                        <div class="cnt-type-badge">${autopilot.enabled ? 'autopilot on' : 'autopilot off'}</div>
+                        <button class="cnt-type-badge" type="button" data-continuity-drill="1">drill</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-clear="1">clear alerts</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">handoff success</div>
+                            <div class="cnt-item-type">rate</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(handoffStats.successRatePct || 0))}%</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">handoff latency</div>
+                            <div class="cnt-item-type">avg / p95</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(latency.avg || 0))}/${escapeHtml(String(latency.p95 || 0))}ms</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">budget breaches</div>
+                            <div class="cnt-item-type">count</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(handoffStats.breaches || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">pending handoff</div>
+                            <div class="cnt-item-type">state</div>
+                            <div class="cnt-item-ver">${handoff.pending ? 'pending' : 'idle'}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${continuityActive.name ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">active content</div>
+                            <div class="cnt-item-type">${escapeHtml(String(continuityActive.branch || continuityWorkspace.branch || 'main'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(continuityActive.name || 'none'))}</div>
+                            <div class="cnt-item-time"></div>
+                            ${continuityActive.name && continuityActive.domain
+                                ? `<button class="cnt-type-badge" type="button" data-shell-object-kind="repo" data-shell-object-domain="${escapeAttr(String(continuityActive.domain || 'document'))}" data-shell-object-name="${escapeAttr(String(continuityActive.name || ''))}" data-shell-object-branch="${escapeAttr(String(continuityActive.branch || continuityWorkspace.branch || 'main'))}" data-shell-object-item-id="${escapeAttr(String(continuityActive.itemId || ''))}">open</button>`
+                                : ''}
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">worktrees</div>
+                            <div class="cnt-item-type">mounted</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(continuityWorkspace.worktreeCount || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(continuityNotifications.unread || 0) > 0 ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">runtime inbox</div>
+                            <div class="cnt-item-type">unread / total</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(continuityNotifications.unread || 0))}/${escapeHtml(String(continuityNotifications.count || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">devices</div>
+                        <button class="cnt-type-badge" type="button" data-handoff-start="1">start handoff</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-prune="stale">prune stale</button>
+                    </div>
+                    <div class="cnt-history">${deviceRows || '<div class="cnt-empty">No active devices yet.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">paired surfaces</div>
+                        ${pairedItems.some((item) => item.preferred) ? `<div class="cnt-type-badge">preferred set</div>` : '<div class="cnt-type-badge">none preferred</div>'}
+                    </div>
+                    <div class="cnt-history">${pairedRows || '<div class="cnt-empty">No paired Genome surfaces yet.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">handoff</div>
+                        ${pendingToken ? `<button class="cnt-type-badge" type="button" data-handoff-copy="${escapeAttr(pendingToken)}" data-handoff-backend="${escapeAttr(pendingBackendUrl)}" data-handoff-bridge="${escapeAttr(pendingBridgeUrl)}">copy link</button>` : ''}
+                        ${pendingShareUrl ? `<button class="cnt-type-badge" type="button" data-handoff-qr="${escapeAttr(pendingToken)}" data-handoff-backend="${escapeAttr(pendingBackendUrl)}" data-handoff-bridge="${escapeAttr(pendingBridgeUrl)}" data-handoff-expires="${escapeAttr(String(pendingExpires || ''))}">show qr</button>` : ''}
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${pendingToken ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">pending token</div>
+                            <div class="cnt-item-type">${pendingToken ? 'ready' : 'idle'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(pendingToken ? pendingToken : 'no pending handoff')}</div>
+                            <div class="cnt-item-time">${escapeHtml(pendingExpires ? formatDate(pendingExpires) : '')}</div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${handoff.activeDeviceId ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">active device</div>
+                            <div class="cnt-item-type">${handoff.activeDeviceId ? 'claimed' : 'idle'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(handoff.activeDeviceId || 'none'))}</div>
+                            <div class="cnt-item-time">${escapeHtml(handoff.lastClaimAt ? formatDate(handoff.lastClaimAt) : '')}</div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${pendingPair.targetSurfaceId ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">target surface</div>
+                            <div class="cnt-item-type">${pendingPair.routed || pendingPair.woke ? 'requested' : 'waiting'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(pendingPair.targetLabel || pendingPair.targetSurfaceId || 'none'))}</div>
+                            <div class="cnt-item-time">${escapeHtml(String(pendingPair.targetRole || ''))}</div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">next actions</div>
+                        <button class="cnt-type-badge" type="button" data-continuity-next-apply="1">apply next</button>
+                    </div>
+                    <div class="cnt-history">${nextRows || '<div class="cnt-empty">No continuity action needed right now.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">incidents</div>
+                        ${incidents.summary?.topSeverity ? `<div class="cnt-type-badge">${escapeHtml(String(incidents.summary.topSeverity))}</div>` : ''}
+                    </div>
+                    <div class="cnt-history">${incidentRows || '<div class="cnt-empty">No continuity incidents recorded.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">autopilot</div>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot="${autopilot.enabled ? 'off' : 'on'}">${autopilot.enabled ? 'disable' : 'enable'}</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-tick="1">tick</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-mode="recommended">apply mode</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-align="${autopilot.autoAlignMode ? 'off' : 'on'}">${autopilot.autoAlignMode ? 'auto-align off' : 'auto-align on'}</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-reset="stats">reset stats</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${autopilot.enabled ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">mode</div>
+                            <div class="cnt-item-type">${escapeHtml(String(autopilot.mode || 'normal'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilot.lastResult || 'idle'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">cooldown</div>
+                            <div class="cnt-item-type">ms</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilot.cooldownMs || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon document"></div>
+                            <div class="cnt-item-name">applies</div>
+                            <div class="cnt-item-type">count</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilot.applied || 0))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${autopilotSummary.modeDrifted ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">recommended</div>
+                            <div class="cnt-item-type">${escapeHtml(String(autopilotSummary.recommendedMode || 'normal'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotSummary.previewReason || autopilotSummary.lastResult || 'ready'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(autopilotSummary.guardrailBlockers || 0) > 0 ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">guardrails</div>
+                            <div class="cnt-item-type">${Number(autopilotSummary.guardrailBlockers || 0) > 0 ? 'blocked' : 'clear'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotSummary.guardrailBlockers || 0))} blockers</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">control plane</div>
+                        <button class="cnt-type-badge" type="button" data-continuity-posture-batch="3">apply batch</button>
+                        <button class="cnt-type-badge" type="button" data-continuity-autopilot-reset="history">clear history</button>
+                    </div>
+                    <div class="cnt-history">
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${previewInfo.appliable === false ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">preview</div>
+                            <div class="cnt-item-type">${escapeHtml(String(previewInfo.reason || autopilotSummary.previewReason || 'unknown'))}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(previewInfo.command || previewInfo.title || 'next control step').slice(0, 72))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(guardrailState.blockerCount || 0) > 0 ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">guardrail summary</div>
+                            <div class="cnt-item-type">${Number(guardrailState.blockerCount || 0) > 0 ? 'blocked' : 'clear'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(guardrailState.blockerCount || 0))} blockers · ${escapeHtml(String((guardrailState.codes || []).slice(0, 2).join(', ') || 'steady'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${driftInfo.drifted ? 'generic' : 'document'}"></div>
+                            <div class="cnt-item-name">mode drift</div>
+                            <div class="cnt-item-type">${driftInfo.drifted ? 'drifted' : 'aligned'}</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotMode.recommendedMode || autopilot.mode || 'normal'))}</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(autopilotMetricsSummary.recentCount || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">recent events</div>
+                            <div class="cnt-item-type">1h</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(autopilotMetricsSummary.recentCount || 0))} events</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(alignmentSummary.aligned || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">mode alignment</div>
+                            <div class="cnt-item-type">recent</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(alignmentSummary.aligned || 0))}/${escapeHtml(String(alignmentSummary.count || 0))} aligned</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                        <div class="cnt-item">
+                            <div class="cnt-item-icon ${Number(postureActionMetrics.summary?.applied || 0) > 0 ? 'document' : 'generic'}"></div>
+                            <div class="cnt-item-name">posture actions</div>
+                            <div class="cnt-item-type">1h</div>
+                            <div class="cnt-item-ver">${escapeHtml(String(postureActionMetrics.summary?.applied || 0))}/${escapeHtml(String(postureActionMetrics.summary?.count || 0))} applied</div>
+                            <div class="cnt-item-time"></div>
+                        </div>
+                    </div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">mode policy</div>
+                    </div>
+                    <div class="cnt-history">${modeMatrixRows || '<div class="cnt-empty">No autopilot mode policy matrix available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">posture actions</div>
+                        ${posturePolicyMatrix.summary?.allowed != null ? `<div class="cnt-type-badge">${escapeHtml(String(posturePolicyMatrix.summary.allowed || 0))} ready</div>` : ''}
+                    </div>
+                    <div class="cnt-history">${postureActionRows || '<div class="cnt-empty">No posture actions available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">posture policy</div>
+                    </div>
+                    <div class="cnt-history">${posturePolicyRows || '<div class="cnt-empty">No posture policy rows available.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">control history</div>
+                    </div>
+                    <div class="cnt-history">${autopilotHistoryRows || '<div class="cnt-empty">No autopilot actions recorded yet.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">posture history</div>
+                        ${postureAnomalies.summary?.count ? `<div class="cnt-type-badge">${escapeHtml(String(postureAnomalies.summary.count || 0))} anomalies</div>` : ''}
+                    </div>
+                    <div class="cnt-history">${postureHistoryRows || '<div class="cnt-empty">No posture snapshots recorded yet.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">posture anomalies</div>
+                    </div>
+                    <div class="cnt-history">${postureAnomalyRows || '<div class="cnt-empty">No posture anomalies detected.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">continuity history</div>
+                        ${continuityAnomalies.summary?.topSeverity ? `<div class="cnt-type-badge">${escapeHtml(String(continuityAnomalies.summary.topSeverity || 'steady'))}</div>` : ''}
+                    </div>
+                    <div class="cnt-history">${continuityHistoryRows || '<div class="cnt-empty">No continuity history recorded yet.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">continuity anomalies</div>
+                    </div>
+                    <div class="cnt-history">${continuityAnomalyRows || '<div class="cnt-empty">No continuity anomalies detected.</div>'}</div>
+                    <div class="cnt-header">
+                        <div class="cnt-action-badge">alerts</div>
+                    </div>
+                    <div class="cnt-history">${alertRows || '<div class="cnt-empty">No continuity alerts right now.</div>'}</div>
                 </div>
             </div>`;
         }
         // ── Drive files scene (when gdrive.list data is present) ───────────────
-        if (core.kind === 'document' && Array.isArray(core.info?.files) && core.info.files.length) {
+        if ((core.kind === 'drive' || (core.kind === 'document' && Array.isArray(core.info?.files) && core.info.files.length))) {
             const info  = core.info || {};
             const files = info.files.slice(0, 8);
             const mimeLabel = (mime) => {
@@ -6752,6 +8942,8 @@ const UIEngine = {
             this._sceneRenderer = this.makeSportsRenderer(canvas);
         } else if (scene === 'phone') {
             this._sceneRenderer = this.makePhoneRenderer(canvas);
+        } else if (scene === 'plan') {
+            this._sceneRenderer = this.makePlanRenderer(canvas);
         } else if (['document','spreadsheet','presentation','code','terminal','calendar','email','content'].includes(scene)) {
             this._sceneRenderer = this.makeComputerRenderer(canvas);
         } else if (scene === 'music') {
@@ -8942,6 +11134,17 @@ const UIEngine = {
         const entry = this.state.history[index];
         if (!entry) return;
 
+        this.markUserEngaged();
+        if (!entry.envelope || !entry.plan) {
+            const replayIntent = String(entry.intent || '').trim();
+            if (!replayIntent) return;
+            this.updateStatus('RESTORING');
+            this.showToast('Replaying preserved history trace.', 'info', 2200);
+            this.input.value = replayIntent;
+            this.input.focus();
+            this.handleIntent(replayIntent);
+            return;
+        }
         this.state.memory = JSON.parse(JSON.stringify(entry.memorySnapshot));
         this.state.session.activeHistoryIndex = index;
         this.state.session.lastIntent = entry.intent;
@@ -8976,7 +11179,7 @@ const UIEngine = {
 
         try {
             const parsed = JSON.parse(raw);
-            this.state.memory = parsed.memory || structuredClone(DEFAULT_MEMORY);
+            this.state.memory = parsed.memory || safeStructuredClone(DEFAULT_MEMORY);
             this.state.history = parsed.history || [];
             this.state.intentHistory = Array.isArray(parsed.intentHistory)
                 ? parsed.intentHistory.filter((x) => typeof x === 'string').slice(-60)
@@ -8986,17 +11189,18 @@ const UIEngine = {
             this.state.session.deviceId = parsed.deviceId || localStorage.getItem(DEVICE_STORAGE_KEY) || '';
             this.state.session.handoff = parsed.handoff || this.state.session.handoff;
             this.state.session.presence = parsed.presence || this.state.session.presence;
+            this.state.session.workspace = parsed.workspace || this.state.session.workspace;
             this.state.session.revision = Number(parsed.revision || 0);
             this.state.session.locationHint = String(parsed.locationHint || '').trim();
             this.state.runtimeEvents = Array.isArray(parsed.runtimeEvents)
-                ? parsed.runtimeEvents.filter((item) => item && typeof item === 'object').slice(-8)
+                ? parsed.runtimeEvents.filter((item) => item && typeof item === 'object').slice(-20)
                 : [];
             const mode = String(parsed?.uiPrefs?.webdeckMode || '').toLowerCase();
             if (mode === 'surface' || mode === 'full') {
                 this.state.webdeck.mode = mode;
             }
         } catch {
-            this.state.memory = structuredClone(DEFAULT_MEMORY);
+            this.state.memory = safeStructuredClone(DEFAULT_MEMORY);
             this.state.history = [];
             this.state.intentHistory = [];
             this.state.intentHistoryIndex = -1;
@@ -9004,6 +11208,7 @@ const UIEngine = {
     },
 
     saveState() {
+        this.syncActiveSurfaceWorkspaceFocus();
         localStorage.setItem(STORAGE_KEY, JSON.stringify({
             memory: this.state.memory,
             history: this.state.history,
@@ -9012,6 +11217,7 @@ const UIEngine = {
             deviceId: this.state.session.deviceId,
             handoff: this.state.session.handoff,
             presence: this.state.session.presence,
+            workspace: this.state.session.workspace,
             revision: this.state.session.revision,
             locationHint: this.state.session.locationHint,
             runtimeEvents: this.state.runtimeEvents,
@@ -9046,6 +11252,64 @@ const UIEngine = {
             return;
         }
         this.shortcutHint.innerText = 'Alt+1..9 run | Alt+<-/-> history | Alt+Shift+<-/-> scenes | Alt+M webdeck mode | Ctrl/Cmd+K focus';
+    },
+
+    isStandalonePwa() {
+        return !!(
+            (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+            || window.navigator.standalone
+        );
+    },
+
+    isPhoneSurface() {
+        return typeof window !== 'undefined'
+            && ((window.matchMedia && window.matchMedia('(pointer: coarse)').matches) || window.innerWidth <= 900);
+    },
+
+    setupPwaRuntime() {
+        this.state.pwa.installed = this.isStandalonePwa();
+        this.state.pwa.installReady = false;
+        if (typeof window === 'undefined' || isElectronRuntime()) return;
+        window.addEventListener('beforeinstallprompt', (event) => {
+            event.preventDefault();
+            this._deferredInstallPrompt = event;
+            this.state.pwa.installReady = true;
+            this.renderPwaInstallPrompt();
+        });
+        window.addEventListener('appinstalled', () => {
+            this._deferredInstallPrompt = null;
+            this.state.pwa.installReady = false;
+            this.state.pwa.installed = true;
+            this.renderPwaInstallPrompt();
+            this.showToast('Genome installed on this screen.', 'ok', 2600);
+        });
+        this.renderPwaInstallPrompt();
+    },
+
+    renderPwaInstallPrompt() {
+        if (typeof document === 'undefined') return;
+        document.getElementById('genome-pwa-install')?.remove();
+        if (isElectronRuntime() || this.state.pwa.installed || !this.isPhoneSurface()) return;
+        const wrapper = document.createElement('div');
+        wrapper.id = 'genome-pwa-install';
+        wrapper.style.cssText = 'position:fixed;top:16px;right:16px;z-index:1200;display:flex;gap:8px;align-items:center;padding:10px 12px;border-radius:16px;background:rgba(8,12,20,.88);border:1px solid rgba(90,214,190,.35);box-shadow:0 12px 40px rgba(0,0,0,.28);backdrop-filter:blur(14px);';
+        wrapper.innerHTML = `
+            <div style="font:600 12px var(--font-mono);letter-spacing:.08em;color:#9fd7c5;">GENOME PHONE SURFACE</div>
+            <button type="button" id="genome-pwa-install-btn" style="border:0;border-radius:999px;padding:8px 12px;background:#0d7c66;color:#f7fffb;font:600 12px var(--font-mono);">${this.state.pwa.installReady ? 'install' : 'share → add to home screen'}</button>
+        `;
+        document.body.appendChild(wrapper);
+        wrapper.querySelector('#genome-pwa-install-btn')?.addEventListener('click', async () => {
+            if (this._deferredInstallPrompt) {
+                const prompt = this._deferredInstallPrompt;
+                this._deferredInstallPrompt = null;
+                await prompt.prompt();
+                await prompt.userChoice.catch(() => null);
+                this.state.pwa.installReady = false;
+                this.renderPwaInstallPrompt();
+                return;
+            }
+            this.showToast('Use Share > Add to Home Screen on your phone.', 'ok', 3200);
+        });
     },
 
     weatherVisualContext(location) {
@@ -9100,6 +11364,75 @@ const UIEngine = {
     },
 
     // ── Wave-3/4 scene renderers ────────────────────────────────────────────
+
+    makePlanRenderer(canvas) {
+        // Flowing node-graph: step nodes connected by animated edges, with a
+        // cascading "complete" glow as each node activates left-to-right.
+        let t = 0;
+        const execution = this.state.session.lastExecution;
+        const steps = Array.isArray(execution?.toolResults) ? execution.toolResults : [];
+        const nodeCount = Math.max(steps.length, 2);
+
+        return () => {
+            const W = canvas.width  = canvas.offsetWidth;
+            const H = canvas.height = canvas.offsetHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, W, H);
+            t += 0.016;
+
+            // Background gradient — dark slate
+            const bg = ctx.createLinearGradient(0, 0, W, H);
+            bg.addColorStop(0, '#060d14');
+            bg.addColorStop(1, '#0d1a2a');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, W, H);
+
+            // Compute node positions (horizontal chain)
+            const nodeY = H * 0.48;
+            const margin = W * 0.12;
+            const spacing = nodeCount > 1 ? (W - margin * 2) / (nodeCount - 1) : 0;
+            const nodes = Array.from({ length: nodeCount }, (_, i) => ({
+                x: nodeCount === 1 ? W / 2 : margin + i * spacing,
+                y: nodeY + Math.sin(t * 0.6 + i * 1.2) * 6,
+                ok: (steps[i]?.ok !== false),
+                active: i <= Math.floor(((Math.sin(t * 0.4) + 1) / 2) * nodeCount),
+            }));
+
+            // Draw edges
+            for (let i = 0; i < nodes.length - 1; i++) {
+                const a = nodes[i], b = nodes[i + 1];
+                const progress = Math.min(1, Math.max(0, (t * 0.5 - i * 0.3)));
+                const ex = a.x + (b.x - a.x) * progress;
+                const ey = a.y + (b.y - a.y) * progress;
+                ctx.beginPath();
+                ctx.moveTo(a.x, a.y);
+                ctx.lineTo(ex, ey);
+                ctx.strokeStyle = 'rgba(56, 189, 248, 0.22)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+
+            // Draw nodes
+            nodes.forEach((n, i) => {
+                const glow = n.ok ? 'rgba(56,189,248,0.55)' : 'rgba(239,68,68,0.5)';
+                const core = n.ok ? '#38bdf8' : '#ef4444';
+                const r = 8 + Math.sin(t * 1.2 + i) * 2;
+                // Glow halo
+                const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r * 2.5);
+                grad.addColorStop(0, glow);
+                grad.addColorStop(1, 'transparent');
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, r * 2.5, 0, Math.PI * 2);
+                ctx.fill();
+                // Core dot
+                ctx.fillStyle = core;
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        };
+    },
 
     makeMusicRenderer(canvas) {
         // Deep violet-to-indigo field with slow radial pulse rings and floating
@@ -10166,6 +12499,48 @@ const UIEngine = {
 
     // ── Mesh: auto-join local network + notification badge ───────────────────
 
+    _initNotifications() {
+        // Wire Electron notification click → intent routing
+        if (window.electronAPI?.onNotificationClick) {
+            window.electronAPI.onNotificationClick(({ route }) => {
+                if (route) this.handleIntent(String(route));
+            });
+        }
+        // Auto-updater banner — show a subtle toast when an update is ready
+        if (window.electronAPI?.onUpdaterStatus) {
+            window.electronAPI.onUpdaterStatus(({ event, version, percent }) => {
+                if (event === 'ready') {
+                    this.showToast(
+                        `Update ${version || ''} ready. Restart now?`,
+                        'ok',
+                        14000,
+                        { label: 'Restart', onClick: () => this.installUpdateNow(version || '') }
+                    );
+                } else if (event === 'available') {
+                    this.showToast(`Downloading update ${version || ''}…`, 'info', 3500);
+                } else if (event === 'downloading' && Number.isFinite(Number(percent)) && Number(percent) >= 100) {
+                    this.showToast('Update download complete.', 'info', 1800);
+                } else if (event === 'error') {
+                    this.showToast('Update check failed. The app will keep running normally.', 'warn', 3200);
+                }
+                // 'checking', 'up-to-date', 'downloading', 'error' — silent
+            });
+        }
+    },
+
+    /**
+     * Send a desktop notification via Electron's native Notification API.
+     * No-ops gracefully in browser mode (no Electron).
+     * @param {string} title
+     * @param {string} body
+     * @param {string} [route]  Intent to dispatch when user clicks the notification
+     */
+    osNotify(title, body, route = '') {
+        if (window.electronAPI?.notify) {
+            window.electronAPI.notify({ title, body, route });
+        }
+    },
+
     async _initNetworkMesh() {
         if (this._meshInitDone) return;
         this._meshInitDone = true;
@@ -10203,6 +12578,11 @@ const UIEngine = {
                     const latest = msgs[msgs.length - 1];
                     if (!this._meshLastSeen) this._meshLastSeen = {};
                     this._meshLastSeen[topic] = latest.receivedAt || Date.now();
+                    if (newCount > 0) {
+                        const sender = String(latest.from || 'Someone').slice(0, 40);
+                        const preview = String(latest.text || latest.content || '').slice(0, 80);
+                        this.osNotify(`Message from ${sender}`, preview || 'New message', 'show local mesh');
+                    }
                 }
             }
             this._updateMeshBadge(totalNew);
@@ -10352,8 +12732,43 @@ const UIEngine = {
         }
     },
 
+    syncActiveSurfaceWorkspaceFocus() {
+        const activeSurface = this.state.activeSurface;
+        if (!activeSurface || typeof activeSurface !== 'object') return;
+        const meta = typeof activeSurface.getMeta === 'function' ? activeSurface.getMeta() : null;
+        if (!meta || typeof meta !== 'object') return;
+        const domain = String(meta.domain || activeSurface.domain || '').trim();
+        const name = String(meta.name || activeSurface.name || '').trim();
+        if (!domain || !name) return;
+        const itemId = String(meta.itemId || '').trim();
+        const branch = String(meta.branch || this.state.session.workspace?.branch || 'main').trim() || 'main';
+        const updatedAt = Number(meta.updatedAt || Date.now());
+        this.state.session.workspace = this.state.session.workspace || { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null };
+        const worktrees = (this.state.session.workspace.worktrees && typeof this.state.session.workspace.worktrees === 'object')
+            ? this.state.session.workspace.worktrees
+            : {};
+        worktrees[itemId || `${domain}:${name}`] = {
+            itemId,
+            name,
+            domain,
+            branch,
+            updatedAt,
+        };
+        this.state.session.workspace.worktrees = worktrees;
+        this.state.session.workspace.branch = branch;
+        this.state.session.workspace.activeContent = {
+            itemId,
+            name,
+            domain,
+            branch,
+            hash: String(meta.hash || '').trim(),
+            updatedAt,
+        };
+    },
+
     _initFunctionalSurfaces() {
         // Tear down previous surface (clear auto-save timer, etc.)
+        this.syncActiveSurfaceWorkspaceFocus();
         if (this.state.activeSurface?.cleanup) this.state.activeSurface.cleanup();
         this.state.activeSurface = null;
 
@@ -10374,6 +12789,12 @@ const UIEngine = {
 
         const phoneEl = this.container.querySelector('[data-func-domain="telephony"]');
         if (phoneEl) { this._initTelephonySurface(phoneEl); return; }
+
+        const autoConnectEl = this.container.querySelector('[data-auto-connect]');
+        if (autoConnectEl) {
+            const svc = String(autoConnectEl.dataset.autoConnect || '').trim();
+            if (svc) setTimeout(() => this._oauthConnectService(svc), 150);
+        }
     },
 
     _initTelephonySurface(el) {
@@ -10500,13 +12921,582 @@ const UIEngine = {
         if (!name) return null;
         try {
             const token = sessionStorage.getItem('genome_session') || '';
-            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}`, {
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const branch = encodeURIComponent(this._contentBranchFor(domain, name));
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}?sessionId=${sessionId}&branch=${branch}`, {
                 headers: { 'X-Genome-Auth': token }
             });
             if (!res.ok) return null;
             const json = await res.json();
-            return json.ok ? json.data : null;
+            return json.ok ? (json.item?.data ?? null) : null;
         } catch { return null; }
+    },
+
+    async _contentOpenItem(domain, name) {
+        if (!name) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const branch = encodeURIComponent(this._contentBranchFor(domain, name));
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}?sessionId=${sessionId}&branch=${branch}`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            return json.ok ? (json.item || null) : null;
+        } catch { return null; }
+    },
+
+    async _contentHistory(domain, name, limit = 20) {
+        if (!name) return [];
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const branch = encodeURIComponent(this._contentBranchFor(domain, name));
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}/history?branch=${branch}&limit=${Math.max(1, Math.min(100, Number(limit || 20)))}`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return [];
+            const json = await res.json();
+            return Array.isArray(json?.items) ? json.items : [];
+        } catch { return []; }
+    },
+
+    async _contentBranches(domain, name) {
+        if (!name) return [];
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}/branches`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return [];
+            const json = await res.json();
+            return Array.isArray(json?.items) ? json.items : [];
+        } catch { return []; }
+    },
+
+    async _fetchWorkspaceState() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return this.state.session.workspace || null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/workspace`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return this.state.session.workspace || null;
+            const json = await res.json();
+            if (json?.workspace && typeof json.workspace === 'object') {
+                this.state.session.workspace = json.workspace;
+            }
+            return this.state.session.workspace || null;
+        } catch {
+            return this.state.session.workspace || null;
+        }
+    },
+
+    async _fetchWorkspaceWorktrees() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return [];
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/workspace/worktrees`, {
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return [];
+            const json = await res.json();
+            return Array.isArray(json?.items) ? json.items : [];
+        } catch {
+            return [];
+        }
+    },
+
+    async _fetchNotificationsState() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/notifications`);
+            if (!res.ok) return Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+            const json = await res.json();
+            this.mergeRuntimeEvents(json?.notifications, { replace: true });
+            return Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+        } catch {
+            return Array.isArray(this.state.runtimeEvents) ? this.state.runtimeEvents : [];
+        }
+    },
+
+    async markNotificationsRead(app = '') {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        const target = String(app || '').trim().toLowerCase() === 'all' ? '' : String(app || '').trim();
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/notifications/read`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ app: target })
+            });
+            if (!res.ok) return false;
+            const json = await res.json();
+            this.mergeRuntimeEvents(json?.notifications, { replace: true });
+            await this.showNotificationsInbox();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async clearNotifications(app = '') {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        const target = String(app || '').trim().toLowerCase() === 'all' ? '' : String(app || '').trim();
+        const suffix = target ? `?app=${encodeURIComponent(target)}` : '';
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/notifications${suffix}`, {
+                method: 'DELETE'
+            });
+            if (!res.ok) return false;
+            const json = await res.json();
+            this.mergeRuntimeEvents(json?.notifications, { replace: true });
+            await this.showNotificationsInbox();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async setConnectorGrant(scope, enabled, ttlMs = 0) {
+        const targetScope = String(scope || '').trim();
+        if (!targetScope) return false;
+        try {
+            const res = await fetch('/api/connectors/grants', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scope: targetScope, enabled: Boolean(enabled), ttlMs: Math.max(0, Number(ttlMs || 0)) })
+            });
+            if (!res.ok) return false;
+            await this.showConnectionsPanel();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async clearContinuityAlerts() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/alerts/clear`, { method: 'POST' });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async drillContinuityAlert() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/alerts/drill`, { method: 'POST' });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async prunePresence(all = false, maxAgeMs = 120000) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/presence/prune`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ all: Boolean(all), maxAgeMs: Math.max(1000, Number(maxAgeMs || 120000)) })
+            });
+            if (!res.ok) return false;
+            const json = await res.json();
+            this.state.session.presence = json || this.state.session.presence;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async setContinuityAutopilot(enabled) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: Boolean(enabled) })
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async tickContinuityAutopilot() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/tick`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ force: true })
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async applyRecommendedContinuityMode() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/mode/apply-recommended`, {
+                method: 'POST'
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async applyContinuityNextAction() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/next/apply`, {
+                method: 'POST'
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async configureContinuityAutopilot(options = {}) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid || !options || typeof options !== 'object') return false;
+        const body = {};
+        if (options.mode != null) body.mode = String(options.mode || '').trim().toLowerCase();
+        if (options.cooldownMs != null) body.cooldownMs = Math.max(1000, Number(options.cooldownMs || 0));
+        if (options.maxAppliesPerHour != null) body.maxAppliesPerHour = Math.max(0, Number(options.maxAppliesPerHour || 0));
+        if (options.autoAlignMode != null) body.autoAlignMode = Boolean(options.autoAlignMode);
+        if (!Object.keys(body).length) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/config`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async resetContinuityAutopilot(clearHistory = false) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/reset`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ clearHistory: Boolean(clearHistory) })
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async applyContinuityPostureAction(index = 1) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/actions/apply?index=${Math.max(1, Number(index || 1))}`, {
+                method: 'POST'
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async applyContinuityPostureBatch(limit = 3) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/actions/apply-batch?limit=${Math.max(1, Math.min(10, Number(limit || 3)))}`, {
+                method: 'POST'
+            });
+            if (!res.ok) return false;
+            await this.showContinuitySurface();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async openShellObject(spec = {}) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid || !spec || typeof spec !== 'object') return false;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/objects/open`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(spec)
+            });
+            if (!res.ok) return false;
+            const json = await res.json();
+            if (!json?.ok) return false;
+            if (json?.data?.workspace && typeof json.data.workspace === 'object') {
+                this.state.session.workspace = json.data.workspace;
+            }
+            if (json?.revision != null) {
+                this.state.session.revision = Number(json.revision || this.state.session.revision);
+            }
+            const target = (json?.data?.target && typeof json.data.target === 'object') ? json.data.target : {};
+            if (String(target.type || '') === 'repo') {
+                return await this.openRepoObject(
+                    String(target.domain || spec.domain || '').trim(),
+                    String(target.name || spec.name || '').trim(),
+                    String(target.branch || spec.branch || '').trim()
+                );
+            }
+            if (String(target.type || '') === 'scene') {
+                const scene = String(target.scene || spec.scene || '').trim().toLowerCase();
+                const service = String(target.service || spec.service || '').trim().toLowerCase();
+                if (scene === 'connectors' && service) return await this.showConnectionsPanel(service);
+                return await this.switchToSceneDomain(scene);
+            }
+            return false;
+        } catch {
+            return false;
+        }
+    },
+
+    async startSessionHandoff(targetSurfaceId = '') {
+        const sid = String(this.state.session.sessionId || '').trim();
+        const deviceId = String(this.state.session.deviceId || '').trim();
+        if (!sid || !deviceId) return null;
+        try {
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/handoff/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ deviceId, targetSurfaceId: String(targetSurfaceId || '').trim() || null })
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            const backendUrl = this.resolveHandoffBackendUrl(json?.backendUrl || '');
+            const bridgeUrl = String(json?.bridgeUrl || '').trim();
+            if (json?.handoff && typeof json.handoff === 'object') {
+                this.state.session.handoff = json.handoff;
+                if (this.state.session.handoff?.pending && typeof this.state.session.handoff.pending === 'object') {
+                    this.state.session.handoff.pending.backendUrl = backendUrl;
+                    this.state.session.handoff.pending.bridgeUrl = bridgeUrl;
+                }
+            }
+            if (json?.revision != null) {
+                this.state.session.revision = Number(json.revision || this.state.session.revision);
+            }
+            if (json && typeof json === 'object') {
+                json.backendUrl = backendUrl;
+                json.bridgeUrl = bridgeUrl;
+            }
+            this.saveState();
+            return json;
+        } catch {
+            return null;
+        }
+    },
+
+    async preferPairedSurface(surfaceId = '') {
+        const clean = String(surfaceId || '').trim();
+        if (!clean) return false;
+        try {
+            const res = await fetch(`/api/surfaces/${encodeURIComponent(clean)}/prefer`, { method: 'POST' });
+            return !!res.ok;
+        } catch {
+            return false;
+        }
+    },
+
+    resolveHandoffBackendUrl(raw = '') {
+        const value = String(raw || '').trim().replace(/\/+$/, '');
+        if (value) return rewriteLoopbackOrigin(value, '8787');
+        return rewriteLoopbackOrigin(`${window.location.protocol}//${window.location.hostname}:8787`, '8787');
+    },
+
+    resolvePhoneSurfaceUrl(backendUrl = '') {
+        const backendBase = this.resolveHandoffBackendUrl(backendUrl);
+        const frontendOrigin = rewriteLoopbackOrigin(window.location.origin, window.location.port || '5173');
+        try {
+            const fromBackend = new URL(backendBase);
+            fromBackend.port = window.location.port || '5173';
+            return fromBackend.origin;
+        } catch {
+            return frontendOrigin;
+        }
+    },
+
+    buildHandoffShareUrl(token = '', backendUrl = '', bridgeUrl = '') {
+        const cleanToken = String(token || '').trim();
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!cleanToken || !sid) return '';
+        const phoneBase = this.resolvePhoneSurfaceUrl(backendUrl);
+        const backendBase = this.resolveHandoffBackendUrl(backendUrl);
+        return `${phoneBase}/?session=${encodeURIComponent(sid)}&handoff=${encodeURIComponent(cleanToken)}&backend=${encodeURIComponent(backendBase)}`;
+    },
+
+    async showHandoffQr(link = '', expiresAt = 0) {
+        const cleanLink = String(link || '').trim();
+        if (!cleanLink) return false;
+        document.getElementById('genome-handoff-qr-overlay')?.remove();
+        const overlay = document.createElement('div');
+        overlay.className = 'handoff-qr-overlay';
+        overlay.id = 'genome-handoff-qr-overlay';
+        overlay.innerHTML = `
+            <div class="handoff-qr-card">
+                <div class="handoff-qr-title">Open Genome On Phone</div>
+                <div class="handoff-qr-sub">Scan to open the phone PWA surface and claim this session.</div>
+                <div class="handoff-qr-frame">
+                    <img class="handoff-qr-image" id="genome-handoff-qr-image" alt="Nous handoff QR code" />
+                </div>
+                <div class="handoff-qr-meta">${escapeHtml(cleanLink)}</div>
+                ${Number(expiresAt || 0) > 0 ? `<div class="handoff-qr-expiry">Expires ${escapeHtml(formatDate(Number(expiresAt)))}</div>` : ''}
+                <div class="handoff-qr-actions">
+                    <button class="confirm-cancel" id="handoff-qr-close-btn">Close</button>
+                    <button class="confirm-approve" id="handoff-qr-copy-btn">Copy Link</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        const dismiss = () => document.getElementById('genome-handoff-qr-overlay')?.remove();
+        document.getElementById('handoff-qr-close-btn')?.addEventListener('click', dismiss);
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) dismiss();
+        });
+        document.getElementById('handoff-qr-copy-btn')?.addEventListener('click', async () => {
+            const ok = await this.copyTextToClipboard(cleanLink);
+            this.showToast(ok ? 'Handoff link copied.' : 'Could not copy handoff link.', ok ? 'ok' : 'warn', 2200);
+        });
+
+        try {
+            const dataUrl = await QRCode.toDataURL(cleanLink, {
+                errorCorrectionLevel: 'H',
+                margin: 3,
+                width: 320,
+                color: {
+                    dark: '#000000',
+                    light: '#ffffff'
+                }
+            });
+            const img = document.getElementById('genome-handoff-qr-image');
+            if (img) img.src = dataUrl;
+            return true;
+        } catch {
+            dismiss();
+            this.showToast('Could not generate handoff QR.', 'warn', 2400);
+            return false;
+        }
+    },
+
+    async copyTextToClipboard(text) {
+        const value = String(text || '').trim();
+        if (!value) return false;
+        try {
+            await navigator.clipboard.writeText(value);
+            return true;
+        } catch {
+            const probe = document.createElement('textarea');
+            probe.value = value;
+            probe.setAttribute('readonly', 'readonly');
+            probe.style.position = 'fixed';
+            probe.style.opacity = '0';
+            document.body.appendChild(probe);
+            probe.select();
+            const ok = document.execCommand('copy');
+            probe.remove();
+            return Boolean(ok);
+        }
+    },
+
+    async runDirectShellCommand(rawCommand) {
+        const command = String(rawCommand || '').trim();
+        if (!command) return false;
+        const lower = command.toLowerCase();
+
+        if (lower === 'show my notifications' || lower === 'show notifications') {
+            return await this.showNotificationsInbox();
+        }
+        if (lower === 'show content history' || lower === 'show content') {
+            return await this.showContentRepository();
+        }
+        if (lower === 'show workspace files') {
+            return await this.showWorkspaceFiles('.');
+        }
+        if (lower === 'show my connections' || lower === 'show connections') {
+            return await this.showConnectionsPanel();
+        }
+        if (lower === 'show continuity') {
+            return await this.showContinuitySurface();
+        }
+        if (lower === 'show runtime health' || lower === 'show runtime') {
+            return await this.showRuntimeHealth();
+        }
+        if (lower === 'check my email' || lower === 'show email') {
+            return await this.showEmailInbox();
+        }
+        if (lower === 'show messages' || lower === 'show messaging') {
+            return await this.showMessagingInbox();
+        }
+        if (lower === 'show calendar') {
+            return await this.showCalendarAgenda();
+        }
+
+        let match = lower.match(/^show connections for\s+([a-z0-9_-]+)$/i);
+        if (match) {
+            return await this.showConnectionsPanel(match[1]);
+        }
+
+        match = command.match(/^show history for\s+(document|spreadsheet|presentation)\s+(.+)$/i);
+        if (match) {
+            const [, domain, name] = match;
+            return await this.showRepoHistory(domain, String(name || '').trim());
+        }
+
+        match = command.match(/^list files(?:\s+(.+))?$/i);
+        if (match) {
+            return await this.showWorkspaceFiles(String(match[1] || '.').trim() || '.');
+        }
+
+        match = command.match(/^search drive for\s+(.+)$/i);
+        if (match) {
+            return await this.showDriveFiles(String(match[1] || '').trim());
+        }
+
+        return false;
     },
 
     async _contentSave(domain, name, data) {
@@ -10515,16 +13505,918 @@ const UIEngine = {
         if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'func-save-status saving'; }
         try {
             const token = sessionStorage.getItem('genome_session') || '';
-            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}`, {
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const branch = encodeURIComponent(this._contentBranchFor(domain, name));
+            const res = await fetch(`/api/content/${encodeURIComponent(domain)}/${encodeURIComponent(name)}?sessionId=${sessionId}&branch=${branch}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
                 body: JSON.stringify({ data })
             });
-            const ok = res.ok && (await res.json()).ok;
+            const json = res.ok ? await res.json() : null;
+            const ok = Boolean(res.ok && json?.ok);
+            if (ok && json?.item) {
+                const item = json.item;
+                this.state.session.workspace = this.state.session.workspace || { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null };
+                this.state.session.workspace.branch = String(item.branch || this.state.session.workspace.branch || 'main');
+                this.state.session.workspace.activeContent = {
+                    itemId: String(item.itemId || ''),
+                    name: String(item.name || name),
+                    domain: String(item.domain || domain),
+                    branch: String(item.branch || 'main'),
+                    hash: String(item.hash || ''),
+                    updatedAt: Number(item.updated_at || Date.now())
+                };
+                this._renderSurfaceRepoMeta(domain, name);
+            }
             if (statusEl) { statusEl.textContent = ok ? 'Saved' : 'Error'; statusEl.className = `func-save-status${ok ? '' : ' error'}`; }
         } catch {
             if (statusEl) { statusEl.textContent = 'Error'; statusEl.className = 'func-save-status error'; }
         }
+    },
+
+    _activeContentMeta(domain, fallbackName = '') {
+        const workspace = this.state.session.workspace || {};
+        const active = (workspace.activeContent && typeof workspace.activeContent === 'object') ? workspace.activeContent : null;
+        if (active && String(active.domain || '').trim() === String(domain || '').trim()) {
+            return {
+                itemId: String(active.itemId || ''),
+                name: String(active.name || fallbackName || ''),
+                domain: String(active.domain || domain || ''),
+                branch: String(active.branch || workspace.branch || 'main'),
+                hash: String(active.hash || ''),
+                updatedAt: Number(active.updatedAt || 0)
+            };
+        }
+        return {
+            itemId: '',
+            name: String(fallbackName || ''),
+            domain: String(domain || ''),
+            branch: String(workspace.branch || 'main'),
+            hash: '',
+            updatedAt: 0
+        };
+    },
+
+    _contentBranchFor(domain, name = '') {
+        const meta = this._activeContentMeta(domain, name);
+        return String(meta.branch || this.state.session.workspace?.branch || 'main');
+    },
+
+    _renderSurfaceRepoMeta(domain, fallbackName = '') {
+        const meta = this._activeContentMeta(domain, fallbackName);
+        const branchEls = this.container.querySelectorAll('.func-branch-badge');
+        const hashEls = this.container.querySelectorAll('.func-hash-badge');
+        for (const el of branchEls) el.textContent = meta.branch || 'main';
+        for (const el of hashEls) el.textContent = meta.hash ? meta.hash.slice(0, 8) : 'new';
+        return meta;
+    },
+
+    async createRepoBranch(domain, name, targetBranch) {
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        const nextBranch = String(targetBranch || '').trim();
+        if (!itemDomain || !itemName || !nextBranch) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const fromBranch = encodeURIComponent(this._contentBranchFor(itemDomain, itemName));
+            const res = await fetch(`/api/content/${encodeURIComponent(itemDomain)}/${encodeURIComponent(itemName)}/branch?sessionId=${sessionId}&branch=${fromBranch}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                body: JSON.stringify({ targetBranch: nextBranch })
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            const item = json?.item || null;
+            if (!item) return null;
+            this.state.session.workspace = this.state.session.workspace || { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null };
+            this.state.session.workspace.branch = String(item.branch || nextBranch);
+            if (this.state.session.workspace.activeContent && typeof this.state.session.workspace.activeContent === 'object') {
+                this.state.session.workspace.activeContent.branch = String(item.branch || nextBranch);
+                this.state.session.workspace.activeContent.hash = String(item.hash || this.state.session.workspace.activeContent.hash || '');
+            }
+            this.saveState();
+            return item;
+        } catch {
+            return null;
+        }
+    },
+
+    async revertRepoObject(domain, name, targetHash) {
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        const hash = String(targetHash || '').trim();
+        if (!itemDomain || !itemName || !hash) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const branch = encodeURIComponent(this._contentBranchFor(itemDomain, itemName));
+            const res = await fetch(`/api/content/${encodeURIComponent(itemDomain)}/${encodeURIComponent(itemName)}/revert?sessionId=${sessionId}&branch=${branch}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                body: JSON.stringify({ hash })
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            return json?.item || null;
+        } catch {
+            return null;
+        }
+    },
+
+    async mergeRepoBranch(domain, name, sourceBranch, targetBranch = '') {
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        const source = String(sourceBranch || '').trim();
+        const target = String(targetBranch || this._contentBranchFor(itemDomain, itemName)).trim() || 'main';
+        if (!itemDomain || !itemName || !source || source === target) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const sessionId = encodeURIComponent(this.state.session.sessionId || '');
+            const branch = encodeURIComponent(target);
+            const res = await fetch(`/api/content/${encodeURIComponent(itemDomain)}/${encodeURIComponent(itemName)}/merge?sessionId=${sessionId}&branch=${branch}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                body: JSON.stringify({ sourceBranch: source })
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            return json?.item || null;
+        } catch {
+            return null;
+        }
+    },
+
+    async showRepoHistory(domain, name) {
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        if (!itemDomain || !itemName) return false;
+        const history = await this._contentHistory(itemDomain, itemName, 30);
+        const branches = await this._contentBranches(itemDomain, itemName);
+        const branch = this._contentBranchFor(itemDomain, itemName);
+        const intent = `history for ${itemDomain} ${itemName}`;
+        const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+        const plan = UIPlanSchema.normalize({
+            title: 'Repository history',
+            subtitle: `${itemDomain} · ${itemName}`,
+            suggestions: [],
+            trace: {}
+        });
+        const execution = {
+            ok: true,
+            toolResults: [{
+                ok: true,
+                op: 'content_history',
+                message: `History for ${itemName}`,
+                data: {
+                    op: 'content_history',
+                    action: 'history',
+                    name: itemName,
+                    type: itemDomain,
+                    branch,
+                    branches,
+                    history,
+                    source: 'live',
+                    connected: true,
+                    authoritative: true,
+                }
+            }]
+        };
+        this.state.session.lastIntent = intent;
+        this.state.session.lastExecution = execution;
+        this.render(plan, envelope, this.state.session.lastKernelTrace);
+        this.saveState();
+        return true;
+    },
+
+    async showWorkspaceWorktrees() {
+        const workspace = await this._fetchWorkspaceState();
+        const worktrees = await this._fetchWorkspaceWorktrees();
+        const branch = String(workspace?.branch || 'main');
+        const runtimeFocus = (workspace?.activeContent && typeof workspace.activeContent === 'object') ? workspace.activeContent : null;
+        const presence = this.state.session.presence || {};
+        const handoff = this.state.session.handoff || {};
+        const intent = 'show workspace worktrees';
+        const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+        const plan = UIPlanSchema.normalize({
+            title: 'Workspace worktrees',
+            subtitle: `session · ${branch}`,
+            suggestions: [],
+            trace: {}
+        });
+        const execution = {
+            ok: true,
+            toolResults: [{
+                ok: true,
+                op: 'content_list',
+                message: 'Workspace worktrees',
+                data: {
+                    op: 'content_list',
+                    action: 'worktrees',
+                    name: '',
+                    type: '',
+                    branch,
+                    runtimeFocus,
+                    presence,
+                    handoff,
+                    items: [],
+                    worktrees,
+                    source: 'live',
+                    connected: true,
+                    authoritative: true,
+                }
+            }]
+        };
+        this.state.session.lastIntent = intent;
+        this.state.session.lastExecution = execution;
+        this.render(plan, envelope, this.state.session.lastKernelTrace);
+        this.saveState();
+        return true;
+    },
+
+    async showNotificationsInbox() {
+        const items = await this._fetchNotificationsState();
+        const unread = items.filter((item) => !item.read).length;
+        const intent = 'show my notifications';
+        const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+        const plan = UIPlanSchema.normalize({
+            title: 'Notification center',
+            subtitle: unread > 0 ? `${unread} unread` : 'Runtime inbox',
+            suggestions: [],
+            trace: {}
+        });
+        const execution = {
+            ok: true,
+            toolResults: [{
+                ok: true,
+                op: 'notifications_view',
+                message: unread > 0 ? `${unread} unread notifications` : 'Notifications',
+                data: {
+                    op: 'notifications_view',
+                    notifications: items,
+                    source: 'live',
+                    authoritative: true,
+                }
+            }]
+        };
+        this.state.session.lastIntent = intent;
+        this.state.session.lastExecution = execution;
+        this.render(plan, envelope, this.state.session.lastKernelTrace);
+        this.saveState();
+        return true;
+    },
+
+    async showConnectionsPanel(targetService = '') {
+        try {
+            const suffix = targetService ? `?targetService=${encodeURIComponent(String(targetService).trim())}` : '';
+            const [statusRes, providersRes, contractsRes] = await Promise.all([
+                fetch(`/api/connectors/status${suffix}`),
+                fetch('/api/connectors/providers'),
+                fetch('/api/connectors/contracts'),
+            ]);
+            if (!statusRes.ok || !providersRes.ok || !contractsRes.ok) return false;
+            const [payload, providersPayload, contractsPayload] = await Promise.all([
+                statusRes.json(),
+                providersRes.json(),
+                contractsRes.json(),
+            ]);
+            if (payload?.data && typeof payload.data === 'object') {
+                payload.data.providers = (providersPayload && typeof providersPayload === 'object') ? (providersPayload.providers || {}) : {};
+                payload.data.contracts = (contractsPayload && typeof contractsPayload === 'object') ? (contractsPayload.contracts || {}) : {};
+            }
+            const focusedService = String(targetService || '').trim().toLowerCase();
+            if (focusedService) {
+                try {
+                    const diagRes = await fetch(`/api/connectors/status/${encodeURIComponent(focusedService)}`);
+                    if (diagRes.ok) {
+                        const diagPayload = await diagRes.json();
+                        if (payload?.data && typeof payload.data === 'object') {
+                            payload.data.serviceDiagnostics = diagPayload?.data || null;
+                        }
+                    }
+                } catch {
+                    // Keep connections shell operable even if focused diagnostics fail.
+                }
+            }
+            const execution = {
+                ok: true,
+                toolResults: [payload],
+            };
+            const intent = targetService ? `show connections for ${targetService}` : 'show my connections';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            const plan = UIPlanSchema.normalize({
+                title: 'Connections',
+                subtitle: 'Live connector state',
+                suggestions: [],
+                trace: {}
+            });
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showEmailInbox(limit = 10) {
+        try {
+            const res = await fetch(`/api/connectors/gmail/messages?limit=${Math.max(1, Math.min(25, Number(limit || 10)))}`);
+            if (!res.ok) return false;
+            const json = await res.json();
+            const item = (json?.item && typeof json.item === 'object') ? json.item : {};
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: Boolean(item.ok !== false),
+                    op: 'email_read',
+                    message: item.ok === false ? String(item.error || 'Email unavailable') : 'Inbox',
+                    data: {
+                        ...item,
+                        op: 'email_read',
+                        action: 'read',
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Email',
+                subtitle: item.connected === false ? 'Connect your inbox' : 'Live mailbox',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = 'check my email';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showMessagingInbox() {
+        try {
+            const res = await fetch('/api/connectors/slack/channels');
+            if (!res.ok) return false;
+            const json = await res.json();
+            const item = (json?.item && typeof json.item === 'object') ? json.item : {};
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: Boolean(item.ok !== false),
+                    op: 'slack_read',
+                    message: item.ok === false ? String(item.error || 'Messaging unavailable') : 'Messages',
+                    data: {
+                        ...item,
+                        op: 'slack_read',
+                        action: 'read',
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Messages',
+                subtitle: item.connected === false ? 'Connect messaging' : 'Live channels',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = 'show my messages';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showCalendarAgenda(days = 7) {
+        try {
+            const res = await fetch(`/api/connectors/gcal/events?days=${Math.max(1, Math.min(30, Number(days || 7)))}`);
+            if (!res.ok) return false;
+            const json = await res.json();
+            const item = (json?.item && typeof json.item === 'object') ? json.item : {};
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: Boolean(item.ok !== false),
+                    op: 'calendar_list',
+                    message: item.ok === false ? String(item.error || 'Calendar unavailable') : 'Agenda',
+                    data: {
+                        ...item,
+                        op: 'calendar_list',
+                        action: 'read',
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Calendar',
+                subtitle: item.connected === false ? 'Connect calendar' : 'Live agenda',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = 'show my calendar';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showDriveFiles(query = '') {
+        try {
+            const suffix = query ? `?query=${encodeURIComponent(String(query).trim())}` : '';
+            const res = await fetch(`/api/connectors/gdrive/files${suffix}`);
+            if (!res.ok) return false;
+            const json = await res.json();
+            const item = (json?.item && typeof json.item === 'object') ? json.item : {};
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: Boolean(item.ok !== false),
+                    op: 'gdrive.list',
+                    message: item.ok === false ? String(item.error || 'Drive unavailable') : 'Drive files',
+                    data: {
+                        ...item,
+                        op: 'gdrive.list',
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Drive',
+                subtitle: item.connected === false ? 'Connect file storage' : 'Connector storage',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = query ? `search drive for ${query}` : 'show my drive files';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showRuntimeHealth(limit = 120) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const [healthRes, selfCheckRes, profileRes, servicesRes, diagnosticsRes] = await Promise.all([
+                fetch(`/api/session/${encodeURIComponent(sid)}/runtime`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/runtime/self-check`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/runtime/profile?limit=${Math.max(10, Math.min(500, Number(limit || 120)))}`),
+                fetch('/api/runtime/services'),
+                fetch(`/api/session/${encodeURIComponent(sid)}/diagnostics`),
+            ]);
+            if (!healthRes.ok || !selfCheckRes.ok || !profileRes.ok || !servicesRes.ok || !diagnosticsRes.ok) return false;
+            const [health, selfCheck, profile, services, diagnostics] = await Promise.all([
+                healthRes.json(),
+                selfCheckRes.json(),
+                profileRes.json(),
+                servicesRes.json(),
+                diagnosticsRes.json(),
+            ]);
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: true,
+                    op: 'runtime_profile',
+                    message: 'Runtime health',
+                    data: {
+                        op: 'runtime_profile',
+                        health,
+                        selfCheck,
+                        profile,
+                        services,
+                        diagnostics,
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Runtime',
+                subtitle: 'Shell health and latency',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = 'show runtime health';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showContinuitySurface() {
+        const sid = String(this.state.session.sessionId || '').trim();
+        if (!sid) return false;
+        try {
+            const [
+                continuityRes,
+                alertsRes,
+                handoffRes,
+                presenceRes,
+                incidentsRes,
+                nextRes,
+                diagnosticsRes,
+                continuityHistoryRes,
+                continuityAnomaliesRes,
+                autopilotHistoryRes,
+                autopilotPreviewRes,
+                autopilotMetricsRes,
+                autopilotGuardrailsRes,
+                autopilotModeRes,
+                autopilotDriftRes,
+                autopilotAlignmentRes,
+                autopilotPolicyMatrixRes,
+                postureHistoryRes,
+                postureAnomaliesRes,
+                postureActionsRes,
+                postureActionMetricsRes,
+                posturePolicyMatrixRes,
+                pairedSurfacesRes,
+            ] = await Promise.all([
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/alerts`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/handoff/stats`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/presence`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/incidents?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/next?limit=5`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/diagnostics`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/history?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/anomalies?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/history?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/preview`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/metrics?window_ms=3600000`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/guardrails`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/mode-recommendation`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/mode-drift`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/mode-alignment?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/mode-policy/matrix`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/history?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/anomalies?limit=8`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/actions?limit=5`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/actions/metrics?window_ms=3600000`),
+                fetch(`/api/session/${encodeURIComponent(sid)}/continuity/autopilot/posture/actions/policy-matrix?limit=5`),
+                fetch('/api/surfaces?limit=12'),
+            ]);
+            if (
+                !continuityRes.ok ||
+                !alertsRes.ok ||
+                !handoffRes.ok ||
+                !presenceRes.ok ||
+                !incidentsRes.ok ||
+                !nextRes.ok ||
+                !diagnosticsRes.ok ||
+                !continuityHistoryRes.ok ||
+                !continuityAnomaliesRes.ok ||
+                !autopilotHistoryRes.ok ||
+                !autopilotPreviewRes.ok ||
+                !autopilotMetricsRes.ok ||
+                !autopilotGuardrailsRes.ok ||
+                !autopilotModeRes.ok ||
+                !autopilotDriftRes.ok ||
+                !autopilotAlignmentRes.ok ||
+                !autopilotPolicyMatrixRes.ok ||
+                !postureHistoryRes.ok ||
+                !postureAnomaliesRes.ok ||
+                !postureActionsRes.ok ||
+                !postureActionMetricsRes.ok ||
+                !posturePolicyMatrixRes.ok ||
+                !pairedSurfacesRes.ok
+            ) return false;
+            const [
+                continuity,
+                alerts,
+                handoff,
+                presence,
+                incidents,
+                nextActions,
+                diagnostics,
+                continuityHistory,
+                continuityAnomalies,
+                autopilotHistory,
+                autopilotPreview,
+                autopilotMetrics,
+                autopilotGuardrails,
+                autopilotMode,
+                autopilotDrift,
+                autopilotAlignment,
+                autopilotPolicyMatrix,
+                postureHistory,
+                postureAnomalies,
+                postureActions,
+                postureActionMetrics,
+                posturePolicyMatrix,
+                pairedSurfaces,
+            ] = await Promise.all([
+                continuityRes.json(),
+                alertsRes.json(),
+                handoffRes.json(),
+                presenceRes.json(),
+                incidentsRes.json(),
+                nextRes.json(),
+                diagnosticsRes.json(),
+                continuityHistoryRes.json(),
+                continuityAnomaliesRes.json(),
+                autopilotHistoryRes.json(),
+                autopilotPreviewRes.json(),
+                autopilotMetricsRes.json(),
+                autopilotGuardrailsRes.json(),
+                autopilotModeRes.json(),
+                autopilotDriftRes.json(),
+                autopilotAlignmentRes.json(),
+                autopilotPolicyMatrixRes.json(),
+                postureHistoryRes.json(),
+                postureAnomaliesRes.json(),
+                postureActionsRes.json(),
+                postureActionMetricsRes.json(),
+                posturePolicyMatrixRes.json(),
+                pairedSurfacesRes.json(),
+            ]);
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: true,
+                    op: 'continuity_alerts',
+                    message: 'Continuity',
+                    data: {
+                        op: 'continuity_alerts',
+                        continuity,
+                        alerts,
+                        handoff,
+                        presence,
+                        incidents,
+                        nextActions,
+                        diagnostics,
+                        continuityHistory,
+                        continuityAnomalies,
+                        autopilotHistory,
+                        autopilotPreview,
+                        autopilotMetrics,
+                        autopilotGuardrails,
+                        autopilotMode,
+                        autopilotDrift,
+                        autopilotAlignment,
+                        autopilotPolicyMatrix,
+                        postureHistory,
+                        postureAnomalies,
+                        postureActions,
+                        postureActionMetrics,
+                        posturePolicyMatrix,
+                        pairedSurfaces,
+                    }
+                }]
+            };
+            const plan = UIPlanSchema.normalize({
+                title: 'Continuity',
+                subtitle: 'Shared runtime and handoff',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = 'show continuity';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showContentRepository(query = '') {
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const headers = token ? { 'X-Genome-Auth': token } : {};
+            const suffix = query ? `?query=${encodeURIComponent(String(query).trim())}` : '';
+            const domains = ['document', 'spreadsheet', 'presentation'];
+            const responses = await Promise.all(domains.map(async (domain) => {
+                const res = await fetch(`/api/content/${encodeURIComponent(domain)}${suffix}`, { headers });
+                if (!res.ok) return [];
+                const json = await res.json();
+                return Array.isArray(json?.items) ? json.items.map((item) => ({ ...item, domain })) : [];
+            }));
+            const items = responses.flat().sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+            const workspace = await this._fetchWorkspaceState();
+            const worktrees = await this._fetchWorkspaceWorktrees();
+            const plan = UIPlanSchema.normalize({
+                title: 'Content repository',
+                subtitle: query ? `results for ${query}` : 'Repo objects',
+                suggestions: [],
+                trace: {}
+            });
+            const intent = query ? `find content ${query}` : 'show content history';
+            const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+            const execution = {
+                ok: true,
+                toolResults: [{
+                    ok: true,
+                    op: 'content_list',
+                    message: items.length ? `${items.length} repo objects` : 'No repo objects',
+                    data: {
+                        op: 'content_list',
+                        action: query ? 'find' : 'list',
+                        query: String(query || '').trim(),
+                        items,
+                        branch: String(workspace?.branch || 'main'),
+                        worktrees,
+                        source: 'live',
+                        connected: true,
+                        authoritative: true,
+                    }
+                }]
+            };
+            this.state.session.lastIntent = intent;
+            this.state.session.lastExecution = execution;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async showWorkspaceFiles(path = '.') {
+        try {
+            const execution = await RemoteTurnService.process(
+                `list files ${String(path || '.').trim() || '.'}`,
+                this.state.session.sessionId,
+                this.state.session.revision,
+                this.state.session.deviceId,
+                'rebase_if_commutative',
+                `files:${String(path || '.').trim() || '.'}:${Date.now()}`
+            );
+            this.state.session.revision = Number(execution.revision || this.state.session.revision);
+            this.state.memory = execution.memory || this.state.memory;
+            this.state.session.handoff = execution.handoff || this.state.session.handoff;
+            this.state.session.presence = execution.presence || this.state.session.presence;
+            this.state.session.workspace = execution.workspace || this.state.session.workspace;
+            const plan = UIPlanSchema.normalize(execution.plan);
+            const envelope = execution.envelope || IntentLayerCompiler.compile(`list files ${String(path || '.').trim() || '.'}`, this.state.memory);
+            this.state.session.lastIntent = String(path || '.').trim() && String(path || '.').trim() !== '.'
+                ? `list files ${String(path || '.').trim()}`
+                : 'show workspace files';
+            this.state.session.lastExecution = execution.execution || this.state.session.lastExecution;
+            this.state.session.lastKernelTrace = execution.kernelTrace || this.state.session.lastKernelTrace;
+            this.render(plan, envelope, this.state.session.lastKernelTrace);
+            this.saveState();
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
+    async activateWorkspaceWorktree(itemId) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        const target = String(itemId || '').trim();
+        if (!sid || !target) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/workspace/worktrees/${encodeURIComponent(target)}/activate`, {
+                method: 'POST',
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            if (json?.workspace && typeof json.workspace === 'object') {
+                this.state.session.workspace = json.workspace;
+            }
+            return json?.item || null;
+        } catch {
+            return null;
+        }
+    },
+
+    async detachWorkspaceWorktree(itemId) {
+        const sid = String(this.state.session.sessionId || '').trim();
+        const target = String(itemId || '').trim();
+        if (!sid || !target) return false;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/workspace/worktrees/${encodeURIComponent(target)}`, {
+                method: 'DELETE',
+                headers: { 'X-Genome-Auth': token }
+            });
+            if (!res.ok) return false;
+            const json = await res.json();
+            if (json?.workspace && typeof json.workspace === 'object') {
+                this.state.session.workspace = json.workspace;
+            }
+            return Boolean(json?.ok);
+        } catch {
+            return false;
+        }
+    },
+
+    async attachWorkspaceWorktree(domain, name, branch = '') {
+        const sid = String(this.state.session.sessionId || '').trim();
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        const itemBranch = String(branch || this._contentBranchFor(itemDomain, itemName)).trim() || 'main';
+        if (!sid || !itemDomain || !itemName) return null;
+        try {
+            const token = sessionStorage.getItem('genome_session') || '';
+            const res = await fetch(`/api/session/${encodeURIComponent(sid)}/workspace/attach`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Genome-Auth': token },
+                body: JSON.stringify({ domain: itemDomain, name: itemName, branch: itemBranch })
+            });
+            if (!res.ok) return null;
+            const json = await res.json();
+            if (json?.workspace && typeof json.workspace === 'object') {
+                this.state.session.workspace = json.workspace;
+            }
+            return json?.item || null;
+        } catch {
+            return null;
+        }
+    },
+
+    async openRepoObject(domain, name, branch = '') {
+        const itemDomain = String(domain || '').trim().toLowerCase();
+        const itemName = String(name || '').trim();
+        if (!itemDomain || !itemName) return false;
+
+        if (branch) {
+            this.state.session.workspace = this.state.session.workspace || { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null };
+            this.state.session.workspace.branch = String(branch).trim() || 'main';
+            if (this.state.session.workspace.activeContent && typeof this.state.session.workspace.activeContent === 'object') {
+                this.state.session.workspace.activeContent.branch = this.state.session.workspace.branch;
+            }
+        }
+
+        const item = await this._contentOpenItem(itemDomain, itemName);
+        if (!item) {
+            this.showToast(`Could not open ${itemName}.`, 'warn', 2400);
+            return false;
+        }
+
+        this.state.session.workspace = this.state.session.workspace || { repoId: 'user-global', branch: 'main', worktrees: {}, activeContent: null };
+        const worktrees = (this.state.session.workspace.worktrees && typeof this.state.session.workspace.worktrees === 'object')
+            ? this.state.session.workspace.worktrees
+            : {};
+        worktrees[String(item.itemId || itemName)] = {
+            itemId: String(item.itemId || ''),
+            name: String(item.name || itemName),
+            domain: String(item.domain || itemDomain),
+            branch: String(item.branch || 'main'),
+            updatedAt: Number(item.updated_at || Date.now())
+        };
+        this.state.session.workspace.worktrees = worktrees;
+        this.state.session.workspace.branch = String(item.branch || this.state.session.workspace.branch || 'main');
+        this.state.session.workspace.activeContent = {
+            itemId: String(item.itemId || ''),
+            name: String(item.name || itemName),
+            domain: String(item.domain || itemDomain),
+            branch: String(item.branch || 'main'),
+            hash: String(item.hash || ''),
+            updatedAt: Number(item.updated_at || Date.now())
+        };
+
+        const intent = `open ${itemDomain} ${itemName}`;
+        const envelope = IntentLayerCompiler.compile(intent, this.state.memory);
+        const plan = UIPlanSchema.normalize({
+            title: 'Open repository object',
+            subtitle: `${itemDomain} · ${itemName}`,
+            suggestions: [],
+            trace: {}
+        });
+        const execution = {
+            ok: true,
+            toolResults: [{
+                ok: true,
+                op: `${itemDomain}_open`,
+                message: `Opened ${itemName}`,
+                data: {
+                    op: `${itemDomain}_open`,
+                    action: 'open',
+                    name: itemName,
+                    domain: itemDomain,
+                    ...item,
+                }
+            }]
+        };
+        this.state.session.lastIntent = intent;
+        this.state.session.lastExecution = execution;
+        this.render(plan, envelope, this.state.session.lastKernelTrace);
+        this.saveState();
+        return true;
     },
 
     _makeAutoSave(domain, name, getDataFn, delayMs = 30000) {
@@ -10539,6 +14431,7 @@ const UIEngine = {
     _initDocumentSurface(bodyEl) {
         const domain = 'document';
         const name = bodyEl.dataset.funcName || '';
+        this._renderSurfaceRepoMeta(domain, name);
 
         // Toolbar: execCommand bindings
         const toolbar = this.container.querySelector('[data-func-toolbar="document"]');
@@ -10566,7 +14459,7 @@ const UIEngine = {
             this._contentSave(domain, name, getData());
         });
 
-        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup, getMeta: () => this._activeContentMeta(domain, name) };
 
         // Load saved content
         this._contentLoad(domain, name).then((saved) => {
@@ -10591,6 +14484,7 @@ const UIEngine = {
     _initSpreadsheetSurface(tableEl) {
         const domain = 'spreadsheet';
         const name = tableEl.dataset.funcName || '';
+        this._renderSurfaceRepoMeta(domain, name);
 
         // Formula bar + cell ref sync
         const formulaBar = this.container.querySelector('[data-formula-bar]');
@@ -10632,6 +14526,10 @@ const UIEngine = {
                 // Function rewrites
                 const expr = resolved
                     .replace(/\bSUM\(\[([^\]]*)\]\)/g, (_, v) => `(${v.split(',').map(Number).reduce((a, b) => a + b, 0)})`)
+                    .replace(/\bAVERAGE\(\[([^\]]*)\]\)/g, (_, v) => {
+                        const a = v.split(',').map(Number).filter((n) => Number.isFinite(n));
+                        return a.length ? (a.reduce((x, y) => x + y, 0) / a.length) : 0;
+                    })
                     .replace(/\bAVG\(\[([^\]]*)\]\)/g, (_, v) => { const a = v.split(',').map(Number); return a.reduce((x, y) => x + y, 0) / a.length; })
                     .replace(/\bIF\((.+),(.+),(.+)\)/g, (_, cond, t, f2) => `((${cond}) ? (${t}) : (${f2}))`)
                     // Single-cell references
@@ -10708,7 +14606,7 @@ const UIEngine = {
         };
         const saver = this._makeAutoSave(domain, name, getData);
 
-        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup, getMeta: () => this._activeContentMeta(domain, name) };
 
         // Load saved content
         this._contentLoad(domain, name).then((saved) => {
@@ -10832,6 +14730,7 @@ const UIEngine = {
     _initPresentationSurface(stageSlideEl) {
         const domain = 'presentation';
         const name = stageSlideEl.dataset.funcName || '';
+        this._renderSurfaceRepoMeta(domain, name);
         const panel = this.container.querySelector('[data-pres-panel]');
         const toolbar = this.container.querySelector('[data-func-toolbar="presentation"]');
 
@@ -10890,7 +14789,7 @@ const UIEngine = {
         const getData = () => slides.slice();
         const saver = this._makeAutoSave(domain, name, getData);
 
-        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup };
+        this.state.activeSurface = { domain, name, getData, cleanup: saver.cleanup, getMeta: () => this._activeContentMeta(domain, name) };
 
         // Load saved content
         this._contentLoad(domain, name).then((saved) => {
@@ -10998,7 +14897,7 @@ const ToolRegistry = {
         add_task(memory, payload) {
             const title = (payload.title || '').trim();
             if (!title) return { ok: false, message: 'Task title is empty. Use: add task <title>' };
-            memory.tasks.unshift({ id: crypto.randomUUID(), title, done: false, createdAt: Date.now() });
+            memory.tasks.unshift({ id: safeRandomId(), title, done: false, createdAt: Date.now() });
             return { ok: true, message: `Added task: ${title}` };
         },
 
@@ -11028,7 +14927,7 @@ const ToolRegistry = {
             if (Number.isNaN(amount) || amount <= 0) return { ok: false, message: 'Invalid expense amount.' };
             const category = (payload.category || 'general').toLowerCase();
             memory.expenses.unshift({
-                id: crypto.randomUUID(),
+                id: safeRandomId(),
                 amount,
                 category,
                 note: payload.note || '',
@@ -11040,14 +14939,14 @@ const ToolRegistry = {
         add_note(memory, payload) {
             const text = (payload.text || '').trim();
             if (!text) return { ok: false, message: 'Note is empty.' };
-            memory.notes.unshift({ id: crypto.randomUUID(), text, createdAt: Date.now() });
+            memory.notes.unshift({ id: safeRandomId(), text, createdAt: Date.now() });
             return { ok: true, message: 'Note captured.' };
         },
 
         reset_memory(memory) {
-            memory.tasks = structuredClone(DEFAULT_MEMORY.tasks);
-            memory.expenses = structuredClone(DEFAULT_MEMORY.expenses);
-            memory.notes = structuredClone(DEFAULT_MEMORY.notes);
+            memory.tasks = safeStructuredClone(DEFAULT_MEMORY.tasks);
+            memory.expenses = safeStructuredClone(DEFAULT_MEMORY.expenses);
+            memory.notes = safeStructuredClone(DEFAULT_MEMORY.notes);
             return { ok: true, message: 'Memory reset to defaults.' };
         }
     },

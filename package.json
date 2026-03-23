@@ -9,6 +9,9 @@
     "dev:os": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1",
     "dev:os:watch": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -WatchBackend",
     "dev:os:bootstrap": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -Bootstrap",
+    "os:service:install": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\install-services.ps1",
+    "os:service:uninstall": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\uninstall-services.ps1",
+    "os:service:status": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\service-status.ps1",
     "os:test": "powershell -NoLogo -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1 -SmokeTest -TestOnly",
     "os:test:unit": ".\\.venv\\Scripts\\python.exe -m unittest discover -s tests\\unit -p \"test_*.py\"",
     "os:test:replay": ".\\.venv\\Scripts\\python.exe scripts\\replay_smoke.py",
@@ -98,17 +101,26 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "genome-os",
+      "repo": "GenomeUI",
+      "releaseType": "release"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/cli": "^2.10.0",
     "concurrently": "^9.2.1",
-    "electron": "^40.6.0",
+    "electron": "^33.4.11",
     "electron-builder": "^26.8.1",
     "vite": "^5.0.0",
     "wait-on": "^9.0.4"
   }
 }
-

@@ -160,9 +160,9 @@ main {
 
 .workspace.immersive {
     display: block;
-    position: relative;
+    position: absolute;
+    inset: 0;
     padding: 0;
-    height: 100%;
     --rail-width: clamp(160px, 14vw, 220px);
 }
 
@@ -4925,6 +4925,9 @@ body.network-offline #command-bar .input-container {
     color: var(--text);
     font-family: var(--font-mono);
     font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
     opacity: 0;
     transform: translateY(-6px);
     pointer-events: none;
@@ -4934,6 +4937,7 @@ body.network-offline #command-bar .input-container {
 #ux-toast.visible {
     opacity: 1;
     transform: translateY(0);
+    pointer-events: auto;
 }
 
 #ux-toast.tone-ok {
@@ -4942,6 +4946,32 @@ body.network-offline #command-bar .input-container {
 
 #ux-toast.tone-warn {
     border-color: rgba(187, 45, 59, 0.45);
+}
+
+.ux-toast-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.ux-toast-action {
+    border: 1px solid rgba(13, 67, 130, 0.18);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.92);
+    color: rgba(10, 25, 43, 0.92);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+    flex: none;
+}
+
+.ux-toast-action:hover {
+    background: rgba(246, 250, 255, 0.98);
+}
+
+.ux-toast-action:focus-visible {
+    outline: 2px solid rgba(22, 102, 194, 0.65);
+    outline-offset: 2px;
 }
 
 #help-overlay {
@@ -5295,6 +5325,75 @@ body.network-offline #command-bar .input-container {
     cursor: pointer;
 }
 .confirm-approve:hover { background: #dc2626; }
+
+.handoff-qr-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(4, 8, 16, 0.78);
+    backdrop-filter: blur(10px);
+}
+.handoff-qr-card {
+    width: min(420px, 100%);
+    border-radius: 24px;
+    padding: 24px;
+    background:
+        radial-gradient(circle at top, rgba(94, 155, 255, 0.18), transparent 52%),
+        linear-gradient(180deg, rgba(18, 24, 40, 0.98), rgba(9, 14, 24, 0.98));
+    border: 1px solid rgba(124, 168, 255, 0.2);
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.42);
+    color: rgba(240, 245, 255, 0.96);
+}
+.handoff-qr-title {
+    font-size: 23px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+}
+.handoff-qr-sub {
+    margin-top: 6px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: rgba(209, 223, 255, 0.74);
+}
+.handoff-qr-frame {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 320px;
+    margin-top: 18px;
+    padding: 18px;
+    border-radius: 18px;
+    background: #ffffff;
+    border: 1px solid rgba(138, 172, 255, 0.28);
+}
+.handoff-qr-image {
+    width: min(320px, 100%);
+    height: auto;
+    display: block;
+}
+.handoff-qr-meta {
+    margin-top: 14px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: rgba(194, 206, 237, 0.58);
+    word-break: break-all;
+    font-family: 'SF Mono', Consolas, monospace;
+}
+.handoff-qr-expiry {
+    margin-top: 10px;
+    font-size: 12px;
+    color: rgba(225, 234, 255, 0.76);
+}
+.handoff-qr-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 18px;
+}
 
 /* Sound toggle button */
 .sound-toggle {
@@ -5792,31 +5891,75 @@ body.network-offline #command-bar .input-container {
    Right rail hidden. Input at thumb reach.
 ═══════════════════════════════════════════════════════════ */
 @media (max-width: 600px) {
-    body { overflow: hidden; height: 100dvh; }
+    .ui-shard {
+        opacity: 1;
+        transform: none;
+    }
+
+    html, body { height: 100dvh; }
+    body { overflow: auto; min-height: 100dvh; }
 
     main {
         display: flex;
         flex-direction: column;
-        height: 100dvh;
+        min-height: 100dvh;
+        height: auto;
         padding-bottom: 0;
     }
 
     #surface {
         flex: 1;
-        overflow: hidden;
+        overflow: auto;
         min-height: 0;
+        padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .ui-shard {
+        padding: 8px 8px calc(120px + env(safe-area-inset-bottom, 0px)) 8px;
+        overflow: auto;
     }
 
     .workspace {
         grid-template-columns: 1fr;
-        height: 100%;
+        height: auto;
+        min-height: calc(100dvh - 96px);
     }
 
     .workspace-side { display: none !important; }
 
-    .workspace-main { height: 100%; overflow: hidden; }
-    .surface-core { height: 100%; border-radius: 0; }
-    .scene { border-radius: 0; }
+    .workspace-main { height: auto; min-height: calc(100dvh - 96px); overflow: visible; }
+    .surface-core { height: auto; min-height: calc(100dvh - 96px); border-radius: 0; overflow: visible; padding: 72px 14px 18px; }
+    .surface-core.immersive { min-height: calc(100dvh - 96px); overflow: auto; }
+    .scene {
+        position: relative;
+        inset: auto;
+        min-height: calc(100dvh - 148px);
+        border-radius: 0;
+        overflow: visible;
+    }
+    .scene.interactive { overflow: visible; }
+    .workspace.immersive { position: relative; min-height: calc(100dvh - 96px); }
+    .workspace.immersive > .scene-dock {
+        position: sticky;
+        top: 0;
+        padding-top: max(env(safe-area-inset-top, 0px), 8px);
+        background: linear-gradient(180deg, rgba(244,241,232,.96), rgba(244,241,232,.72) 70%, rgba(244,241,232,0));
+        backdrop-filter: blur(8px);
+    }
+    .workspace.immersive .workspace-main {
+        min-height: calc(100dvh - 96px);
+    }
+    .workspace.immersive .surface-core.immersive > .scene {
+        padding-top: 52px;
+    }
+    .scene-dock {
+        position: sticky;
+        top: 0;
+        z-index: 30;
+        background: linear-gradient(180deg, rgba(244,241,232,.96), rgba(244,241,232,.72) 70%, rgba(244,241,232,0));
+        backdrop-filter: blur(8px);
+    }
 
     /* Command bar: fixed to bottom, full width, safe-area aware */
     #command-bar {
@@ -5841,6 +5984,36 @@ body.network-offline #command-bar .input-container {
     }
 
     .status { display: none; }
+    .window-controls { display: none !important; }
+
+    .welcome-surface {
+        min-height: auto;
+        align-content: start;
+        padding: 28px 10px 18px;
+    }
+    .welcome-tiles {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+    .welcome-tile {
+        padding: 16px 14px;
+    }
+
+    .auth-overlay {
+        align-items: flex-start;
+        justify-content: center;
+        padding: max(env(safe-area-inset-top, 0px), 24px) 16px 16px;
+        overflow: auto;
+    }
+    .auth-card {
+        width: min(420px, calc(100vw - 24px));
+        padding: 28px 20px 24px;
+        gap: 14px;
+        margin-bottom: 24px;
+    }
+    .auth-headline { font-size: 20px; }
+    .auth-sub { font-size: 13px; line-height: 1.45; }
+    .auth-btn { width: 100%; }
 
     .core-intent {
         font-size: clamp(22px, 8vw, 36px);
@@ -7830,8 +8003,34 @@ body.network-offline #command-bar .input-container {
     border-color: rgba(52, 211, 153, 0.22);
 }
 .conn-card-btn:disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+/* Connector not-connected CTA — shown in email/calendar scenes when OAuth not done */
+/* ── Plan scene (multi-step execution) ──────────────────────────────────── */
+.plan-scene { display: flex; flex-direction: column; gap: 14px; padding: 24px 20px; max-width: 560px; margin: 0 auto; width: 100%; }
+.plan-intent { font-size: 13px; color: rgba(255,255,255,0.38); letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 4px; }
+.plan-steps { display: flex; flex-direction: column; gap: 10px; }
+.plan-step { display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.045); border-radius: 8px; padding: 10px 14px; border-left: 3px solid transparent; transition: border-color 0.2s; }
+.plan-step-ok  { border-left-color: rgba(56,189,248,0.6); }
+.plan-step-fail{ border-left-color: rgba(239,68,68,0.6); }
+.plan-step-num  { font-size: 11px; color: rgba(255,255,255,0.28); min-width: 16px; text-align: center; }
+.plan-step-icon { font-size: 15px; min-width: 20px; text-align: center; }
+.plan-step-body { flex: 1; min-width: 0; }
+.plan-step-op   { font-size: 12px; color: rgba(255,255,255,0.55); text-transform: uppercase; letter-spacing: 0.04em; }
+.plan-step-msg  { font-size: 13px; color: rgba(255,255,255,0.82); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plan-step-status { font-size: 14px; }
+.plan-step-ok  .plan-step-status { color: #38bdf8; }
+.plan-step-fail .plan-step-status { color: #ef4444; }
+.plan-summary { font-size: 12px; color: rgba(255,255,255,0.38); text-align: center; padding-top: 4px; }
+.plan-summary-ok   { color: rgba(56,189,248,0.7); }
+.plan-summary-warn { color: rgba(251,191,36,0.7); }
+.connector-cta { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 28px 0; }
+.connector-cta-label { color: rgba(255,255,255,0.42); font-size: 13px; letter-spacing: 0.04em; }
+.connector-cta-btn { background: none; border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.7); border-radius: 6px; padding: 8px 20px; font-size: 13px; cursor: pointer; transition: border-color 0.15s, color 0.15s; }
+.connector-cta-btn:hover { border-color: rgba(255,255,255,0.42); color: rgba(255,255,255,0.95); }
 .conn-card-btn--save { color: rgba(99, 202, 255, 0.8); border-color: rgba(99, 202, 255, 0.25); }
 .conn-card-btn--save:hover { color: rgba(99, 202, 255, 1); border-color: rgba(99, 202, 255, 0.5); }
+.connector-email-input { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); color: rgba(255,255,255,0.85); border-radius: 6px; padding: 8px 14px; font-size: 13px; width: 220px; outline: none; }
+.connector-email-input:focus { border-color: rgba(255,255,255,0.32); }
+.connector-cta-hint { color: rgba(255,255,255,0.28); font-size: 11px; text-align: center; max-width: 220px; }
 .conn-card-form { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 .conn-card-input {
     background: rgba(255, 255, 255, 0.05);

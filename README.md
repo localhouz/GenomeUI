@@ -76,6 +76,10 @@ Current sprint execution board: `docs/TASKBOARD.md`.
 
 6. **Open**: `http://localhost:5173`
 
+7. **Passkey auth is on by default**:
+   On first launch, GenomeUI will prompt you to create a local passkey. That session token is then used for `/api/turn`, connectors, and WebSocket access.
+   For trusted local automation only, set `GENOME_AUTH_ENABLED=false`.
+
 ## CI / Release
 - CI workflow: `.github/workflows/ci.yml`
   - Linux validate job: build + Python unit tests + Electron module tests + Playwright smoke
@@ -88,6 +92,15 @@ Current sprint execution board: `docs/TASKBOARD.md`.
   npm run ci:local
   ```
 
+## Desktop Runtime
+- Auto-update: packaged Electron builds use `electron-updater` and GitHub Releases metadata from the Electron build config. Update checks are silent on launch, downloads happen in the background, the renderer receives `updater:status` events, and a downloaded update can be applied immediately from the in-app restart prompt.
+- Native notifications: renderer calls `window.electronAPI.notify(...)`, which bridges to Electron's `Notification` API for reminders, relay messages, and runtime alerts.
+- Crash logs:
+  - Electron main/renderer: `electron.crash.log`
+  - Python backend: `backend.crash.log`
+  - Backend aggregation endpoint: `POST /api/crash`
+- Service-mode runtime docs live in `README-SERVICES.md`.
+
 ## 📱 Cross-Device Continuity
 Use the same session URL on desktop + phone:
 - Desktop: `http://localhost:5173/?session=mysharedsurface`
@@ -97,6 +110,21 @@ Realtime sync transport priority:
 1. WebSocket (`/ws`)
 2. SSE (`/api/stream?sessionId=<id>`)
 3. Polling fallback
+
+## Genome Surface Pairing
+For relay-first handoff testing, use the phone as the Genome PWA surface before starting handoff:
+
+1. Start GenomeOS desktop and note the reachable phone surface URL, for example `http://192.168.1.214:5173`.
+2. Open that URL on the phone.
+3. Install it to the home screen when prompted, or use `Share > Add to Home Screen`.
+4. Launch the installed Genome phone surface and open the same session URL if you want shared state immediately.
+5. On desktop, open `show continuity` and confirm the phone appears under `devices` or `paired surfaces`.
+6. Use `take over` on that paired surface row, or mark it `prefer` and then say `hand off to my phone`.
+
+Expected result:
+- desktop reports takeover requested on the paired surface
+- the phone PWA claims the same Genome session
+- the current shell surface renders on the phone surface
 
 ## 🖥 Backend (Python / venv)
 FastAPI service in `backend/main.py` provides:
@@ -307,6 +335,11 @@ It includes:
 - Revision conflict protection for cross-device writes (`409 revision_conflict`)
 - per-turn performance telemetry (`parseMs`, `executeMs`, `planMs`, `totalMs`, budget status)
 - session SLO guard with throttle signal (`breachStreak`, `throttled`, alert tail)
+
+Latency benchmark:
+- Run `.\.venv\Scripts\python.exe scripts\benchmark_turn_latency.py --runs 20 --warmup 3 --out .test-temp\turn-latency.json`
+- The script reports `avg/p50/p95/max` for fast-path and complex intents using the `/api/turn` timing headers (`X-Genome-*`, `X-Nous-Parse-Ms`)
+- Use it to verify the Tier 0 / Tier 1 latency targets on actual dev hardware before closing those acceptance items
 
 ## 🔐 Capability and Policy
 Write operations execute through kernel middleware:
